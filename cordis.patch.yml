@@ -1,0 +1,6 @@
+# dsh-delegate bundle patch: mounts the delegation service into the profile.
+# The plugin is inert on load: delegation stays OFF until a native-authenticated
+# user action grants one external connection a task or a session.
+- insert:
+    - id: dsh-delegate
+      name: dsh-delegate

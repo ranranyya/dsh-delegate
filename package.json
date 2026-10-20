@@ -1,0 +1,51 @@
+{
+  "name": "dsh-delegate",
+  "version": "0.1.0",
+  "description": "DSH-side delegation service: explicit provider/model routing, user-authorized external connections, native agent execution and independent read-only review.",
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=24",
+    "dsh": "0.2.0-rc.2"
+  },
+  "main": "src/index.js",
+  "exports": {
+    ".": "./src/index.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "src/**/*.js",
+    "cordis.patch.yml",
+    "LICENSE",
+    "README.md",
+    "docs/native-integration-audit.md",
+    "docs/contracts-stage-b.md"
+  ],
+  "dsh": {
+    "manifestVersion": 1,
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/dsh-agent": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-llm": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-llm-pi-ai": "0.2.0-rc.2"
+  },
+  "devDependencies": {
+    "@deepseek-ai/dsh-agent": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-llm": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-llm-pi-ai": "0.2.0-rc.2"
+  },
+  "scripts": {
+    "test": "node --test-isolation=none --test tests/*.test.js",
+    "test:isolated": "node --test tests/*.test.js",
+    "pack:dry": "npm pack --dry-run"
+  },
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "plugin",
+    "delegation"
+  ]
+}
