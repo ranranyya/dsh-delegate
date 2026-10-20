@@ -1,0 +1,8 @@
+node_modules/
+artifacts/
+.cache/
+coverage/
+*.log
+.env
+.env.*
+!.env.example
