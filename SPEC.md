@@ -8,8 +8,11 @@ configuration, authorization and execution service. A small MCP adapter exposes
 bounded dispatch/status/result/cancel tools to Codex and other MCP hosts.
 
 The user explicitly authorized DeepSeek execution of this implementation.
-Codex owns architecture, inspection, acceptance and final integration; the
-executor for this project is relay / deepseek-v4.1-flash only.
+Codex owns architecture, inspection, acceptance and final integration; for
+implementation tasks in this repository, the latest specified DSH route was
+`workbuddy/deepseek-v4.1-flash` at reasoning effort `high` or `max`. This
+development-task preference is not a product default: the Codex companion must
+use the effective route selected in the DSH plugin.
 
 Develop in this isolated repository, not the installed Crew release. Existing
 Crew and DSH sources may be inspected as API references. Preserve licenses for
@@ -18,27 +21,23 @@ credentials, registry, startup entries or live host registrations.
 
 ## Required behavior
 
-1. Default: delegation is OFF, including after restart. Merely installing the
-   plugin or mentioning DeepSeek must not dispatch work. Codex normally executes
-   its own tasks. Enabling DSH capability does not imply a user request to delegate.
-2. DSH UI is the user control surface. A visible authorization control grants
-   a selected external connection one task (default) or the current connection
-   session. It displays pending connection identity, scope and state, and allows
-   revoke. The server enforces the grant, not just UI or agent instructions.
-3. MCP tools must NOT expose grant/enable/config-write/credential-write APIs.
-   Authorization belongs to a separate authenticated DSH user control path.
-   A caller-supplied Origin or a boolean such as user_approved is NOT proof of
-   authorization. Bind grants to server-issued connection identities and enforce
-   scope, atomic consumption, cancellation, expiry and restart revocation.
-   Browser CSRF/cross-origin writes must be rejected. State threat limits honestly:
-   an agent with the same OS account and unrestricted filesystem is not an
-   adversarial security boundary.
-4. API settings: manage multiple provider profiles with name, base URL, protocol,
-   credential reference or masked secret input, model list retrieval and manual
-   model IDs. Never return secrets in public config, MCP, job history or logs.
-   Reuse supported DSH credential/provider services where feasible. At minimum
-   support OpenAI-compatible Chat Completions endpoints including the existing
-   relay; other protocols may use existing DSH adapters if actually supported.
+1. A fresh install starts with delegation OFF. The persisted switch is restored
+   on restart; installing the plugin or mentioning DeepSeek never enables it.
+   Codex normally executes its own tasks unless the user explicitly requests
+   delegation.
+2. DSH UI exposes one local-call switch. ON allows local MCP task submissions;
+   OFF rejects new submissions and requests cancellation of live tasks. Status,
+   result reads and cancellation remain available while OFF.
+3. MCP tools do not expose configuration, credential, grant or switch writes and
+   require no issued connection token. The execution plane is loopback-only.
+   While enabled, another process running as the same local user may still call
+   it; the switch is an operator control, not per-process authentication or a
+   same-user security boundary. Browser control writes remain protected by the
+   native DSH session and origin fence.
+4. Provider selection comes from DSH's registered provider list. Model and
+   reasoning-effort choices come from exact DSH model metadata; the plugin does
+   not ask users to copy API endpoints or credentials. It never returns DSH
+   secrets in public config, MCP, job history or logs.
 5. Worker settings: independently choose provider, model, supported reasoning
    effort, timeout, maximum parallelism and workspace isolation. Per-model effort
    capabilities are explicit; reject unsupported combinations rather than silently
@@ -63,14 +62,14 @@ credentials, registry, startup entries or live host registrations.
    diff and validation evidence, time and available usage. Execution completion
    must NOT mean host acceptance; host acceptance is a distinct explicit action
    or is left to Codex and labeled honestly. Cancel and explicit retry supported;
-   a retry must have valid authorization, never silently reuse a consumed grant.
+   a retry requires the local switch to be ON and never silently resubmits work.
 9. Connectivity checks: separate HTTP/auth/catalog success from an actual model
    response. Allow a practical token budget, recognize reasoning-only responses,
    return bounded redacted diagnostics; do not repeat the maxTokens=1 false timeout.
-10. DSH settings UI: authorization control above four areas: API management,
-    execution settings, additional review, task records. Plain Chinese labels,
-    usable form controls, masked secrets, explicit save/errors/loading and actual
-    effective values. Do not expose implementation details in ordinary user flows.
+10. DSH settings UI: one local-call switch above four areas: DSH API selection,
+    execution settings, additional review and task records. Plain Chinese labels,
+    usable form controls, explicit save/errors/loading and actual effective
+    values. Do not ask users to re-enter DSH provider credentials.
 11. Shipping: installable npm .tgz with DSH bundle patch, native backend entry,
     DSH settings client entry, MCP executable, README with installation/use,
     supported runtime versions, configuration/secret handling, upgrade/export
@@ -81,6 +80,16 @@ credentials, registry, startup entries or live host registrations.
 12. Configuration presets/export: export nonsecret settings; allow saving reusable
     execution/review combinations. Credentials remain separate. Existing jobs use
     their immutable effective configuration snapshot.
+13. Optional Codex custom-agent companion: install only through an explicit command,
+    writing `CODEX_HOME/agents/dsh-delegate.toml` (or `~/.codex/agents` when unset).
+    Do not edit `config.toml` or register MCP implicitly. Refuse to overwrite a
+    different same-name agent; remove only the unchanged bundled template. The
+    agent dispatches only on explicit user intent, checks the DSH switch first,
+    omits per-task route overrides so DSH applies its selected worker settings
+    and matching project overrides, and never falls back to Crew or another
+    route. Report the actual route from the result. Do not claim direct
+    `@dsh-delegate` invocation unless the active Codex surface officially
+    supports it.
 
 ## Development constraints and available reference installation
 

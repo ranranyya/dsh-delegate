@@ -1,8 +1,8 @@
 // Plugin-owned configuration constants and defaults.
 //
-// dsh-delegate owns exactly one namespace and one document. Nothing here turns
-// delegation on: the module exposes no persisted "enabled" switch at all, so a
-// restart cannot resurrect an authorization that a previous process held.
+// dsh-delegate owns exactly one namespace and one document. Delegation is
+// disabled on a fresh install; the operator controls it with one persisted
+// switch in the authenticated DSH settings page.
 
 /** Persisted document format version. Unknown versions are refused, never migrated silently. */
 export const SCHEMA_VERSION = 1;
@@ -16,13 +16,24 @@ export const HISTORY_FILE = 'jobs.json';
 /** Provider wire protocols this stage actually supports. */
 export const SUPPORTED_PROTOCOLS = Object.freeze(['openai-chat']);
 
-/** Workspace isolation modes. `worktree` requires a committed git repository. */
-export const ISOLATION_MODES = Object.freeze(['shared', 'worktree']);
+/**
+ * Workspace isolation modes, strongest first.
+ *
+ * `worktree` is the default: a mutation runs in a disposable git worktree so the
+ * operator's checkout is untouched. It requires a committed repository, and this
+ * stage refuses it rather than downgrading (see `src/jobs/engine.js`). `shared`
+ * therefore has to be *chosen* by the operator — it is never a silent fallback.
+ */
+export const ISOLATION_MODES = Object.freeze(['worktree', 'shared']);
+
+/** Isolation mode stored when a document does not name one. */
+export const DEFAULT_ISOLATION = 'worktree';
 
 /** Hard bounds. Exceeding any of these is a validation error, not a clamp. */
 export const LIMITS = Object.freeze({
   providers: 32,
   manualModelsPerProvider: 128,
+  presets: 32,
   timeoutSecondsMin: 30,
   timeoutSecondsMax: 2 * 60 * 60,
   maxParallelismMin: 1,
@@ -35,16 +46,28 @@ export const LIMITS = Object.freeze({
   reviewPromptChars: 400_000,
 });
 
-/** Reasoning efforts are opaque adapter-owned ids; only declared ones are accepted. */
-export const KNOWN_EFFORTS = Object.freeze(['minimal', 'low', 'medium', 'high', 'maximum']);
+/**
+ * The complete set of native reasoning-effort ids this build understands, in
+ * canonical order (weakest first).
+ *
+ * These are *ids the wire protocol accepts*, not a claim that any model supports
+ * them. Whether a given model can take one is declared per model in
+ * `provider.models[].efforts`, and both validation and routing refuse anything a
+ * model has not declared. `off` is a real id meaning "no reasoning", not an
+ * absence of a value: a model must declare it explicitly.
+ */
+export const KNOWN_EFFORTS = Object.freeze(['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max']);
+
+/** Canonical sort index for declared effort ids. */
+export const EFFORT_ORDER = Object.freeze(new Map(KNOWN_EFFORTS.map((id, index) => [id, index])));
 
 /**
- * Default settings document. Delegation is off because there is no stored
- * enablement field; authorization lives only in the in-process grant store.
+ * Default settings document. Delegation is off until the operator enables it.
  */
 export function defaultSettings() {
   return {
     schemaVersion: SCHEMA_VERSION,
+    delegationEnabled: false,
     providers: [],
     worker: {
       providerId: null,
@@ -52,7 +75,7 @@ export function defaultSettings() {
       reasoningEffort: null,
       timeoutSeconds: 1800,
       maxParallelism: 1,
-      isolation: 'shared',
+      isolation: DEFAULT_ISOLATION,
     },
     review: {
       enabled: false,
@@ -60,10 +83,16 @@ export function defaultSettings() {
       model: null,
       reasoningEffort: null,
     },
+    // Kept separate from the legacy in-memory connection/grant compatibility
+    // layer. New installations use this one switch for MCP dispatch.
     authorization: {
       taskGrantTtlSeconds: 900,
       sessionGrantTtlSeconds: 4 * 60 * 60,
     },
     projectOverrides: {},
+    // Named, non-secret worker/review combinations. Empty by default, and absent
+    // in documents written before presets existed — validation fills it in, so
+    // schema version 1 stays readable both ways.
+    presets: [],
   };
 }

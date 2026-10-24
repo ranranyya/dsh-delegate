@@ -6,10 +6,14 @@
 // provider/model/effort combination is legal, so an unsupported combination has
 // one refusal point instead of being silently ignored later.
 
+import { posix, win32 } from 'node:path';
+
 import {
+  DEFAULT_ISOLATION,
+  EFFORT_ORDER,
   ISOLATION_MODES,
-  LIMITS,
   KNOWN_EFFORTS,
+  LIMITS,
   SCHEMA_VERSION,
   SUPPORTED_PROTOCOLS,
   defaultSettings,
@@ -31,7 +35,27 @@ export class ConfigError extends Error {
 }
 
 const ID_PATTERN = /^[a-z0-9][a-z0-9-]{1,38}[a-z0-9]$/;
+const PROVIDER_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:@/-]{0,159}$/;
 const CREDENTIAL_REF_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
+/**
+ * Provider-profile keys that may only ever carry a credential *reference*.
+ * A profile carrying one of these is refused instead of having it dropped, so an
+ * operator who pasted a key learns immediately that it was not stored.
+ */
+const PROVIDER_SECRET_KEYS = Object.freeze([
+  'apiKey',
+  'api_key',
+  'apikey',
+  'key',
+  'token',
+  'secret',
+  'password',
+  'passwd',
+  'authorization',
+  'bearer',
+  'headers',
+]);
 
 function requireString(value, code, field, { max = 200, pattern = null, allowEmpty = false } = {}) {
   if (typeof value !== 'string') throw new ConfigError(code, `${field} must be a string`, { field });
@@ -62,15 +86,65 @@ function optionalString(value, code, field, options) {
   return requireString(value, code, field, options);
 }
 
+/** Whether a raw path string is a Windows-style absolute path (drive or UNC). */
+const WINDOWS_STYLE = /^(?:[A-Za-z]:[\\/]|\\\\)/;
+
+function stripTrailingSeparators(candidate, pathImpl) {
+  let out = candidate;
+  const { root } = pathImpl.parse(candidate);
+  while (out.length > root.length && /[\\/]$/.test(out)) out = out.slice(0, -1);
+  return out;
+}
+
 /**
- * Validate one `http(s)` base URL. Loopback plaintext is allowed because the
- * shipped relay runs there; anything else must not silently downgrade.
+ * Canonicalize one absolute project path.
+ *
+ * One canonical form is used by validation, by every settings mutation and by
+ * lookup when a job composes its effective configuration, so `C:/Work/Proj/`,
+ * `c:\work\proj` and `C:\Work\Proj` are the same project key instead of three
+ * overrides that only one of which ever applies.
+ *
+ * Rules:
+ *  - the input must be absolute (a relative key is refused, never resolved
+ *    against the plugin's own cwd, which would silently pick a different project);
+ *  - separators are normalized to the path style's native separator and `.`/`..`
+ *    are collapsed, with a trailing separator removed except at a filesystem root;
+ *  - Windows-style paths (and any path on Windows) are case-folded for the key,
+ *    because NTFS compares case-insensitively while a JSON object key does not.
+ * @param {string} projectPath - absolute project path.
+ * @param {string} [field] - field name for refusals.
+ * @returns {{ key: string, display: string }} canonical lookup key and normalized display form.
+ */
+export function canonicalProjectKey(projectPath, field = 'projectPath') {
+  const raw = requireString(projectPath, 'PROJECT_OVERRIDE_INVALID', field, { max: 1024 });
+  const windowsStyle = WINDOWS_STYLE.test(raw);
+  const pathImpl = windowsStyle ? win32 : posix;
+  if (!pathImpl.isAbsolute(raw)) {
+    throw new ConfigError('PROJECT_OVERRIDE_INVALID', `${field} must be an absolute path`, { field });
+  }
+  const display = stripTrailingSeparators(pathImpl.normalize(raw), pathImpl);
+  const foldCase = windowsStyle || process.platform === 'win32';
+  return { key: foldCase ? display.toLowerCase() : display, display };
+}
+
+/**
+ * Validate one `http(s)` base URL.
+ *
+ * A base URL is persisted in the settings document and can be exported, so it is
+ * an endpoint *without* anything that could carry a secret: no `user:password@`
+ * authority (the classic way a key ends up inside a URL) and no query or fragment
+ * at all, including a bare `?` or `#` — those are exactly where an SDK would
+ * append an `api_key=…` parameter. Plaintext loopback is allowed because the
+ * shipped relay runs there; anything else must be `https`.
  * @param {unknown} value - candidate base URL.
  * @param {string} field - field name for the refusal.
- * @returns {string} normalized base URL without a trailing slash.
+ * @returns {string} normalized base URL without a trailing slash, query or fragment.
  */
 export function validateBaseUrl(value, field = 'baseUrl') {
   const raw = requireString(value, 'PROVIDER_BASE_URL_INVALID', field, { max: 2048 });
+  if (raw.includes('?') || raw.includes('#')) {
+    throw new ConfigError('PROVIDER_BASE_URL_INVALID', `${field} must not contain a query or fragment`, { field });
+  }
   let parsed;
   try {
     parsed = new URL(raw);
@@ -83,7 +157,15 @@ export function validateBaseUrl(value, field = 'baseUrl') {
   if (parsed.username !== '' || parsed.password !== '') {
     throw new ConfigError('PROVIDER_BASE_URL_INVALID', `${field} must not embed credentials`, { field });
   }
-  return `${parsed.origin}${parsed.pathname.replace(/\/+$/, '')}${parsed.search}`;
+  if (parsed.search !== '' || parsed.hash !== '') {
+    // Defence in depth: a URL implementation that keeps a query would persist it.
+    throw new ConfigError('PROVIDER_BASE_URL_INVALID', `${field} must not contain a query or fragment`, { field });
+  }
+  if (parsed.hostname === '') {
+    throw new ConfigError('PROVIDER_BASE_URL_INVALID', `${field} must name a host`, { field });
+  }
+  const path = parsed.pathname.replace(/\/+$/, '');
+  return `${parsed.protocol}//${parsed.host}${path}`;
 }
 
 /**
@@ -101,27 +183,49 @@ export function validateCredentialRef(value) {
 }
 
 /**
+ * Normalize a model's declared reasoning-effort list.
+ *
+ * The declaration is the *only* authority on what a model supports: an id that
+ * this build does not know is refused outright (it would be sent to a provider
+ * that may ignore or reject it), and the accepted ids are sorted into the
+ * canonical weakest-to-strongest order so a UI renders a stable list.
+ * @param {unknown} value - candidate `efforts` array.
+ * @param {string} modelId - model id for refusals.
+ * @returns {string[]} canonical effort ids.
+ */
+function normalizeDeclaredEfforts(value, modelId, { native = false } = {}) {
+  const raw = value ?? [];
+  if (!Array.isArray(raw)) throw new ConfigError('MODEL_EFFORTS_INVALID', 'model.efforts must be a list', { model: modelId });
+  if (raw.length > (native ? 64 : KNOWN_EFFORTS.length)) {
+    throw new ConfigError('MODEL_EFFORTS_INVALID', 'model.efforts declares more efforts than exist', { model: modelId });
+  }
+  const efforts = [];
+  for (const effort of raw) {
+    if (typeof effort !== 'string' || effort.length > 80 || effort.trim() !== effort || effort === ''
+      || (!native && !KNOWN_EFFORTS.includes(effort))) {
+      throw new ConfigError('MODEL_EFFORTS_INVALID', `unsupported reasoning effort ${JSON.stringify(effort)}`, {
+        model: modelId,
+        supported: [...KNOWN_EFFORTS],
+      });
+    }
+    if (!efforts.includes(effort)) efforts.push(effort);
+  }
+  return native
+    ? efforts
+    : efforts.sort((a, b) => EFFORT_ORDER.get(a) - EFFORT_ORDER.get(b));
+}
+
+/**
  * Validate one declared model entry, including its effort capability list.
  * @param {unknown} value - candidate model declaration.
  * @returns {{ id: string, efforts: string[], contextWindow: number | null }} normalized entry.
  */
-export function validateModelDeclaration(value) {
+export function validateModelDeclaration(value, options = {}) {
   if (value === null || typeof value !== 'object' || Array.isArray(value)) {
     throw new ConfigError('MODEL_INVALID', 'model declaration must be an object', {});
   }
   const id = requireString(value.id, 'MODEL_INVALID', 'model.id', { max: 160 });
-  const rawEfforts = value.efforts ?? [];
-  if (!Array.isArray(rawEfforts)) throw new ConfigError('MODEL_EFFORTS_INVALID', 'model.efforts must be a list', { model: id });
-  if (rawEfforts.length > KNOWN_EFFORTS.length) {
-    throw new ConfigError('MODEL_EFFORTS_INVALID', 'model.efforts declares more efforts than exist', { model: id });
-  }
-  const efforts = [];
-  for (const effort of rawEfforts) {
-    if (typeof effort !== 'string' || !KNOWN_EFFORTS.includes(effort)) {
-      throw new ConfigError('MODEL_EFFORTS_INVALID', `unsupported reasoning effort ${JSON.stringify(effort)}`, { model: id });
-    }
-    if (!efforts.includes(effort)) efforts.push(effort);
-  }
+  const efforts = normalizeDeclaredEfforts(value.efforts, id, options);
   const contextWindow = value.contextWindow === undefined || value.contextWindow === null
     ? null
     : requireInt(value.contextWindow, 'MODEL_INVALID', 'model.contextWindow', 1024, 10_000_000);
@@ -137,8 +241,33 @@ export function validateProviderProfile(value) {
   if (value === null || typeof value !== 'object' || Array.isArray(value)) {
     throw new ConfigError('PROVIDER_INVALID', 'provider profile must be an object', {});
   }
-  const id = requireString(value.id, 'PROVIDER_ID_INVALID', 'provider.id', { max: 40, pattern: ID_PATTERN });
+  const id = requireString(value.id, 'PROVIDER_ID_INVALID', 'provider.id', { max: 160, pattern: PROVIDER_ID_PATTERN });
   const name = requireString(value.name, 'PROVIDER_NAME_INVALID', 'provider.name', { max: 80 });
+  const source = value.source ?? 'custom';
+  if (source !== 'native' && source !== 'custom') {
+    throw new ConfigError('PROVIDER_SOURCE_UNSUPPORTED', 'provider.source is unsupported', { id });
+  }
+  for (const key of PROVIDER_SECRET_KEYS) {
+    const candidate = value[key];
+    if (candidate === undefined || candidate === null || candidate === '') continue;
+    // A secret value must enter through the credential seam, never through a
+    // settings document that is exported, logged and packaged.
+    throw new ConfigError('PROVIDER_SECRET_IN_SETTINGS', `provider ${key} is a secret; use credentialRef`, { id });
+  }
+  const rawModels = value.models ?? [];
+  if (!Array.isArray(rawModels)) throw new ConfigError('MODEL_INVALID', 'provider.models must be a list', { id });
+  if (rawModels.length > LIMITS.manualModelsPerProvider) {
+    throw new ConfigError('MODEL_INVALID', `provider.models exceeds ${LIMITS.manualModelsPerProvider} entries`, { id });
+  }
+  const models = rawModels.map((entry) => validateModelDeclaration(entry, { native: source === 'native' }));
+  const seen = new Set();
+  for (const model of models) {
+    if (seen.has(model.id)) throw new ConfigError('MODEL_DUPLICATE', `duplicate model id ${model.id}`, { id });
+    seen.add(model.id);
+  }
+  if (source === 'native') {
+    return { id, name, source, protocol: null, baseUrl: null, credentialRef: null, models };
+  }
   const protocol = requireString(value.protocol ?? 'openai-chat', 'PROVIDER_PROTOCOL_UNSUPPORTED', 'provider.protocol', { max: 40 });
   if (!SUPPORTED_PROTOCOLS.includes(protocol)) {
     throw new ConfigError('PROVIDER_PROTOCOL_UNSUPPORTED', `protocol ${protocol} is not supported by this stage`, {
@@ -150,23 +279,7 @@ export function validateProviderProfile(value) {
   const credentialRef = value.credentialRef === null || value.credentialRef === undefined
     ? null
     : validateCredentialRef(value.credentialRef);
-  if (value.apiKey !== undefined && value.apiKey !== null && value.apiKey !== '') {
-    // A secret value must enter through the credential seam, never through a
-    // settings document that is exported, logged and packaged.
-    throw new ConfigError('PROVIDER_SECRET_IN_SETTINGS', 'provider secrets are stored through the credential seam, not in settings', { id });
-  }
-  const rawModels = value.models ?? [];
-  if (!Array.isArray(rawModels)) throw new ConfigError('MODEL_INVALID', 'provider.models must be a list', { id });
-  if (rawModels.length > LIMITS.manualModelsPerProvider) {
-    throw new ConfigError('MODEL_INVALID', `provider.models exceeds ${LIMITS.manualModelsPerProvider} entries`, { id });
-  }
-  const models = rawModels.map(validateModelDeclaration);
-  const seen = new Set();
-  for (const model of models) {
-    if (seen.has(model.id)) throw new ConfigError('MODEL_DUPLICATE', `duplicate model id ${model.id}`, { id });
-    seen.add(model.id);
-  }
-  return { id, name, protocol, baseUrl, credentialRef, models };
+  return { id, name, source, protocol, baseUrl, credentialRef, models };
 }
 
 /**
@@ -193,15 +306,15 @@ export function validateProviders(value) {
  *
  * This is the single decision point for "is this provider/model/effort
  * combination real". It never substitutes another model or effort for the one
- * requested: an unknown provider, an undeclared model, or an effort the model
- * does not declare is a refusal.
+ * requested: an unknown provider, an undeclared model, an effort id this build
+ * does not know, or an effort the model does not declare is a refusal.
  * @param {{ providerId: unknown, model: unknown, reasoningEffort: unknown }} selection - requested triple.
  * @param {object[]} providers - validated provider list.
  * @param {string} field - field prefix for refusals.
  * @returns {{ providerId: string, model: string, reasoningEffort: string | null, provider: object, modelEntry: object }} resolved triple.
  */
 export function validateSelection(selection, providers, field = 'selection') {
-  const providerId = requireString(selection?.providerId, 'SELECTION_PROVIDER_REQUIRED', `${field}.providerId`, { max: 40, pattern: ID_PATTERN });
+  const providerId = requireString(selection?.providerId, 'SELECTION_PROVIDER_REQUIRED', `${field}.providerId`, { max: 160, pattern: PROVIDER_ID_PATTERN });
   const provider = providers.find((entry) => entry.id === providerId);
   if (provider === undefined) {
     throw new ConfigError('SELECTION_PROVIDER_UNKNOWN', `provider ${providerId} is not configured`, { providerId });
@@ -215,8 +328,12 @@ export function validateSelection(selection, providers, field = 'selection') {
   if (requested === null) {
     return { providerId, model, reasoningEffort: null, provider, modelEntry };
   }
-  if (typeof requested !== 'string' || !KNOWN_EFFORTS.includes(requested)) {
-    throw new ConfigError('SELECTION_EFFORT_UNKNOWN', `reasoning effort ${JSON.stringify(requested)} does not exist`, { providerId, model });
+  if (typeof requested !== 'string' || requested === '' || requested.length > 80 || requested.trim() !== requested) {
+    throw new ConfigError('SELECTION_EFFORT_UNKNOWN', `reasoning effort ${JSON.stringify(requested)} does not exist`, {
+      providerId,
+      model,
+      supported: [...modelEntry.efforts],
+    });
   }
   if (!modelEntry.efforts.includes(requested)) {
     throw new ConfigError('SELECTION_EFFORT_UNSUPPORTED', `model ${model} does not support reasoning effort ${requested}`, {
@@ -227,6 +344,14 @@ export function validateSelection(selection, providers, field = 'selection') {
     });
   }
   return { providerId, model, reasoningEffort: requested, provider, modelEntry };
+}
+
+function validateIsolation(value, code, field) {
+  const isolation = requireString(value ?? DEFAULT_ISOLATION, code, field, { max: 16 });
+  if (!ISOLATION_MODES.includes(isolation)) {
+    throw new ConfigError(code, `isolation ${isolation} is not supported`, { field, isolation, supported: [...ISOLATION_MODES] });
+  }
+  return isolation;
 }
 
 /**
@@ -255,10 +380,9 @@ export function validateWorkerSettings(value, providers) {
     LIMITS.maxParallelismMin,
     LIMITS.maxParallelismMax,
   );
-  const isolation = requireString(source.isolation ?? 'shared', 'WORKER_ISOLATION_INVALID', 'worker.isolation', { max: 16 });
-  if (!ISOLATION_MODES.includes(isolation)) {
-    throw new ConfigError('WORKER_ISOLATION_INVALID', `isolation ${isolation} is not supported`, { isolation, supported: [...ISOLATION_MODES] });
-  }
+  // Isolation is a decision, not a fallback: an absent value is the documented
+  // default (worktree) and `shared` must be stated by the operator.
+  const isolation = validateIsolation(source.isolation, 'WORKER_ISOLATION_INVALID', 'worker.isolation');
   return {
     providerId: selection.providerId,
     model: selection.model,
@@ -294,31 +418,15 @@ export function validateReviewSettings(value, providers) {
   };
 }
 
-/**
- * Validate the authorization TTL block.
- * @param {unknown} value - candidate authorization block.
- * @returns {object} normalized authorization block.
- */
+/** Validate legacy grant TTLs kept for backwards-compatible imports. */
 export function validateAuthorizationSettings(value) {
   const source = value ?? {};
   if (typeof source !== 'object' || Array.isArray(source)) {
     throw new ConfigError('AUTHORIZATION_INVALID', 'authorization settings must be an object', {});
   }
   return {
-    taskGrantTtlSeconds: requireInt(
-      source.taskGrantTtlSeconds ?? 900,
-      'AUTHORIZATION_INVALID',
-      'authorization.taskGrantTtlSeconds',
-      LIMITS.taskGrantTtlSecondsMin,
-      LIMITS.taskGrantTtlSecondsMax,
-    ),
-    sessionGrantTtlSeconds: requireInt(
-      source.sessionGrantTtlSeconds ?? 4 * 60 * 60,
-      'AUTHORIZATION_INVALID',
-      'authorization.sessionGrantTtlSeconds',
-      LIMITS.sessionGrantTtlSecondsMin,
-      LIMITS.sessionGrantTtlSecondsMax,
-    ),
+    taskGrantTtlSeconds: requireInt(source.taskGrantTtlSeconds ?? 900, 'AUTHORIZATION_INVALID', 'authorization.taskGrantTtlSeconds', LIMITS.taskGrantTtlSecondsMin, LIMITS.taskGrantTtlSecondsMax),
+    sessionGrantTtlSeconds: requireInt(source.sessionGrantTtlSeconds ?? 4 * 60 * 60, 'AUTHORIZATION_INVALID', 'authorization.sessionGrantTtlSeconds', LIMITS.sessionGrantTtlSecondsMin, LIMITS.sessionGrantTtlSecondsMax),
   };
 }
 
@@ -348,8 +456,8 @@ export function validateJobOverrides(value, providers) {
   const out = {};
   if (value.providerId !== undefined) {
     const providerId = requireString(value.providerId, 'SELECTION_PROVIDER_REQUIRED', 'override.providerId', {
-      max: 40,
-      pattern: ID_PATTERN,
+      max: 160,
+      pattern: PROVIDER_ID_PATTERN,
     });
     if (!providers.some((entry) => entry.id === providerId)) {
       throw new ConfigError('SELECTION_PROVIDER_UNKNOWN', `provider ${providerId} is not configured`, { providerId });
@@ -361,8 +469,10 @@ export function validateJobOverrides(value, providers) {
   }
   if (value.reasoningEffort !== undefined && value.reasoningEffort !== null) {
     const effort = value.reasoningEffort;
-    if (typeof effort !== 'string' || !KNOWN_EFFORTS.includes(effort)) {
-      throw new ConfigError('SELECTION_EFFORT_UNKNOWN', `reasoning effort ${JSON.stringify(effort)} does not exist`, {});
+    if (typeof effort !== 'string' || effort === '' || effort.length > 80 || effort.trim() !== effort) {
+      throw new ConfigError('SELECTION_EFFORT_UNKNOWN', `reasoning effort ${JSON.stringify(effort)} does not exist`, {
+        supported: [...KNOWN_EFFORTS],
+      });
     }
     out.reasoningEffort = effort;
   } else if (value.reasoningEffort === null) {
@@ -380,11 +490,7 @@ export function validateJobOverrides(value, providers) {
     );
   }
   if (value.isolation !== undefined) {
-    const isolation = requireString(value.isolation, 'WORKER_ISOLATION_INVALID', 'override.isolation', { max: 16 });
-    if (!ISOLATION_MODES.includes(isolation)) {
-      throw new ConfigError('WORKER_ISOLATION_INVALID', `isolation ${isolation} is not supported`, { isolation });
-    }
-    out.isolation = isolation;
+    out.isolation = validateIsolation(value.isolation, 'WORKER_ISOLATION_INVALID', 'override.isolation');
   }
   return out;
 }
@@ -403,6 +509,86 @@ export function validateProjectOverride(value, providers) {
   if (value.worker !== undefined) out.worker = validateWorkerSettings(value.worker, providers);
   if (value.review !== undefined) out.review = validateReviewSettings(value.review, providers);
   return out;
+}
+
+/**
+ * Validate the project-override map, canonicalizing every key.
+ *
+ * Two spellings of one project (`C:/work/p` and `c:\WORK\p`) would otherwise be
+ * two independent overrides of which only the lookup spelling ever applies, so a
+ * duplicate canonical key is refused rather than silently merged.
+ * @param {unknown} value - candidate `projectOverrides` map.
+ * @param {object[]} providers - validated providers.
+ * @returns {Record<string, object>} map keyed by canonical display path.
+ */
+export function validateProjectOverrides(value, providers) {
+  const raw = value ?? {};
+  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
+    throw new ConfigError('PROJECT_OVERRIDE_INVALID', 'projectOverrides must be an object', {});
+  }
+  const out = {};
+  const seen = new Map();
+  for (const [projectPath, block] of Object.entries(raw)) {
+    const { key, display } = canonicalProjectKey(projectPath, 'projectOverrides key');
+    const existing = seen.get(key);
+    if (existing !== undefined) {
+      throw new ConfigError('PROJECT_OVERRIDE_DUPLICATE', 'two project overrides name the same project', {
+        key,
+        paths: [existing, display],
+      });
+    }
+    seen.set(key, display);
+    out[display] = validateProjectOverride(block, providers);
+  }
+  return out;
+}
+
+/**
+ * Validate one named preset: a reusable, entirely non-secret worker/review
+ * combination. Both blocks are validated against the same provider list as live
+ * settings, so a preset can never store a combination that settings would refuse.
+ * @param {unknown} value - candidate preset.
+ * @param {object[]} providers - validated providers.
+ * @returns {{ id: string, name: string, worker: object | null, review: object | null }} normalized preset.
+ */
+export function validatePreset(value, providers) {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+    throw new ConfigError('PRESET_INVALID', 'preset must be an object', {});
+  }
+  const id = requireString(value.id, 'PRESET_INVALID', 'preset.id', { max: 40, pattern: ID_PATTERN });
+  const name = requireString(value.name ?? id, 'PRESET_INVALID', 'preset.name', { max: 80 });
+  if (value.worker === undefined && value.review === undefined) {
+    throw new ConfigError('PRESET_INVALID', 'preset must contain worker or review settings', { id });
+  }
+  return {
+    id,
+    name,
+    worker: value.worker === undefined ? null : validateWorkerSettings(value.worker, providers),
+    review: value.review === undefined ? null : validateReviewSettings(value.review, providers),
+  };
+}
+
+/**
+ * Validate the preset list (backward compatible: a document without presets has
+ * none). A preset only refers to providers by id, so it holds no endpoint,
+ * credential reference or secret.
+ * @param {unknown} value - candidate `presets` array.
+ * @param {object[]} providers - validated providers.
+ * @returns {object[]} normalized presets.
+ */
+export function validatePresets(value, providers) {
+  const raw = value ?? [];
+  if (!Array.isArray(raw)) throw new ConfigError('PRESET_INVALID', 'presets must be a list', {});
+  if (raw.length > LIMITS.presets) {
+    throw new ConfigError('PRESET_INVALID', `presets exceeds ${LIMITS.presets} entries`, {});
+  }
+  const presets = raw.map((entry) => validatePreset(entry, providers));
+  const seen = new Set();
+  for (const preset of presets) {
+    if (seen.has(preset.id)) throw new ConfigError('PRESET_DUPLICATE', `duplicate preset id ${preset.id}`, { id: preset.id });
+    seen.add(preset.id);
+  }
+  return presets;
 }
 
 /**
@@ -452,24 +638,14 @@ export function validateSettings(value, options = {}) {
     throw new ConfigError('SETTINGS_NO_PROVIDERS', 'no provider profile is configured', {});
   }
 
-  const rawProjects = value.projectOverrides ?? {};
-  if (rawProjects === null || typeof rawProjects !== 'object' || Array.isArray(rawProjects)) {
-    throw new ConfigError('PROJECT_OVERRIDE_INVALID', 'projectOverrides must be an object', {});
-  }
-  const projectOverrides = {};
-  for (const [projectPath, block] of Object.entries(rawProjects)) {
-    if (!projectPath.startsWith('/') && !/^[A-Za-z]:[\\/]/.test(projectPath)) {
-      throw new ConfigError('PROJECT_OVERRIDE_INVALID', 'project override keys must be absolute paths', { path: projectPath });
-    }
-    projectOverrides[projectPath] = validateProjectOverride(block, providers);
-  }
-
   return {
     schemaVersion: SCHEMA_VERSION,
+    delegationEnabled: requireBool(value.delegationEnabled ?? false, 'SETTINGS_INVALID', 'delegationEnabled'),
     providers,
     worker,
     review,
     authorization: validateAuthorizationSettings(value.authorization),
-    projectOverrides,
+    projectOverrides: validateProjectOverrides(value.projectOverrides, providers),
+    presets: validatePresets(value.presets, providers),
   };
 }

@@ -151,7 +151,17 @@ function statusForCode(code) {
   if (code === 'WORKSPACE_BUSY') return 409;
   if (code.startsWith('ROUTING_')) return 409;
   if (code.startsWith('AUDIT_')) return 409;
+  // An archived task is not a request error: the task exists, but only as a
+  // durable record, so the action conflicts with the task's real state.
+  if (code === 'JOB_ARCHIVED_TASK') return 409;
   if (code.startsWith('JOB_')) return 409;
+  // The credential seam is a separate service. "It is not installed here" is a
+  // capability gap (503), "the backend refused the write" is an upstream failure
+  // (502), and "the caller sent no usable value" is the caller's mistake (400).
+  if (code === 'CREDENTIAL_SEAM_UNAVAILABLE') return 503;
+  if (code === 'CREDENTIAL_OPERATION_FAILED' || code === 'CREDENTIAL_READ_ONLY') return 502;
+  if (code === 'CREDENTIAL_VALUE_REQUIRED' || code === 'CREDENTIAL_VALUE_TOO_LARGE' || code === 'CREDENTIAL_REF_INVALID') return 400;
+  if (code.startsWith('CREDENTIAL_')) return 409;
   if (code === 'BODY_TOO_LARGE') return 413;
   if (code === 'BODY_INVALID_JSON' || code === 'BODY_NOT_OBJECT') return 400;
   return 400;

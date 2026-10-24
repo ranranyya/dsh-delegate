@@ -120,8 +120,19 @@ async function fixture() {
   await settings.replace(validSettings());
   const auth = new AuthorizationRegistry();
   const engineCalls = [];
+  let delegationEnabled = false;
   const engine = {
-    posture: () => ({ authorized: false, reason: 'delegation is off' }),
+    authorizationMode: 'grants',
+    posture: () => ({
+      authorized: delegationEnabled,
+      reason: delegationEnabled ? null : 'delegation is off',
+      mode: 'switch',
+    }),
+    setDelegationEnabled(enabled) {
+      delegationEnabled = enabled === true;
+      engineCalls.push(['delegation', delegationEnabled]);
+      return this.posture();
+    },
     list: (options) => {
       engineCalls.push(['list', options]);
       return [];
@@ -257,6 +268,91 @@ test('POST /api/dsh-delegate/settings commits a validated document', async () =>
     assert.equal(result.body.settings.worker.reasoningEffort, 'high');
     const stored = await settings.read();
     assert.equal(stored.worker.model, 'deepseek-reasoner', 'the commit must reach the store, not just the response');
+  } finally {
+    await cleanup(dir);
+  }
+});
+
+test('the native provider selector lists only DSH-registered providers with declared model efforts', async () => {
+  const { dir, deps } = await fixture();
+  try {
+    deps.llm = {
+      listProviders: () => [
+        { id: 'workbuddy', name: 'WorkBuddy' },
+        { id: 'dsh-delegate:relay', name: 'Plugin-owned route' },
+      ],
+      listModels: (providerId) => providerId === 'workbuddy'
+        ? [{ id: 'deepseek-v4.1-flash', name: 'DeepSeek V4.1 Flash' }]
+        : [],
+      resolveModelInfo: (providerId, modelId) => ({
+        provider: providerId,
+        id: modelId,
+        reasoning: { efforts: [{ id: 'high' }, { id: 'max' }], defaultEffort: 'high' },
+        context: { contextWindow: 128_000 },
+      }),
+    };
+    const result = await call(wrapUserPlaneRoutes(deps), 'GET', `${USER_PLANE_PREFIX}/native-providers`);
+    assert.equal(result.status, 200);
+    assert.equal(result.body.providers.length, 1, 'the selector must not offer its own dynamically registered route');
+    assert.deepEqual(result.body.providers[0], {
+      id: 'workbuddy',
+      name: 'WorkBuddy',
+      models: [{
+        id: 'deepseek-v4.1-flash',
+        name: 'DeepSeek V4.1 Flash',
+        efforts: ['high', 'max'],
+        contextWindow: 128_000,
+      }],
+      error: null,
+    });
+    assert.equal(JSON.stringify(result.body).includes('baseUrl'), false);
+    assert.equal(JSON.stringify(result.body).includes('credential'), false);
+  } finally {
+    await cleanup(dir);
+  }
+});
+
+test('the delegation endpoint is the only settings path that changes the switch', async () => {
+  const { dir, deps, settings, engineCalls } = await fixture();
+  try {
+    deps.engine.authorizationMode = 'switch';
+    const originalSet = settings.setDelegationEnabled.bind(settings);
+    let postureWhenPersisting;
+    settings.setDelegationEnabled = async (enabled) => {
+      postureWhenPersisting = deps.engine.posture().authorized;
+      return await originalSet(enabled);
+    };
+    const routes = wrapUserPlaneRoutes(deps);
+    const routePaths = new Set(routes.map((route) => route.path));
+    for (const path of [
+      `${USER_PLANE_PREFIX}/connections`,
+      `${USER_PLANE_PREFIX}/connections/revoke`,
+      `${USER_PLANE_PREFIX}/grants`,
+      `${USER_PLANE_PREFIX}/grants/revoke`,
+      `${USER_PLANE_PREFIX}/authorization/revoke-all`,
+    ]) {
+      assert.equal(routePaths.has(path), false, `${path} must not be registered in switch mode`);
+    }
+
+    const enabled = await call(routes, 'POST', `${USER_PLANE_PREFIX}/delegation`, { enabled: true });
+    assert.equal(enabled.status, 200);
+    assert.equal(enabled.body.delegation.authorized, true);
+    assert.equal((await settings.read()).delegationEnabled, true);
+    assert.deepEqual(engineCalls, [['delegation', true]]);
+
+    const fullConfig = validSettings({ delegationEnabled: false });
+    const saved = await call(routes, 'POST', `${USER_PLANE_PREFIX}/settings`, { settings: fullConfig });
+    assert.equal(saved.status, 200);
+    assert.equal(saved.body.settings.delegationEnabled, true, 'ordinary config saves preserve the live switch');
+    assert.equal(deps.engine.posture().authorized, true, 'ordinary config saves cannot disable or enable it');
+    assert.deepEqual(engineCalls, [['delegation', true]], 'saving other settings must not touch the switch');
+
+    const disabled = await call(routes, 'POST', `${USER_PLANE_PREFIX}/delegation`, { enabled: false });
+    assert.equal(disabled.status, 200);
+    assert.equal(postureWhenPersisting, false, 'the execution gate closes before persistence begins');
+    assert.equal(disabled.body.delegation.authorized, false);
+    assert.equal((await settings.read()).delegationEnabled, false);
+    assert.deepEqual(engineCalls, [['delegation', true], ['delegation', false]]);
   } finally {
     await cleanup(dir);
   }
@@ -405,6 +501,355 @@ test('task reads and cancellation reach the engine with the operator cause', asy
     assert.equal(cancelled.status, 200);
     assert.equal(cancelled.body.task.state, 'cancelled');
     assert.deepEqual(engineCalls.at(-1), ['cancel', 'task-7', 'operator']);
+  } finally {
+    await cleanup(dir);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 4. Native route mapping on the read paths
+//
+// The observed field bug: `/models` answered `route: "workbuddy"` with
+// `models: []` and a `ROUTING_MODEL_UNRESOLVED` error, because the route map was
+// lost (a failed registration was swallowed into `null`, which the catalog treats
+// as "use the profile id") and the profile id happened to be the name of an
+// ambient route the plugin does not own.
+//
+// `/models` no longer enumerates the configured catalog at all: it is *remote
+// discovery* (one authenticated `GET <baseUrl>/models` against the selected
+// provider), so the route contract below holds it to a different truth — the
+// profile id is still never reported as a route, but an empty configured provider
+// can now obtain real ids, and a discovery failure is a distinct diagnosis rather
+// than a catalog error. `/catalog` keeps the configured-catalog contract.
+// ---------------------------------------------------------------------------
+
+/** A native LLM double that resolves only the routes it was given. */
+function mappedLlm(table) {
+  const calls = [];
+  return {
+    calls,
+    listProviders: () => Object.keys(table).map((id) => ({ id, name: id })),
+    async listModels(provider) {
+      calls.push(['listModels', provider]);
+      return Object.keys(table[provider] ?? {}).map((id) => ({ id, name: id }));
+    },
+    async resolveModelInfo(provider, model) {
+      calls.push(['resolveModelInfo', provider, model]);
+      const efforts = table[provider]?.[model];
+      if (efforts === undefined) {
+        const error = new Error(`no adapter registered for provider "${provider}"`);
+        error.code = 'NO_ADAPTER';
+        throw error;
+      }
+      return {
+        provider,
+        id: model,
+        name: model,
+        ...(efforts.length === 0 ? {} : { reasoning: { efforts: efforts.map((id) => ({ id, name: id })) } }),
+      };
+    },
+  };
+}
+
+const NATIVE = {
+  'dsh-delegate:relay': {
+    'deepseek-chat': ['low', 'medium', 'high'],
+    'deepseek-reasoner': ['medium', 'high'],
+  },
+};
+
+/**
+ * The only credential value used by `/models` tests. Not a key.
+ */
+const MODELS_DUMMY_KEY = 'sk-dummy-route-contract-value';
+
+/**
+ * A `fetch` double for the discovery request only.
+ *
+ * The remote request itself is proven against a real loopback server in
+ * `tests/discovery.test.js`; here it is replaced so the *route* contract can be
+ * tested without a socket per case.
+ * @param {object} [options] - `status`, `body`, `fail`, and the recorded `calls`.
+ * @returns {Function} fetch implementation with `calls` history.
+ */
+function discoveryFetch(options = {}) {
+  const calls = [];
+  const impl = async (url, init) => {
+    calls.push({ url: String(url), method: init?.method, authorization: init?.headers?.authorization ?? null });
+    if (options.fail !== undefined) throw options.fail;
+    const status = options.status ?? 200;
+    const payload = options.body ?? { data: [{ id: 'remote-model' }] };
+    return new Response(typeof payload === 'string' ? payload : JSON.stringify(payload), {
+      status,
+      headers: { 'content-type': 'application/json' },
+    });
+  };
+  impl.calls = calls;
+  return impl;
+}
+
+/** A credential gateway that answers one reference. */
+function dummyCredentials(table = { DSH_DELEGATE_RELAY_KEY: MODELS_DUMMY_KEY }) {
+  return {
+    async describe(ref) {
+      return { configured: typeof table[ref] === 'string', writable: true };
+    },
+    async resolve(ref) {
+      const value = table[ref];
+      return value === undefined ? undefined : { value, source: 'test' };
+    },
+  };
+}
+
+test('POST /models is remote discovery: it reports the provider\'s real ids from its API', async () => {
+  const { dir, deps } = await fixture();
+  try {
+    const llm = mappedLlm(NATIVE);
+    deps.llm = llm;
+    deps.credentials = dummyCredentials();
+    const fetchImpl = discoveryFetch({
+      body: { object: 'list', data: [{ id: 'deepseek-chat', owned_by: 'vendor' }, { id: 'fresh-model' }] },
+    });
+    deps.fetchImpl = fetchImpl;
+    deps.ensureRoutes = async () => new Map([['relay', 'dsh-delegate:relay']]);
+
+    const result = await call(wrapUserPlaneRoutes(deps), 'POST', `${USER_PLANE_PREFIX}/models`, { providerId: 'relay' });
+    assert.equal(result.status, 200);
+    assert.equal(result.body.source, 'remote');
+    assert.equal(result.body.error, null);
+    assert.equal(result.body.registration, null);
+    assert.equal(result.body.route, 'dsh-delegate:relay', 'the configured route is disclosed, not used for discovery');
+    // The ids come from the endpoint; `owned_by` and every other upstream field is dropped.
+    assert.deepEqual(result.body.models, [
+      { id: 'deepseek-chat', efforts: [] },
+      { id: 'fresh-model', efforts: [] },
+    ]);
+    // Discovery is not a catalog read: the native seam is never asked for models.
+    assert.deepEqual(llm.calls, []);
+    assert.equal(fetchImpl.calls.length, 1);
+    assert.equal(fetchImpl.calls[0].url, 'http://127.0.0.1:8443/v1/models');
+    assert.equal(fetchImpl.calls[0].authorization, `Bearer ${MODELS_DUMMY_KEY}`);
+    assert.equal(JSON.stringify(result.body).includes(MODELS_DUMMY_KEY), false);
+  } finally {
+    await cleanup(dir);
+  }
+});
+
+test('POST /models reports a discovery failure as its own diagnosis, never as a catalog error', async () => {
+  const { dir, deps, settings } = await fixture();
+  try {
+    const llm = mappedLlm(NATIVE);
+    deps.llm = llm;
+    deps.credentials = dummyCredentials();
+    deps.fetchImpl = discoveryFetch({ fail: new TypeError('fetch failed: getaddrinfo ENOTFOUND example.invalid') });
+    deps.ensureRoutes = async () => {
+      throw Object.assign(new Error('the provider routes could not be ensured'), { code: 'provider_registry' });
+    };
+    const before = await settings.read();
+
+    const result = await call(wrapUserPlaneRoutes(deps), 'POST', `${USER_PLANE_PREFIX}/models`, { providerId: 'relay' });
+    // The request itself is answered: a failed discovery is a diagnosis, not a crash.
+    assert.equal(result.status, 200);
+    assert.equal(result.body.route, null, 'a refused registration must not answer with the profile id');
+    assert.deepEqual(result.body.models, [], 'no list is invented');
+    assert.equal(result.body.source, 'remote');
+    // The failure is discovery's own code, not a routing/catalog code.
+    assert.equal(result.body.error.code, 'DISCOVERY_NETWORK_FAILED');
+    assert.equal(result.body.discovery.failed, true);
+    assert.equal(result.body.discovery.code, 'DISCOVERY_NETWORK_FAILED');
+    assert.equal(result.body.registration, null, 'discovery claims nothing about native registration');
+    // The upstream message names the operator's host and is not forwarded.
+    assert.equal(JSON.stringify(result.body).includes('ENOTFOUND'), false);
+    assert.equal(JSON.stringify(result.body).includes('example.invalid'), false);
+    assert.deepEqual(llm.calls.filter((entry) => entry[0] === 'resolveModelInfo'), []);
+    // Read-only: the stored document is unchanged, so manual entries stay usable.
+    assert.deepEqual(await settings.read(), before);
+  } finally {
+    await cleanup(dir);
+  }
+});
+
+test('POST /models of an empty configured provider discovers ids and reports no route', async () => {
+  const { dir, deps, settings } = await fixture();
+  try {
+    // The configuration this feature exists for: a provider with no models and no
+    // native route, which the old `/models` could only answer with `models: []`.
+    const empty = validSettings();
+    empty.providers[0] = { ...empty.providers[0], models: [] };
+    empty.worker = { providerId: null, model: null, reasoningEffort: null, timeoutSeconds: 600, maxParallelism: 1, isolation: 'shared' };
+    await settings.replace(empty);
+    deps.llm = mappedLlm({});
+    deps.credentials = dummyCredentials();
+    deps.fetchImpl = discoveryFetch({ body: { data: [{ id: 'real-remote-id' }] } });
+    // A host that cannot register routes at all: discovery must not care.
+    const result = await call(wrapUserPlaneRoutes(deps), 'POST', `${USER_PLANE_PREFIX}/models`, { providerId: 'relay' });
+    assert.equal(result.status, 200);
+    assert.equal(result.body.route, null);
+    assert.deepEqual(result.body.models.map((model) => model.id), ['real-remote-id']);
+    assert.equal(result.body.error, null);
+    assert.equal(result.body.discovery.failed, false);
+    assert.equal(result.body.discovery.note, 'a model listing does not establish reasoning-effort support');
+  } finally {
+    await cleanup(dir);
+  }
+});
+
+test('POST /models refuses an unknown provider and never borrows another provider\'s credential', async () => {
+  const { dir, deps } = await fixture();
+  try {
+    const fetchImpl = discoveryFetch();
+    deps.fetchImpl = fetchImpl;
+    // No credential gateway at all: even discovery cannot invent one.
+    const unknown = await call(wrapUserPlaneRoutes(deps), 'POST', `${USER_PLANE_PREFIX}/models`, { providerId: 'nope' });
+    assert.equal(unknown.status, 404);
+    assert.equal(unknown.body.error.code, 'PROVIDER_UNKNOWN');
+    assert.equal(fetchImpl.calls.length, 0);
+
+    const missing = await call(wrapUserPlaneRoutes(deps), 'POST', `${USER_PLANE_PREFIX}/models`, {});
+    assert.equal(missing.status, 400);
+    assert.equal(missing.body.error.code, 'PROVIDER_ID_REQUIRED');
+
+    // With no seam the answer is an explicit, non-secret diagnosis and no request.
+    const noSeam = await call(wrapUserPlaneRoutes(deps), 'POST', `${USER_PLANE_PREFIX}/models`, { providerId: 'relay' });
+    assert.equal(noSeam.status, 200);
+    assert.equal(noSeam.body.error.code, 'DISCOVERY_CREDENTIAL_SEAM_UNAVAILABLE');
+    assert.deepEqual(noSeam.body.models, []);
+    assert.equal(fetchImpl.calls.length, 0);
+  } finally {
+    await cleanup(dir);
+  }
+});
+
+test('POST /catalog maps every row to its registered route', async () => {
+  const { dir, deps, settings } = await fixture();
+  try {
+    const llm = mappedLlm({ ...NATIVE, 'dsh-delegate:backup': { 'deepseek-chat': ['medium'] } });
+    deps.llm = llm;
+    const next = validSettings();
+    next.providers.push({
+      id: 'backup',
+      name: 'Backup',
+      protocol: 'openai-chat',
+      baseUrl: 'http://127.0.0.1:9000/v1',
+      credentialRef: 'DSH_DELEGATE_BACKUP_KEY',
+      models: [{ id: 'deepseek-chat', efforts: ['medium'] }],
+    });
+    await settings.replace(next);
+    deps.ensureRoutes = async () => new Map([
+      ['relay', 'dsh-delegate:relay'],
+      ['backup', 'dsh-delegate:backup'],
+    ]);
+
+    const result = await call(wrapUserPlaneRoutes(deps), 'POST', `${USER_PLANE_PREFIX}/catalog`, {});
+    assert.equal(result.status, 200);
+    assert.equal(result.body.registration, null);
+    assert.deepEqual(result.body.catalog.map((entry) => entry.providerId), ['relay', 'backup']);
+    assert.deepEqual([...result.body.catalog.map((entry) => entry.route)], ['dsh-delegate:relay', 'dsh-delegate:backup']);
+    for (const entry of result.body.catalog) {
+      assert.equal(entry.error, null, `${entry.providerId} must resolve cleanly`);
+    }
+    assert.deepEqual(result.body.secrets, { values_returned: false });
+  } finally {
+    await cleanup(dir);
+  }
+});
+
+test('POST /catalog keeps a refused registration visible instead of describing ambient routes', async () => {
+  const { dir, deps } = await fixture();
+  try {
+    const llm = mappedLlm(NATIVE);
+    deps.llm = llm;
+    deps.ensureRoutes = async () => {
+      throw Object.assign(new Error('adapter metadata for provider "dsh-delegate:relay" is invalid'), { code: 'INVALID_ADAPTER' });
+    };
+
+    const result = await call(wrapUserPlaneRoutes(deps), 'POST', `${USER_PLANE_PREFIX}/catalog`, {});
+    assert.equal(result.status, 200);
+    assert.equal(result.body.registration.code, 'INVALID_ADAPTER');
+    const [entry] = result.body.catalog;
+    // An unmapped provider is reported unmapped; the profile id never becomes the route.
+    assert.notEqual(entry.route, 'relay');
+    assert.equal(entry.error.code, 'ROUTING_PROVIDER_NOT_REGISTERED');
+    assert.deepEqual(entry.models, []);
+    assert.deepEqual(llm.calls, [], 'a refused registration must not query any route');
+  } finally {
+    await cleanup(dir);
+  }
+});
+
+test('POST /catalog of an empty document registers nothing', async () => {
+  const { dir, deps, settings } = await fixture();
+  try {
+    const empty = validSettings();
+    empty.providers = [];
+    empty.worker = { ...empty.worker, providerId: null, model: null };
+    await settings.replace(empty);
+    let ensured = 0;
+    deps.ensureRoutes = async () => {
+      ensured += 1;
+      return new Map();
+    };
+    deps.llm = mappedLlm({});
+
+    const result = await call(wrapUserPlaneRoutes(deps), 'POST', `${USER_PLANE_PREFIX}/catalog`, {});
+    assert.equal(result.status, 200);
+    assert.deepEqual(result.body.catalog, []);
+    assert.equal(result.body.effective, null);
+    assert.equal(ensured, 0, 'a read of an unconfigured document must not create native state');
+  } finally {
+    await cleanup(dir);
+  }
+});
+
+test('both read paths use the entry point resolver when it is injected', async () => {
+  const { dir, deps } = await fixture();
+  try {
+    const asked = [];
+    deps.llm = mappedLlm(NATIVE);
+    deps.credentials = dummyCredentials();
+    deps.fetchImpl = discoveryFetch();
+    deps.resolveRoutes = async (snapshot, operation) => {
+      asked.push([snapshot.providers.length, operation]);
+      return { routes: new Map([['relay', 'dsh-delegate:relay']]), error: null };
+    };
+    const routes = wrapUserPlaneRoutes(deps);
+
+    await call(routes, 'POST', `${USER_PLANE_PREFIX}/models`, { providerId: 'relay' });
+    await call(routes, 'POST', `${USER_PLANE_PREFIX}/catalog`, {});
+    assert.equal(asked.length, 2);
+    assert.deepEqual(asked.map((entry) => entry[1]), ['a model list', 'a catalog read']);
+  } finally {
+    await cleanup(dir);
+  }
+});
+
+test('a refused native registration does not block remote discovery', async () => {
+  const { dir, deps } = await fixture();
+  try {
+    // `/catalog` reports the refusal (`registration`) and no rows; `/models` still
+    // answers with what the provider's own API serves, because discovery never
+    // depended on the native registry. The two surfaces disagree honestly.
+    deps.llm = mappedLlm(NATIVE);
+    deps.credentials = dummyCredentials();
+    deps.fetchImpl = discoveryFetch({ body: { data: [{ id: 'discovered-anyway' }] } });
+    deps.resolveRoutes = async () => ({
+      routes: null,
+      error: { code: 'INVALID_ADAPTER', message: 'the native provider routes could not be registered' },
+    });
+    const routes = wrapUserPlaneRoutes(deps);
+
+    const catalog = await call(routes, 'POST', `${USER_PLANE_PREFIX}/catalog`, {});
+    assert.equal(catalog.body.registration.code, 'INVALID_ADAPTER');
+    // Every catalog row is unmapped: the configured models are not reported as routable.
+    for (const entry of catalog.body.catalog) {
+      assert.equal(entry.route, null);
+      assert.deepEqual(entry.models, []);
+    }
+
+    const models = await call(routes, 'POST', `${USER_PLANE_PREFIX}/models`, { providerId: 'relay' });
+    assert.equal(models.body.route, null);
+    assert.deepEqual(models.body.models.map((model) => model.id), ['discovered-anyway']);
+    assert.equal(models.body.error, null);
   } finally {
     await cleanup(dir);
   }

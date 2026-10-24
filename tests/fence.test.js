@@ -52,8 +52,90 @@ test('loopback hostnames are recognized', () => {
 test('a canonical authority is derived from the Host header', () => {
   assert.equal(requestAuthority('127.0.0.1:3210'), '127.0.0.1:3210');
   assert.equal(requestAuthority('localhost'), 'localhost');
+  assert.equal(requestAuthority('[::1]:3210'), '[::1]:3210');
   assert.equal(requestAuthority(''), null);
   assert.equal(requestAuthority(undefined), null);
+});
+
+test('a Host header carrying whitespace is refused, not trimmed', () => {
+  // Trimming would accept an authority that was never sent: the bytes around the
+  // value are part of what the client wrote, so any of them is a refusal.
+  for (const host of [
+    ' localhost',
+    'localhost ',
+    ' 127.0.0.1:3210',
+    '127.0.0.1:3210 ',
+    '\tlocalhost',
+    'localhost\n',
+    '127.0.0.1 :3210',
+    '127.0.0.1\t:3210',
+    ' ',
+    '\t',
+  ]) {
+    assert.equal(requestAuthority(host), null, JSON.stringify(host));
+  }
+  const verdict = fenceExternalConnection(request({ headers: { host: ' 127.0.0.1:3210 ' } }));
+  assert.equal(verdict.ok, false);
+  assert.equal(verdict.code, 'CONNECTION_HOST_INVALID');
+});
+
+test('a non-canonical numeric host is refused instead of normalised to loopback', () => {
+  // The URL parser expands every one of these to 127.0.0.1. Accepting them would
+  // mean a Host header that is not a dotted-quad IPv4 is nevertheless treated as
+  // this machine, so the raw spelling is validated before parsing.
+  for (const host of [
+    '127.1',
+    '127.0.1',
+    '2130706433',
+    '0x7f.0.0.1',
+    '0x7f000001',
+    '0177.0.0.1',
+    '127.0.0.256',
+    '127.0.0.1.5',
+    '1.2.3',
+    '127.0.0.1:',
+    '[::1]:',
+    '::1',
+    '[::1',
+    '[]',
+    '[::1]:80:90',
+    '127.0.0.1:0',
+    '127.0.0.1:65536',
+    '127.0.0.1:080',
+  ]) {
+    assert.equal(requestAuthority(host), null, JSON.stringify(host));
+  }
+});
+
+test('authority forms that smuggle a second component are refused', () => {
+  for (const host of [
+    'user@127.0.0.1',
+    'user:pass@127.0.0.1',
+    '127.0.0.1/tasks',
+    '127.0.0.1?x=1',
+    '127.0.0.1#f',
+    '127.0.0.1\\tasks',
+    '127.0.0.1,example.com',
+    '%31%32%37.0.0.1',
+    '127.0.0.1\u0000',
+  ]) {
+    assert.equal(requestAuthority(host), null, JSON.stringify(host));
+  }
+});
+
+test('an IPv6 loopback Host is a valid local authority', () => {
+  assert.equal(requestAuthority('[::1]'), '[::1]');
+  assert.equal(requestAuthority('[::1]:3210'), '[::1]:3210');
+  // A non-loopback IPv6 address is a well-formed authority but not this machine.
+  assert.equal(requestAuthority('[2001:db8::1]:3210'), '[2001:db8::1]:3210');
+  assert.deepEqual(
+    fenceExternalConnection(request({ headers: { host: '[::1]:3210', origin: 'http://[::1]:3210' } })),
+    { ok: true },
+  );
+  // This machine by name, not by address: the fence must still refuse it.
+  const remoteV6 = fenceExternalConnection(request({ headers: { host: '[2001:db8::1]:3210' } }));
+  assert.equal(remoteV6.ok, false);
+  assert.equal(remoteV6.code, 'CONNECTION_HOST_NOT_LOCAL');
 });
 
 test('a fully local same-origin request passes the fence', () => {
@@ -125,6 +207,39 @@ test('the user plane refuses a request with no Origin', async () => {
   const verdict = await fenceUserPlane(request({ headers: { host: '127.0.0.1:3210' } }), () => true);
   assert.equal(verdict.ok, false);
   assert.equal(verdict.code, 'USER_PLANE_ORIGIN_REQUIRED');
+});
+
+test('an authenticated read may omit Origin, but is still authenticated', async () => {
+  for (const method of ['GET', 'HEAD', 'get']) {
+    const headers = { host: '127.0.0.1:3210' };
+    assert.deepEqual(await fenceUserPlane(request({ method, headers }), () => true), { ok: true }, method);
+    // Same-origin GET navigation sends no Origin, but that is not a substitute
+    // for the native session: an unauthenticated read is still refused.
+    const denied = await fenceUserPlane(request({ method, headers }), () => false);
+    assert.equal(denied.code, 'USER_PLANE_UNAUTHENTICATED');
+    assert.equal(denied.status, 401);
+  }
+});
+
+test('a write still requires Origin even when authenticated', async () => {
+  const readHeaders = { host: '127.0.0.1:3210', 'content-type': 'application/json' };
+  for (const method of ['POST', 'PUT', 'PATCH', 'DELETE']) {
+    let authAsked = false;
+    const verdict = await fenceUserPlane(request({ method, headers: readHeaders }), () => { authAsked = true; return true; });
+    assert.equal(verdict.ok, false, method);
+    assert.equal(verdict.code, 'USER_PLANE_ORIGIN_REQUIRED');
+    // A browser write without Origin is refused before the session is consulted.
+    assert.equal(authAsked, false, method);
+  }
+});
+
+test('a GET with a supplied Origin still has to be same-origin', async () => {
+  const crossOrigin = await fenceUserPlane(request({
+    method: 'GET',
+    headers: { host: '127.0.0.1:3210', origin: 'http://evil.test' },
+  }), () => true);
+  assert.equal(crossOrigin.ok, false);
+  assert.equal(crossOrigin.code, 'USER_PLANE_CROSS_ORIGIN');
 });
 
 test('the user plane refuses cross-origin and cross-site requests before authentication', async () => {

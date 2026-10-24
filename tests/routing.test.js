@@ -105,24 +105,63 @@ test('declared efforts are flattened from the native shape', () => {
   assert.deepEqual(declaredEfforts(null), { efforts: [], defaultEffort: null });
 });
 
+/**
+ * The {@link llmTable} model set, keyed by native route.
+ *
+ * `fakeLlm` resolves only the provider keys it was given, which is the accurate
+ * shape: an adapter answers for the route it was registered under, never for the
+ * operator's profile id.
+ * @returns {object} provider table keyed by `dsh-delegate:` route ids.
+ */
+function nativeTable() {
+  return { 'dsh-delegate:relay': llmTable().relay };
+}
+
 test('the catalog reports models and efforts per provider without hiding failures', async () => {
-  const llm = fakeLlm({ providers: llmTable() });
+  const llm = fakeLlm({ providers: nativeTable() });
   const catalog = await describeCatalog({ llm }, [{
     id: 'relay',
     models: [{ id: 'deepseek-chat' }, { id: 'missing-model' }],
-  }]);
+  }], { routes: new Map([['relay', 'dsh-delegate:relay']]) });
   assert.equal(catalog.length, 1);
   const entry = catalog[0];
   assert.equal(entry.providerId, 'relay');
+  // The row names the native route the plugin registered, not the profile id.
+  assert.equal(entry.route, 'dsh-delegate:relay');
   assert.deepEqual(entry.models.map((model) => model.id), ['deepseek-chat']);
   assert.equal(entry.error.code, ROUTING_CODES.modelUnresolved);
 });
 
 test('the catalog falls back to the native model list when none are declared', async () => {
-  const llm = fakeLlm({ providers: llmTable() });
-  const catalog = await describeCatalog({ llm }, [{ id: 'relay', models: [] }]);
+  const llm = fakeLlm({ providers: nativeTable() });
+  const catalog = await describeCatalog({ llm }, [{ id: 'relay', models: [] }], {
+    routes: new Map([['relay', 'dsh-delegate:relay']]),
+  });
   assert.deepEqual(
     catalog[0].models.map((model) => model.id).sort(),
     ['deepseek-chat', 'deepseek-reasoner'],
   );
+});
+
+test('a catalog without a route mapping reports no route instead of the profile id', async () => {
+  const llm = fakeLlm({ providers: llmTable() });
+
+  // No mapping supplied at all: the profile id must not be reported as a route.
+  const [absent] = await describeCatalog({ llm }, [{ id: 'relay', models: [{ id: 'deepseek-chat' }] }]);
+  assert.equal(absent.route, null);
+  assert.equal(absent.error.code, ROUTING_CODES.providerNotRegistered);
+  assert.deepEqual(absent.models, []);
+
+  // `null` explicitly — what a swallowed registration failure used to produce.
+  const [nulled] = await describeCatalog({ llm }, [{ id: 'relay', models: [] }], { routes: null });
+  assert.equal(nulled.route, null);
+  assert.equal(nulled.error.code, ROUTING_CODES.providerNotRegistered);
+
+  // A map that simply lacks this provider is the same refusal, for the same reason.
+  const [unmapped] = await describeCatalog({ llm }, [{ id: 'relay', models: [] }], { routes: new Map() });
+  assert.equal(unmapped.route, null);
+  assert.equal(unmapped.error.code, ROUTING_CODES.providerNotRegistered);
+
+  // And nothing was resolved against a route that does not exist.
+  assert.equal(llm.calls.resolveModelInfo, 0);
 });

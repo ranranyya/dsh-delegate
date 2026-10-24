@@ -1,8 +1,16 @@
 node_modules/
 artifacts/
 .cache/
+.pnpm-store/
 coverage/
 *.log
+# Local, throwaway probe scripts written at the repository root. Nothing is
+# deleted by ignoring them: they simply stop showing up as untracked.
+.probe*.mjs
+.probe/
+.tmp-*
+scratch-*.mjs
+*.tgz
 .env
 .env.*
 !.env.example

@@ -4,6 +4,11 @@
 // half-written document, and a document from an unknown schema version is
 // refused instead of being reinterpreted. Delegation authorization is
 // deliberately NOT stored here — see src/auth/grants.js.
+//
+// A third property is added because callers hand these documents to UI and
+// HTTP layers: every document this module returns is deep-frozen, so a caller
+// cannot mutate what the store believes is on disk. A writer must go through
+// `commit`, which works on its own deep copy.
 
 import { randomBytes } from 'node:crypto';
 import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
@@ -45,6 +50,26 @@ export async function writeFileAtomic(filename, content) {
   }
 }
 
+/**
+ * Freeze a JSON-shaped value and everything below it.
+ *
+ * Used on every snapshot this module hands out, so "the caller changed the
+ * document" is impossible rather than merely discouraged: a write to a frozen
+ * object throws in the strict mode every ESM module runs in. The input is
+ * expected to be JSON data (objects, arrays, primitives); a cyclic graph is not
+ * produced by `JSON.parse` and is not supported.
+ * @template T
+ * @param {T} value - value to freeze in place.
+ * @returns {T} the same value, frozen down to its leaves.
+ */
+export function deepFreeze(value) {
+  if (value === null || typeof value !== 'object') return value;
+  // Already frozen (possibly by an earlier pass): nothing below can be mutable.
+  if (Object.isFrozen(value)) return value;
+  for (const key of Object.keys(value)) deepFreeze(value[key]);
+  return Object.freeze(value);
+}
+
 /** Refusal raised when a stored document cannot be trusted as-is. */
 export class StoreError extends Error {
   /**
@@ -63,6 +88,9 @@ export class StoreError extends Error {
  *
  * Writes are queued: a read-modify-write cycle inside this process cannot lose
  * a concurrent update, and the last committed snapshot is what a restart reads.
+ * Reads are not queued — the file is replaced atomically, and `current` only
+ * ever points at a complete document, so a concurrent read returns either the
+ * old or the new snapshot and never a partial one.
  */
 export class JsonDocument {
   /**
@@ -75,21 +103,35 @@ export class JsonDocument {
     this.schemaVersion = schemaVersion;
     this.initial = initial;
     this.current = null;
+    // In-flight first read. Concurrent `load()` calls share it instead of each
+    // issuing their own read of the same file.
+    this.loading = null;
     this.queue = Promise.resolve();
   }
 
   /**
    * Read the document, creating the in-memory default when absent.
-   * @returns {Promise<object>} the current document.
+   * @returns {Promise<object>} the current document, frozen.
    */
   async load() {
     if (this.current !== null) return this.current;
+    if (this.loading === null) {
+      this.loading = this.readOnce().finally(() => { this.loading = null; });
+    }
+    return await this.loading;
+  }
+
+  /**
+   * Perform the single physical read behind {@link JsonDocument#load}.
+   * @returns {Promise<object>} the loaded document, frozen.
+   */
+  async readOnce() {
     let raw;
     try {
       raw = await readFile(this.path, 'utf8');
     } catch (error) {
       if (error?.code === 'ENOENT') {
-        this.current = this.initial();
+        this.current = deepFreeze(this.initial());
         return this.current;
       }
       throw new StoreError('STORE_UNREADABLE', `cannot read ${this.path}: ${error?.code ?? 'unknown error'}`);
@@ -109,14 +151,18 @@ export class JsonDocument {
         `stored schemaVersion ${String(parsed.schemaVersion)} is not supported by this release`,
       );
     }
-    this.current = parsed;
+    this.current = deepFreeze(parsed);
     return this.current;
   }
 
   /**
    * Apply a synchronous mutation and commit it durably.
+   *
+   * The mutation receives a mutable deep copy, so it can edit in place. It is
+   * not allowed to reach back into this document (for example by awaiting
+   * another `commit`), which would queue behind itself and never settle.
    * @param {(document: object) => object | void} mutate - receives a deep copy; returns the next document or mutates it.
-   * @returns {Promise<object>} the committed document.
+   * @returns {Promise<object>} the committed document, frozen.
    */
   commit(mutate) {
     const run = this.queue.then(async () => {
@@ -129,9 +175,11 @@ export class JsonDocument {
       }
       next.schemaVersion = this.schemaVersion;
       await writeFileAtomic(this.path, `${JSON.stringify(next, null, 2)}\n`);
-      this.current = next;
-      return next;
+      this.current = deepFreeze(next);
+      return this.current;
     });
+    // The queue tail is settled either way: one failed write must not poison
+    // every later commit.
     this.queue = run.then(() => undefined, () => undefined);
     return run;
   }

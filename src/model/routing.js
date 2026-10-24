@@ -11,6 +11,8 @@
 // A configuration can be internally consistent and still unroutable; a settings
 // edit can also make a previously routable route vanish.
 
+import { redactText } from '../config/redact.js';
+
 /** Refusal codes surfaced by routing. */
 export const ROUTING_CODES = Object.freeze({
   serviceUnavailable: 'ROUTING_SERVICE_UNAVAILABLE',
@@ -20,6 +22,15 @@ export const ROUTING_CODES = Object.freeze({
   effortUnsupported: 'ROUTING_EFFORT_UNSUPPORTED',
   credentialMissing: 'ROUTING_CREDENTIAL_MISSING',
 });
+
+/**
+ * The four connectivity layers, in report order.
+ *
+ * They are separate because they fail for different reasons and an operator who
+ * sees one red row must be able to tell "the endpoint is unreachable" from "the
+ * key is wrong" from "the model answered nothing".
+ */
+export const CONNECTIVITY_LAYERS = Object.freeze(['transport', 'authentication', 'catalog', 'modelResponse']);
 
 /** A routing refusal with a stable machine code. */
 export class RoutingError extends Error {
@@ -92,13 +103,44 @@ async function resolveModelInfo(llm, providerRoute, model, signal) {
 }
 
 /**
+ * Decide which native provider route one selection actually addresses.
+ *
+ * Two sources exist and only one may win. When the provider registry has
+ * produced a mapping for the operator's configured provider id, that mapping is
+ * authoritative: it is the route the plugin just registered with the harness,
+ * and a profile id is not a native route (`relay` in settings is not
+ * necessarily the route id the adapter was registered under). When no mapping
+ * is supplied — a caller that already froze a route, or a snapshot taken before
+ * the first sync — the explicit route, then the profile id, is used as before.
+ * There is no substitution: a provider absent from a supplied mapping is
+ * refused rather than rerouted through its profile id, because that id may
+ * collide with an unrelated native route.
+ * @param {Map<string, string> | null | undefined} routes - public provider id -> native route.
+ * @param {string | null | undefined} providerId - operator-facing profile id.
+ * @param {string | null | undefined} explicitRoute - route already resolved by a caller.
+ * @returns {string} native route id.
+ */
+function requireMappedRoute(routes, providerId, explicitRoute) {
+  if (routes === undefined || routes === null) return explicitRoute ?? providerId;
+  const mapped = routes instanceof Map ? routes.get(providerId) : undefined;
+  if (typeof mapped !== 'string' || mapped === '') {
+    throw new RoutingError(ROUTING_CODES.providerNotRegistered, `provider ${providerId} has no registered native route`, {
+      providerId: typeof providerId === 'string' ? providerId : null,
+      registered: routes instanceof Map ? [...routes.keys()].slice(0, 32) : [],
+    });
+  }
+  return mapped;
+}
+
+/**
  * Resolve one configured selection into a routable native request descriptor.
  *
  * @param {object} deps - `llm` is the native LLM service (may be undefined while
  *   the plugin loads before that service exists).
  * @param {object} selection - validated `{ providerId, providerRoute, model, reasoningEffort, provider }`.
  * @param {object} [options] - `signal` for cancellation, `requireEffort` to demand
- *   an explicit effort on models that declare efforts.
+ *   an explicit effort on models that declare efforts, `routes` as the plugin's
+ *   public-provider-id -> native-route mapping.
  * @returns {Promise<object>} routable descriptor.
  */
 export async function resolveRoute(deps, selection, options = {}) {
@@ -107,7 +149,7 @@ export async function resolveRoute(deps, selection, options = {}) {
     || (typeof llm.resolveModelInfo !== 'function' && typeof llm.resolveModel !== 'function')) {
     throw new RoutingError(ROUTING_CODES.serviceUnavailable, 'the native llm service is not available', {});
   }
-  const providerRoute = selection.providerRoute ?? selection.providerId;
+  const providerRoute = requireMappedRoute(options.routes, selection.providerId, selection.providerRoute);
   const model = selection.model;
   if (typeof providerRoute !== 'string' || providerRoute === '') {
     throw new RoutingError(ROUTING_CODES.providerNotRegistered, 'no provider route was selected', {});
@@ -200,16 +242,46 @@ export async function resolveRoute(deps, selection, options = {}) {
  * provider, the models the native seam can resolve and which efforts each
  * declares. Unreachable providers are reported with a reason instead of being
  * hidden, so an operator sees why their configured model cannot be picked.
+ *
+ * The `routes` map is authoritative whenever the caller has one, and a caller
+ * that is *reporting* routes must always supply one. There is deliberately no
+ * "no mapping supplied, so use the profile id" branch: a profile id is not a
+ * native route, and reporting it produced the observed `/models` and `/catalog`
+ * answers of `route: "workbuddy"` with an empty model list — a row that named an
+ * ambient route the plugin does not own. A caller with no mapping (`routes`
+ * `null`/absent) gets a `providerNotRegistered` refusal instead. Only the
+ * internal routing decision keeps the profile-id fallback, through
+ * `requireMappedRoute`, for callers that froze a route before the first sync.
  * @param {object} deps - `llm` native service.
  * @param {object[]} providers - validated provider profiles.
- * @param {object} [options] - `signal`.
+ * @param {object} [options] - `signal`, `routes` as the public-id -> native-route map.
  * @returns {Promise<object[]>} per-provider catalog with explicit status.
  */
 export async function describeCatalog(deps, providers, options = {}) {
   const llm = deps?.llm;
+  const routes = options.routes instanceof Map ? options.routes : null;
   const out = [];
   for (const provider of providers) {
-    const entry = { providerId: provider.id, route: provider.id, models: [], error: null };
+    const mapped = routes === null ? undefined : routes.get(provider.id);
+    // `route` is null unless a native route was actually registered for this
+    // provider: never the profile id, which may collide with an ambient route.
+    const entry = {
+      providerId: provider.id,
+      route: typeof mapped === 'string' && mapped !== '' ? mapped : null,
+      models: [],
+      error: null,
+    };
+    if (entry.route === null) {
+      entry.error = {
+        code: ROUTING_CODES.providerNotRegistered,
+        message: routes === null
+          ? 'no native route mapping was supplied, so no route is reported'
+          : 'this provider has no registered native route',
+      };
+      out.push(entry);
+      continue;
+    }
+    const route = entry.route;
     const resolveAvailable = llm !== undefined && llm !== null
       && (typeof llm.resolveModelInfo === 'function' || typeof llm.resolveModel === 'function');
     if (!resolveAvailable) {
@@ -220,10 +292,10 @@ export async function describeCatalog(deps, providers, options = {}) {
     const declared = Array.isArray(provider.models) ? provider.models : [];
     const candidates = declared.length > 0
       ? declared.map((model) => model.id)
-      : await listNativeModels(llm, provider.id).catch(() => []);
+      : await listNativeModels(llm, route).catch(() => []);
     for (const modelId of candidates) {
       try {
-        const resolved = await resolveModelInfo(llm, provider.id, modelId, options.signal);
+        const resolved = await resolveModelInfo(llm, route, modelId, options.signal);
         const { efforts, defaultEffort } = declaredEfforts(resolved);
         entry.models.push({ id: modelId, efforts, defaultEffort });
       } catch (error) {

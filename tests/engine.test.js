@@ -4,6 +4,11 @@
 // These tests run the real engine. Only native services are faked, so a
 // regression in ordering (for example, creating an agent before consuming the
 // grant) fails here.
+//
+// The fakes are deliberately closed: no `allowLegacyProviderRoutes` escape hatch
+// is used, `providerRegistry` is a deterministic mapping, and the git fake answers
+// in the NUL-delimited format the audit module requires. A fixture that let a
+// missing service look like a working one would make these tests prove nothing.
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -15,15 +20,124 @@ import { JobEngine, JOB_CODES, TASK_STATES } from '../src/jobs/engine.js';
 import { SettingsService } from '../src/config/settings.js';
 import { WorkspaceLocks } from '../src/workspace/locks.js';
 import { REVIEW_STATES } from '../src/review/reviewer.js';
+import { DEFAULT_MAX_TOKENS } from '../src/runtime/agent-runner.js';
 import {
   cleanup,
   fakeAgents,
-  fakeGit,
   fakeLlm,
   llmTable,
   makeTempDir,
   validSettings,
 } from './helpers/fakes.js';
+
+/** The pinned commit the fake repository always reports. */
+const HEAD = 'a'.repeat(40);
+
+/**
+ * Public provider profile id → native route id.
+ *
+ * The two ids are deliberately different: a job records the profile the operator
+ * chose and hands the native route to the harness, so a test that conflates them
+ * would hide a routing bug.
+ */
+const NATIVE_ROUTES = Object.freeze({ relay: 'relay-native' });
+
+/**
+ * Build a git runner that answers in the NUL-delimited format the audit layer
+ * parses. A line-format answer is refused by the parser, which is why the fixture
+ * must produce the real shape rather than a convenient one.
+ * @returns {object} runner function with `calls` history.
+ */
+function engineGit() {
+  const calls = [];
+  const runner = async (cwd, args) => {
+    calls.push({ cwd, args });
+    const key = args.join(' ');
+    if (key === '--version') return { stdout: 'git version 2.0.0\n', code: 0 };
+    if (key === 'rev-parse --is-inside-work-tree') return { stdout: 'true\n', code: 0 };
+    if (key === 'rev-parse --verify HEAD') return { stdout: `${HEAD}\n`, code: 0 };
+    if (args[0] === 'status') return { stdout: ' M src/a.js\u0000', code: 0 };
+    if (args[0] === 'diff' && args[1] === '--numstat') return { stdout: '2\t0\tsrc/a.js\u0000', code: 0 };
+    if (args[0] === 'diff') return { stdout: 'diff --git a/src/a.js b/src/a.js\n+implementation\n', code: 0 };
+    if (args[0] === 'ls-files') return { stdout: '', code: 0 };
+    return { stdout: '', code: 0 };
+  };
+  runner.calls = calls;
+  return runner;
+}
+
+/**
+ * Build the provider registry the production entry point injects.
+ *
+ * `ensure(providers)` returns one deterministic profile → native-route mapping,
+ * so a job can only route to a profile the registry actually mapped. That keeps
+ * the engine's fail-closed check (`JOB_PROVIDER_REGISTRY_REQUIRED`) intact: the
+ * fixture satisfies the contract instead of disabling the check.
+ * @param {object} [options] - `fail`: error to reject with, `defer`: promise to await first.
+ * @returns {object} registry with `calls` history.
+ */
+export function fakeProviderRegistry(options = {}) {
+  const calls = [];
+  return {
+    calls,
+    async ensure(providers) {
+      calls.push(providers.map((provider) => provider.id));
+      if (options.defer !== undefined) await options.defer;
+      if (options.fail !== undefined) throw options.fail;
+      const routes = new Map();
+      for (const provider of providers) {
+        routes.set(provider.id, NATIVE_ROUTES[provider.id] ?? `${provider.id}-native`);
+      }
+      return { routes };
+    },
+  };
+}
+
+/**
+ * Build the agent preset registry an agent needs before it can run.
+ *
+ * Mounting a preset is what installs an agent's tool composition, so this
+ * fixture also answers the tool inventory from the mount: without it the
+ * additional review has no inventory to restrict and would (correctly) refuse.
+ * @param {string[]} [inventory] - tool names the mounted composition offers.
+ * @returns {object} preset registry with `mounts` history.
+ */
+function enginePresets(inventory = ['read', 'glob', 'grep', 'read_image']) {
+  const mounts = [];
+  return {
+    mounts,
+    async mount(ctx, id) {
+      mounts.push({ ctx, id });
+      ctx.tools.schemas = () => inventory.map((name) => ({ name, description: name, parameters: {} }));
+      return { id: id ?? 'default-preset' };
+    },
+  };
+}
+
+/**
+ * Stand-in for the plugin-owned read-only review composition.
+ *
+ * The real composer (`src/review/preset.js`) mounts the native filesystem tool
+ * packages, which this repository does not depend on, so without a composer every
+ * review fails at `REVIEW_PRESET_UNSUPPORTED` before any route is used. Accepting
+ * that failure would make "the reviewer ran on its own provider/model" provable
+ * only by its absence, so the engine tests supply the composer contract instead:
+ * an id this fixture owns, and a mount that advertises the read-only inventory.
+ * Nothing about routing, authorization or the worker run is affected.
+ * @param {ReturnType<typeof enginePresets>} presets - the preset registry to own a composition in.
+ * @returns {{ id: string, owns: (id: string) => boolean, preparation: () => Promise<string> }} composer.
+ */
+function reviewComposer(presets) {
+  void presets;
+  const id = 'dsh-delegate-review-test';
+  return {
+    get id() { return id; },
+    owns(candidate) { return candidate === id; },
+    async preparation() {
+      return id;
+    },
+  };
+}
 
 /**
  * Build an engine over temporary storage, a real workspace directory and faked
@@ -31,7 +145,8 @@ import {
  *
  * The workspace must exist because the engine resolves it before use; a
  * nonexistent path is itself a refusal and has its own test.
- * @param {object} [options] - `agents`, `git`, `settings`.
+ * @param {object} [options] - `agents`, `git`, `settings`, `worktrees`,
+ *   `providerRegistry`, `ensureRoutes`, `agentPresets`, `preflightTimeoutMs`.
  * @returns {Promise<object>} harness with engine, auth, workspace and cleanup.
  */
 async function harness(options = {}) {
@@ -42,19 +157,31 @@ async function harness(options = {}) {
   const auth = new AuthorizationRegistry();
   const locks = new WorkspaceLocks();
   const agents = options.agents ?? fakeAgents({ respond: { text: 'implemented the change' } });
+  const providerRegistry = options.providerRegistry ?? fakeProviderRegistry();
+  const presets = options.agentPresets ?? enginePresets();
   const deps = {
     agents,
+    agentPresets: presets,
+    // The plugin-owned read-only composition a review mounts. Its native rows are
+    // not available in this repository, so the composer contract is supplied here
+    // (see `reviewComposer`); routing and the worker run are unaffected.
+    reviewPresets: options.reviewPresets ?? reviewComposer(presets),
     sessions: { async flush() {} },
-    llm: fakeLlm({ providers: llmTable() }),
+    // The native route is not the profile id; the model table is keyed by the
+    // route the harness will be asked to resolve.
+    llm: fakeLlm({ providers: { 'relay-native': llmTable().relay } }),
     settings,
     auth,
     locks,
-    runGit: options.git ?? fakeGit({
-      'status --porcelain=v1 --untracked-files=all': { stdout: ' M src/a.js\n' },
-      'diff --numstat HEAD': { stdout: '2\t0\tsrc/a.js\n' },
-      'diff --no-color --no-ext-diff --unified=3 HEAD': { stdout: 'diff --git a/src/a.js b/src/a.js\n+implementation\n' },
-      'ls-files --others --exclude-standard': { stdout: '' },
-    }),
+    runGit: options.git ?? engineGit(),
+    providerRegistry,
+    // The entry point's full-snapshot seam. Only injected when a test asks for it,
+    // so the registry fallback is exercised by default.
+    ...(options.ensureRoutes === undefined ? {} : { ensureRoutes: options.ensureRoutes }),
+    ...(options.worktrees === undefined ? {} : { worktrees: options.worktrees }),
+    ...(options.preflightTimeoutMs === undefined ? {} : { preflightTimeoutMs: options.preflightTimeoutMs }),
+    authorizationMode: options.authorizationMode ?? 'grants',
+    delegationEnabled: options.delegationEnabled === true,
     logger: { info() {}, warn() {} },
   };
   const engine = new JobEngine(deps);
@@ -62,14 +189,16 @@ async function harness(options = {}) {
   /**
    * Issue a connection plus a grant covering this harness's workspace.
    * @param {'task'|'session'} [kind] - grant kind.
+   * @param {object} [input] - extra `issueGrant` fields (e.g. `overrides`).
    * @returns {object} connection and grant records.
    */
-  function authorize(kind = 'task') {
+  function authorize(kind = 'task', input = {}) {
     const connection = auth.issueConnection({ label: 'codex' });
     const grant = auth.issueGrant(connection.connectionId, {
       kind,
       workspacePath: workspace,
       ttlSeconds: 600,
+      ...input,
     });
     return { connectionId: connection.connectionId, token: connection.token, grant };
   }
@@ -82,6 +211,7 @@ async function harness(options = {}) {
     settings,
     agents,
     deps,
+    providerRegistry,
     authorize,
     async close() {
       await engine.dispose();
@@ -219,11 +349,14 @@ test('starting never happens without a configured provider', async () => {
 });
 
 test('an unsupported effort in settings refuses the job before an agent exists', async () => {
-  const h = await harness({
-    settings: validSettings({ worker: { model: 'deepseek-reasoner', reasoningEffort: 'low' } }),
-  });
+  // The document itself cannot hold this combination — settings validation
+  // refuses to save it — so the refusal is exercised through the per-job
+  // override that carries the same bad triple into the effective snapshot.
+  const h = await harness();
   try {
-    const { connectionId, grant } = h.authorize();
+    const { connectionId, grant } = h.authorize('task', {
+      overrides: { model: 'deepseek-reasoner', reasoningEffort: 'low' },
+    });
     await assert.rejects(
       () => h.engine.start({
         connectionId,
@@ -231,9 +364,25 @@ test('an unsupported effort in settings refuses the job before an agent exists',
         workspacePath: h.workspace,
         prompt: 'go',
       }),
-      (error) => error.code === 'JOB_ROUTING_REFUSED',
+      (error) => error.code === JOB_CODES.routingRefused,
     );
     assert.equal(h.agents.created.length, 0);
+  } finally {
+    await h.close();
+  }
+});
+
+test('saving an unsupported effort is refused by the settings document itself', async () => {
+  const h = await harness();
+  try {
+    await assert.rejects(
+      () => h.settings.replace(validSettings({ worker: { model: 'deepseek-reasoner', reasoningEffort: 'low' } })),
+      (error) => error.code === 'SELECTION_EFFORT_UNSUPPORTED',
+    );
+    // The stored document is unchanged, so no job can inherit the bad triple.
+    const stored = await h.settings.read();
+    assert.equal(stored.worker.model, 'deepseek-chat');
+    assert.equal(stored.worker.reasoningEffort, 'medium');
   } finally {
     await h.close();
   }
@@ -434,6 +583,9 @@ test('a session grant starts repeated tasks', async () => {
       prompt: 'first',
     });
     await settle(h.engine, one.taskId);
+    // A terminal task keeps its record, so the slot has to be returned
+    // explicitly; otherwise it would go on occupying capacity forever.
+    assert.equal(h.engine.tasks.get(one.taskId).slotHeld, false, 'a settled task must not keep its slot');
 
     const two = await h.engine.start({
       connectionId,
@@ -443,6 +595,127 @@ test('a session grant starts repeated tasks', async () => {
     });
     assert.notEqual(one.taskId, two.taskId);
     assert.equal(h.agents.created.length, 2);
+  } finally {
+    await h.close();
+  }
+});
+
+test('a refusal after the slot is reserved releases it for the next job', async () => {
+  // The route registry fails on the first call, which is the first preflight step
+  // *after* the concurrency slot was claimed, and succeeds afterwards. A leaked
+  // claim would make the second start refuse with JOB_CONCURRENCY_LIMIT even
+  // though no native executor ever existed.
+  let calls = 0;
+  const providerRegistry = {
+    async ensure(providers) {
+      calls += 1;
+      if (calls === 1) throw Object.assign(new Error('registry unavailable'), { code: 'REGISTRY_UNAVAILABLE' });
+      const routes = new Map(providers.map((provider) => [provider.id, NATIVE_ROUTES[provider.id] ?? `${provider.id}-native`]));
+      return { routes };
+    },
+  };
+  const h = await harness({ providerRegistry });
+  try {
+    const first = h.authorize();
+    await assert.rejects(
+      () => h.engine.start({
+        connectionId: first.connectionId,
+        grantId: first.grant.grantId,
+        workspacePath: h.workspace,
+        prompt: 'doomed',
+      }),
+      (error) => error.code === JOB_CODES.routingRefused,
+    );
+    const refused = [...h.engine.tasks.values()].at(-1);
+    assert.equal(refused.state, TASK_STATES.failed);
+    assert.equal(refused.slotHeld, false, 'a refused admission must not keep its slot');
+
+    // maxParallelism is 1, so any leak is observable here.
+    const second = h.authorize();
+    const next = await h.engine.start({
+      connectionId: second.connectionId,
+      grantId: second.grant.grantId,
+      workspacePath: h.workspace,
+      prompt: 'next job',
+    });
+    assert.notEqual(next.taskId, refused.taskId);
+    await settle(h.engine, next.taskId);
+  } finally {
+    await h.close();
+  }
+});
+
+test('capacity is not returned while the native executor may still be running', async () => {
+  const h = await harness();
+  try {
+    // Drive finalize directly with a native executor that has started and has not
+    // confirmed it stopped. This is the one state the release gate exists for; the
+    // fakes cannot reach it through a real cancel, because cancelling makes the
+    // runner settle immediately.
+    const task = h.engine.createTask('held job', 'task');
+    h.engine.tasks.set(task.taskId, task);
+    const lease = h.engine.locks.acquire(h.workspace, { taskId: task.taskId });
+    task.leases.push({ path: h.workspace, nonce: lease.nonce });
+    task.slotHeld = true;
+    task.state = TASK_STATES.cancelled;
+    let release;
+    task.native = {
+      started: true,
+      settled: false,
+      promise: new Promise((resolvePromise) => { release = resolvePromise; }),
+    };
+
+    const finalizing = h.engine.finalize(task);
+    await new Promise((resolvePromise) => { setTimeout(resolvePromise, 20); });
+    assert.equal(task.slotHeld, true, 'the slot must not be handed back while the executor may still write');
+    assert.equal(h.engine.locks.isLocked(h.workspace), true, 'the workspace lease must still be held');
+    assert.equal(task.finalizedAt, null);
+
+    // Once the executor confirms it stopped, the same finalize call releases both.
+    task.native.settled = true;
+    release();
+    assert.equal(await finalizing, true);
+    assert.equal(task.slotHeld, false);
+    assert.equal(h.engine.locks.isLocked(h.workspace), false);
+    assert.equal(task.cleanupError, null);
+    // Release the harness's own settlement wait; the record was created outside
+    // a start, so nothing else will ever settle it.
+    task.settle();
+  } finally {
+    await h.close();
+  }
+});
+
+test('finalize is idempotent when several terminal paths race', async () => {
+  const h = await harness();
+  try {
+    const task = h.engine.createTask('raced job', 'task');
+    h.engine.tasks.set(task.taskId, task);
+    const lease = h.engine.locks.acquire(h.workspace, { taskId: task.taskId });
+    task.leases.push({ path: h.workspace, nonce: lease.nonce });
+    task.slotHeld = true;
+
+    // Count the actual lease releases: a second release would be a silent no-op
+    // inside WorkspaceLocks, so only counting proves the latch worked.
+    let releases = 0;
+    const realRelease = h.engine.locks.release.bind(h.engine.locks);
+    h.engine.locks.release = (workspacePath, nonce) => {
+      releases += 1;
+      return realRelease(workspacePath, nonce);
+    };
+
+    // Three callers, one release: a success path racing a cancellation path.
+    const [first, , third] = await Promise.all([
+      h.engine.finalize(task),
+      h.engine.finishTask(task),
+      h.engine.finalize(task),
+    ]);
+    assert.equal(first, true, 'the racing caller must observe the release');
+    assert.equal(third, true, 'every caller sees the same outcome');
+    assert.equal(releases, 1, 'the lease must be released exactly once');
+    assert.equal(task.slotHeld, false);
+    assert.equal(task.leases.length, 0);
+    assert.equal(h.engine.locks.isLocked(h.workspace), false);
   } finally {
     await h.close();
   }
@@ -474,6 +747,43 @@ test('cancelling a running task reaches the agent and states why', async () => {
     // The native agent received a cancel, and the workspace lock was released.
     assert.ok(h.agents.created[0].cancels.length >= 1, 'the agent must be cancelled');
     assert.equal(h.engine.locks.isLocked(h.workspace), false);
+  } finally {
+    await h.close();
+  }
+});
+
+test('the master switch blocks new work while off and cancels live work when disabled', async () => {
+  const agents = fakeAgents({
+    script: async ({ record }) => {
+      record.agent.followup = (message) => {
+        record.followups.push(message);
+        record.idle = false;
+      };
+    },
+  });
+  const h = await harness({ agents, authorizationMode: 'switch', delegationEnabled: false });
+  try {
+    assert.deepEqual(h.engine.posture(), { authorized: false, reason: 'delegation is disabled', mode: 'switch' });
+    await assert.rejects(
+      () => h.engine.start({ workspacePath: h.workspace, prompt: 'must stay blocked' }),
+      (error) => error.code === JOB_CODES.notAuthorized,
+    );
+    assert.equal(agents.created.length, 0, 'a disabled switch must not create an agent');
+
+    h.engine.setDelegationEnabled(true);
+    const started = await h.engine.start({ workspacePath: h.workspace, prompt: 'long job' });
+    await new Promise((resolvePromise) => { setTimeout(resolvePromise, 30); });
+    h.engine.setDelegationEnabled(false);
+    const cancelled = await settle(h.engine, started.taskId);
+
+    assert.equal(cancelled.state, TASK_STATES.cancelled);
+    assert.equal(cancelled.cancelledBy, 'delegation-disabled');
+    assert.ok(agents.created[0].cancels.length >= 1, 'disabling must reach the native agent');
+    assert.equal(h.engine.posture().authorized, false);
+    await assert.rejects(
+      () => h.engine.start({ workspacePath: h.workspace, prompt: 'must stay blocked' }),
+      (error) => error.code === JOB_CODES.notAuthorized,
+    );
   } finally {
     await h.close();
   }
@@ -544,6 +854,40 @@ test('review runs only when enabled and uses its own selection', async () => {
   }
 });
 
+test('both installed requests — worker and reviewer — carry a practical output allowance', async () => {
+  // The job's own evidence, not a unit-test abstraction: the two requests the
+  // installed plugin actually makes must each reserve a real output budget, or a
+  // reasoning turn stops mid-answer and an operator sees a truncated delegation.
+  const agents = fakeAgents({ respond: { text: 'VERDICT: approve\nREASON: correct' } });
+  const h = await harness({
+    agents,
+    settings: validSettings({
+      review: { enabled: true, providerId: 'relay', model: 'deepseek-reasoner', reasoningEffort: 'high' },
+    }),
+  });
+  try {
+    const { connectionId, grant } = h.authorize();
+    const started = await h.engine.start({
+      connectionId,
+      grantId: grant.grantId,
+      workspacePath: h.workspace,
+      prompt: 'go',
+    });
+    const settled = await settle(h.engine, started.taskId);
+    assert.equal(settled.state, TASK_STATES.awaitingHostReview);
+    assert.equal(settled.review.state, REVIEW_STATES.completed);
+
+    const budgets = agents.created.map((record) => record.options.maxTokens);
+    assert.equal(budgets.length, 2, 'one worker request and one reviewer request');
+    for (const [index, budget] of budgets.entries()) {
+      assert.equal(budget, DEFAULT_MAX_TOKENS, `request ${index} must carry the default allowance`);
+      assert.ok(budget >= 32768, `request ${index} must reserve at least 32768 output tokens, got ${budget}`);
+    }
+  } finally {
+    await h.close();
+  }
+});
+
 test('review is skipped when disabled, without recording a verdict', async () => {
   const h = await harness();
   try {
@@ -579,6 +923,132 @@ test('a failing execution is reported as failed, not as awaiting review', async 
     assert.equal(settled.error.code, 'JOB_EXECUTION_FAILED');
     // Evidence is still captured so the host can see partial work.
     assert.ok(settled.diff !== null);
+  } finally {
+    await h.close();
+  }
+});
+
+test('a reasoning-only run is a completed run, not an empty-output failure', async () => {
+  // The recorded turn carries reasoning and no visible text: activity the job must
+  // credit. The turn-end event the fake can express is the reasoning block, which
+  // is exactly the shape a provider with no deltas produces.
+  const agents = fakeAgents({ respond: { reasoningBlock: 'weighing the change' } });
+  const h = await harness({ agents });
+  try {
+    const { connectionId, grant } = h.authorize();
+    const started = await h.engine.start({
+      connectionId,
+      grantId: grant.grantId,
+      workspacePath: h.workspace,
+      prompt: 'go',
+    });
+    const settled = await settle(h.engine, started.taskId);
+    assert.equal(settled.state, TASK_STATES.awaitingHostReview);
+    assert.equal(settled.error, null, 'reasoning is output: it must never be reported as JOB_NO_OUTPUT');
+    assert.equal(settled.execution.outcome, 'completed');
+    assert.equal(settled.execution.reasoningOnly, true);
+    assert.equal(settled.execution.text, '');
+    assert.equal(settled.selfApproved, false);
+  } finally {
+    await h.close();
+  }
+});
+
+test('a reasoning-only run that stops at its output budget is completed, not failed', async () => {
+  // `max-tokens` is how the native loop ends a turn that filled its budget. A
+  // reasoning model does exactly that on a thinking answer, and reporting it as a
+  // failure was the false negative this test pins down.
+  const agents = fakeAgents({ respond: { reasoning: 'long deliberation', reason: 'max-tokens' } });
+  const h = await harness({ agents });
+  try {
+    const { connectionId, grant } = h.authorize();
+    const started = await h.engine.start({
+      connectionId,
+      grantId: grant.grantId,
+      workspacePath: h.workspace,
+      prompt: 'go',
+    });
+    const settled = await settle(h.engine, started.taskId);
+    assert.equal(settled.state, TASK_STATES.awaitingHostReview);
+    assert.equal(settled.error, null);
+    assert.equal(settled.execution.outcome, 'completed');
+    assert.equal(settled.execution.reasoningOnly, true);
+    // The budget fact stays visible on the turn record instead of being invented
+    // as an error, so an operator can raise the budget knowingly.
+    assert.equal(settled.execution.turnEnd.reason, 'max-tokens');
+  } finally {
+    await h.close();
+  }
+});
+
+test('a visible answer that stops at its budget is completed and keeps its text', async () => {
+  const agents = fakeAgents({ respond: { text: 'partially implemented', reason: 'max-tokens' } });
+  const h = await harness({ agents });
+  try {
+    const { connectionId, grant } = h.authorize();
+    const started = await h.engine.start({
+      connectionId,
+      grantId: grant.grantId,
+      workspacePath: h.workspace,
+      prompt: 'go',
+    });
+    const settled = await settle(h.engine, started.taskId);
+    assert.equal(settled.state, TASK_STATES.awaitingHostReview);
+    assert.equal(settled.execution.outcome, 'completed');
+    assert.equal(settled.execution.text, 'partially implemented');
+    assert.equal(settled.execution.reasoningOnly, false);
+  } finally {
+    await h.close();
+  }
+});
+
+test('a run that stops at its budget without any content is reported as a budget failure, not an empty one', async () => {
+  const agents = fakeAgents({ respond: { reason: 'max-tokens' } });
+  const h = await harness({ agents });
+  try {
+    const { connectionId, grant } = h.authorize();
+    const started = await h.engine.start({
+      connectionId,
+      grantId: grant.grantId,
+      workspacePath: h.workspace,
+      prompt: 'go',
+    });
+    const settled = await settle(h.engine, started.taskId);
+    assert.equal(settled.state, TASK_STATES.failed);
+    assert.equal(settled.error.code, JOB_CODES.outputTruncated, JSON.stringify(settled.error));
+    assert.match(settled.error.message, /budget/);
+    // The turn fact that explains the ending travels with the refusal.
+    assert.deepEqual(settled.error.details.turnEnd, { reason: 'max-tokens' });
+    // Evidence is still captured for a partial change.
+    assert.ok(settled.diff !== null);
+  } finally {
+    await h.close();
+  }
+});
+
+test('a run that genuinely produced nothing is still a failure with its own message', async () => {
+  // The distinction the fix must not erase: no text, no reasoning, no budget
+  // ending. The runner records its empty-turn diagnostic, so the job reports an
+  // execution failure — never a completion, and never a budget problem.
+  const agents = fakeAgents({ respond: { reason: 'completed' } });
+  const h = await harness({ agents });
+  try {
+    const { connectionId, grant } = h.authorize();
+    const started = await h.engine.start({
+      connectionId,
+      grantId: grant.grantId,
+      workspacePath: h.workspace,
+      prompt: 'go',
+    });
+    const settled = await settle(h.engine, started.taskId);
+    assert.equal(settled.state, TASK_STATES.failed);
+    assert.equal(settled.error.code, JOB_CODES.executionFailed, JSON.stringify(settled.error));
+    assert.match(settled.error.message, /no assistant text/);
+    assert.notEqual(settled.error.code, JOB_CODES.outputTruncated, 'an empty turn is not a budget ending');
+    assert.equal(settled.error.details, undefined, 'a silent run carries no budget facts');
+    assert.equal(settled.execution.outcome, 'failed');
+    assert.equal(settled.execution.reasoningOnly, false);
+    assert.equal(settled.selfApproved, false);
   } finally {
     await h.close();
   }

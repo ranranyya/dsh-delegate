@@ -13,12 +13,53 @@ const KEYLIKE_PATTERN = /\b(sk|pk|ak)-[A-Za-z0-9_-]{16,}\b/g;
 const ASSIGNMENT_PATTERN = /\b([A-Za-z0-9_]*(?:API_?KEY|SECRET|TOKEN|PASSWORD)[A-Za-z0-9_]*)\s*=\s*("[^"]*"|'[^']*'|\S+)/gi;
 
 /**
+ * Exact names of model usage counters. These keys contain the substring `token`,
+ * so the secret-key pattern alone would mask every prompt/completion count and
+ * publish nothing about what a run actually consumed.
+ *
+ * The exemption is deliberately an allow-list of exact names, not a `*Tokens`
+ * suffix rule: a suffix rule would exempt `refreshTokens` and every future
+ * credential field that happens to end in the same letters. The listed keys are
+ * also only exempt for a finite non-negative number (see {@link isUsageCounter});
+ * a string, object or array behind one of these names is still masked.
+ */
+const USAGE_COUNTER_KEYS = new Set([
+  'inputTokens',
+  'outputTokens',
+  'totalTokens',
+  'reasoningTokens',
+  'cacheTokens',
+  'cacheReadTokens',
+  'cacheWriteTokens',
+  'input_tokens',
+  'output_tokens',
+  'total_tokens',
+  'reasoning_tokens',
+  'cache_tokens',
+  'cache_read_tokens',
+  'cache_write_tokens',
+]);
+
+/**
  * Whether a settings key names a secret that must be masked on the way out.
  * @param {string} key - object key.
  * @returns {boolean} true when the value behind this key is a secret.
  */
 export function isSecretKey(key) {
   return typeof key === 'string' && SECRET_KEY_PATTERN.test(key);
+}
+
+/**
+ * Whether a key/value pair is a usage counter that may be published as a number.
+ * Requires both an exact counter name and a finite, non-negative number, so a
+ * credential stored under a counter-shaped name is still masked.
+ * @param {string} key - object key.
+ * @param {unknown} value - value behind that key.
+ * @returns {boolean} true when the value is a plain usage count.
+ */
+export function isUsageCounter(key, value) {
+  if (typeof key !== 'string' || !USAGE_COUNTER_KEYS.has(key)) return false;
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0;
 }
 
 /**
@@ -50,6 +91,10 @@ export function redactText(text) {
 /**
  * Deep-redact a JSON-compatible value: secret-named keys become the mask and
  * every string is passed through {@link redactText}.
+ *
+ * The one exemption is a genuine model usage counter (exact known name plus a
+ * finite non-negative number), so a job record can report what it consumed
+ * instead of a wall of masks.
  * @param {unknown} value - value to project.
  * @param {number} [depth] - remaining recursion depth.
  * @returns {unknown} redacted copy.
@@ -63,6 +108,10 @@ export function redactDeep(value, depth = 0) {
   if (typeof value === 'object') {
     const out = {};
     for (const [key, item] of Object.entries(value)) {
+      if (isUsageCounter(key, item)) {
+        out[key] = item;
+        continue;
+      }
       if (isSecretKey(key) && item !== null && item !== undefined && item !== '') {
         out[key] = typeof item === 'string' ? maskSecret(item) : MASK;
         continue;
@@ -72,6 +121,27 @@ export function redactDeep(value, depth = 0) {
     return out;
   }
   return String(value);
+}
+
+/**
+ * Truncate and redact a diagnostic string for durable storage.
+ *
+ * This lives here, beside {@link redactText}, rather than in the agent runner
+ * that first needed it: it is a pure string transform with no harness
+ * dependency, and the stdio MCP executable imports it too. Leaving it in
+ * `runtime/agent-runner.js` forced that standalone process to statically import
+ * `@deepseek-ai/dsh-llm` and `@deepseek-ai/dsh-agent` — packages only the DSH
+ * runtime provides — so the executable died with `ERR_MODULE_NOT_FOUND` before
+ * it could even report a missing token.
+ * @param {unknown} value - raw error text.
+ * @param {number} [max] - character bound.
+ * @returns {string | null} redacted text, or null.
+ */
+export function diagnostic(value, max = 800) {
+  if (value === null || value === undefined) return null;
+  const text = typeof value === 'string' ? value : String(value);
+  if (text === '') return null;
+  return redactText(text.slice(0, max));
 }
 
 const SENSITIVE_SUFFIXES = ['.pem', '.key', '.pfx', '.p12'];

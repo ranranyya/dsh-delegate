@@ -10,7 +10,14 @@ import {
   validateWorkerSettings,
   ConfigError,
 } from '../src/config/validate.js';
-import { projectKey, publicSettings, resolveEffectiveConfig, SettingsService } from '../src/config/settings.js';
+import {
+  exportSettings,
+  projectKey,
+  publicSettings,
+  resolveEffectiveConfig,
+  SettingsService,
+  SETTINGS_CODES,
+} from '../src/config/settings.js';
 import { isSensitivePath, isSecretKey, maskSecret, redactDeep, redactText } from '../src/config/redact.js';
 import { JsonDocument, StoreError, writeFileAtomic } from '../src/config/store.js';
 import { cleanup, makeTempDir, validSettings } from './helpers/fakes.js';
@@ -263,11 +270,260 @@ test('concurrent document commits do not lose an update', async () => {
   }
 });
 
-test('project keys are case-folded on Windows only', () => {
-  const { key } = projectKey('C:\\Work\\Project\\');
-  if (process.platform === 'win32') {
-    assert.equal(key, 'c:\\work\\project');
-  } else {
-    assert.equal(key, 'C:\\Work\\Project');
+test('project keys use the canonical form from validate.js', () => {
+  const { key, display } = projectKey('C:\\Work\\Project\\');
+  // A Windows-style path is case-folded for its key on every platform, because
+  // the stored map is a JSON object and NTFS compares case-insensitively.
+  assert.equal(key, 'c:\\work\\project');
+  assert.equal(display, 'C:\\Work\\Project');
+  // Slash style and case do not create a second key.
+  assert.equal(projectKey('c:/work/project').key, key);
+  assert.equal(projectKey('C:\\Work\\Project\\.\\').key, key);
+});
+
+test('a relative project path is refused instead of resolved against the cwd', () => {
+  assert.throws(() => projectKey('work/project'), (error) => error.code === 'PROJECT_OVERRIDE_INVALID');
+});
+
+test('a project override is reachable through any spelling of the same path', async () => {
+  const dir = await makeTempDir();
+  try {
+    const service = new SettingsService(dir);
+    await service.replace(validSettings());
+    await service.setProjectOverride('C:/Work/Project/', {
+      worker: { providerId: 'relay', model: 'deepseek-chat', reasoningEffort: 'low', timeoutSeconds: 900, maxParallelism: 1, isolation: 'shared' },
+    });
+    const stored = await service.read();
+    assert.deepEqual(Object.keys(stored.projectOverrides), ['C:\\Work\\Project'], 'the stored key is the canonical display form');
+
+    const effective = resolveEffectiveConfig(stored, { projectPath: 'c:\\work\\PROJECT' });
+    assert.equal(effective.worker.reasoningEffort, 'low', 'lookup is canonical, so a different spelling still applies');
+    assert.deepEqual(effective.provenance.applied, ['project:worker']);
+    assert.equal(effective.provenance.projectKey, 'c:\\work\\project');
+
+    // Clearing through a third spelling removes the one stored entry.
+    await service.setProjectOverride('C:\\Work\\Project', null);
+    assert.deepEqual(Object.keys((await service.read()).projectOverrides), []);
+  } finally {
+    await cleanup(dir);
+  }
+});
+
+test('concurrent edits to different settings blocks both survive', async () => {
+  const dir = await makeTempDir();
+  try {
+    const service = new SettingsService(dir);
+    await service.replace(validSettings());
+    await Promise.all([
+      service.setWorker({ providerId: 'relay', model: 'deepseek-reasoner', reasoningEffort: 'high', timeoutSeconds: 1200, maxParallelism: 2, isolation: 'shared' }),
+      service.setAuthorization({ taskGrantTtlSeconds: 120, sessionGrantTtlSeconds: 600 }),
+      service.upsertProvider({
+        id: 'backup',
+        name: 'Backup relay',
+        protocol: 'openai-chat',
+        baseUrl: 'https://relay.example.test/v1',
+        credentialRef: 'BACKUP_KEY',
+        models: [{ id: 'm1', efforts: [] }],
+      }),
+    ]);
+    const stored = await service.read();
+    assert.equal(stored.worker.model, 'deepseek-reasoner', 'the worker edit was not overwritten by a sibling read');
+    assert.equal(stored.worker.timeoutSeconds, 1200);
+    assert.equal(stored.authorization.taskGrantTtlSeconds, 120);
+    assert.deepEqual(stored.providers.map((provider) => provider.id), ['relay', 'backup']);
+    assert.deepEqual(stored.presets, [], 'a provider edit alone must not resurrect dropped presets');
+
+    const reloaded = new SettingsService(dir);
+    assert.equal((await reloaded.read()).worker.model, 'deepseek-reasoner', 'the last committed snapshot reached the file');
+  } finally {
+    await cleanup(dir);
+  }
+});
+
+test('ordinary configuration replacement preserves the separately managed delegation switch', async () => {
+  const dir = await makeTempDir();
+  try {
+    const service = new SettingsService(dir);
+    await service.replace({ ...validSettings(), delegationEnabled: true });
+    const next = await service.replaceConfiguration({
+      ...validSettings({ worker: { model: 'deepseek-reasoner', reasoningEffort: 'high' } }),
+      delegationEnabled: false,
+    });
+    assert.equal(next.delegationEnabled, true, 'a settings form cannot change the independent switch');
+    assert.equal(next.worker.model, 'deepseek-reasoner');
+
+    await service.setDelegationEnabled(false);
+    assert.equal((await service.read()).delegationEnabled, false, 'the switch endpoint remains its sole writer');
+  } finally {
+    await cleanup(dir);
+  }
+});
+
+test('a refused edit does not poison the queue for the next one', async () => {
+  const dir = await makeTempDir();
+  try {
+    const service = new SettingsService(dir);
+    await service.replace(validSettings());
+    const results = await Promise.allSettled([
+      service.setWorker({ providerId: 'relay', model: 'ghost-model', reasoningEffort: null }),
+      service.setAuthorization({ taskGrantTtlSeconds: 240, sessionGrantTtlSeconds: 600 }),
+    ]);
+    assert.equal(results[0].status, 'rejected');
+    assert.equal(results[0].reason.code, 'SELECTION_MODEL_UNKNOWN');
+    assert.equal(results[1].status, 'fulfilled');
+    assert.equal((await service.read()).authorization.taskGrantTtlSeconds, 240);
+    assert.equal((await service.read()).worker.model, 'deepseek-chat', 'the refused edit changed nothing');
+  } finally {
+    await cleanup(dir);
+  }
+});
+
+test('hooks run in order and a failing beforeCommit leaves the document untouched', async () => {
+  const dir = await makeTempDir();
+  try {
+    const order = [];
+    const service = new SettingsService(dir, {
+      beforeCommit: async (next, previous) => {
+        order.push(['before', previous.worker.model, next.worker.model]);
+        assert.ok(Object.isFrozen(next), 'beforeCommit receives an immutable snapshot');
+        assert.ok(Object.isFrozen(previous), 'the previous snapshot is immutable too');
+        if (next.worker.model === 'deepseek-reasoner') throw new Error('registry refused the provider');
+      },
+      onChanged: async (next, previous) => {
+        order.push(['after', previous.worker.model, next.worker.model]);
+        assert.ok(Object.isFrozen(next));
+      },
+    });
+    // Seed the document. A fresh install has no selection yet, so the first
+    // write is not the case under test.
+    await service.replace(validSettings());
+    order.length = 0;
+    await service.setAuthorization({ taskGrantTtlSeconds: 300, sessionGrantTtlSeconds: 600 });
+    assert.deepEqual(order, [['before', 'deepseek-chat', 'deepseek-chat'], ['after', 'deepseek-chat', 'deepseek-chat']]);
+
+    order.length = 0;
+    await assert.rejects(
+      () => service.setWorker({ providerId: 'relay', model: 'deepseek-reasoner', reasoningEffort: 'high' }),
+      /registry refused the provider/,
+    );
+    assert.deepEqual(order, [['before', 'deepseek-chat', 'deepseek-reasoner']], 'onChanged must not run after a refused pre-commit');
+    assert.equal((await service.read()).worker.model, 'deepseek-chat', 'the cached snapshot still holds the previous document');
+    const reloaded = new SettingsService(dir);
+    assert.equal((await reloaded.read()).worker.model, 'deepseek-chat', 'nor did the refusal reach the store');
+  } finally {
+    await cleanup(dir);
+  }
+});
+
+test('a failing onChanged reports that the document was already persisted', async () => {
+  const dir = await makeTempDir();
+  try {
+    const service = new SettingsService(dir, {
+      onChanged: async () => { throw new Error('subscriber crashed'); },
+    });
+    await assert.rejects(
+      () => service.replace(validSettings()),
+      (error) => error.code === SETTINGS_CODES.changedHookFailed && error.details.persisted === true,
+    );
+    assert.equal((await new SettingsService(dir).read()).worker.model, 'deepseek-chat', 'the write stands and is readable');
+    assert.equal((await service.read()).worker.model, 'deepseek-chat', 'the cache was not rolled back either');
+  } finally {
+    await cleanup(dir);
+  }
+});
+
+test('callers cannot mutate internal state through a returned snapshot', async () => {
+  const dir = await makeTempDir();
+  try {
+    const service = new SettingsService(dir);
+    const document = {
+      ...validSettings(),
+      presets: [{ id: 'fast', name: 'Fast', worker: { providerId: 'relay', model: 'deepseek-chat', reasoningEffort: 'low' } }],
+    };
+    await service.replace(document);
+    const first = await service.read();
+    assert.ok(Object.isFrozen(first));
+    assert.ok(Object.isFrozen(first.providers[0].models[0].efforts));
+    assert.throws(() => { first.worker.model = 'hijacked'; }, TypeError);
+    assert.throws(() => { first.providers[0].models[0].efforts.push('max'); }, TypeError);
+    assert.throws(() => { first.projectOverrides['C:\\x'] = {}; }, TypeError);
+
+    const projection = publicSettings(first);
+    assert.throws(() => { projection.presets[0].worker.model = 'hijacked'; }, TypeError);
+    assert.equal((await service.read()).worker.model, 'deepseek-chat');
+    assert.notEqual(publicSettings(first), projection, 'each projection is a fresh object, not the stored one');
+  } finally {
+    await cleanup(dir);
+  }
+});
+
+test('the executable snapshot is immutable and names its provider route explicitly', () => {
+  const settings = validateSettings(validSettings());
+  const effective = resolveEffectiveConfig(settings, { projectPath: null, overrides: {} });
+  assert.ok(Object.isFrozen(effective) && Object.isFrozen(effective.worker) && Object.isFrozen(effective.provenance));
+  assert.equal(effective.worker.providerId, 'relay', 'omitted job overrides retain the provider selected in DSH');
+  assert.equal(effective.worker.model, 'deepseek-chat', 'omitted job overrides retain the model selected in DSH');
+  assert.equal(effective.worker.reasoningEffort, 'medium', 'omitted job overrides retain the effort selected in DSH');
+  assert.equal(effective.worker.providerRoute, 'relay', 'the route handed to the native agent is an explicit field');
+  assert.equal(effective.review.providerRoute, null);
+  assert.throws(() => { effective.worker.model = 'deepseek-reasoner'; }, TypeError);
+});
+
+test('public settings and export include nonsecret presets and no credential value', async () => {
+  const dir = await makeTempDir();
+  try {
+    const service = new SettingsService(dir);
+    await service.replace({
+      ...validSettings(),
+      presets: [{
+        id: 'thorough',
+        name: 'Thorough',
+        worker: { providerId: 'relay', model: 'deepseek-reasoner', reasoningEffort: 'high' },
+        review: { enabled: true, providerId: 'relay', model: 'deepseek-reasoner', reasoningEffort: 'medium' },
+      }],
+    });
+    const stored = await service.read();
+    assert.equal(stored.presets.length, 1);
+
+    for (const projection of [publicSettings(stored), exportSettings(stored)]) {
+      assert.deepEqual(projection.presets, [{
+        id: 'thorough',
+        name: 'Thorough',
+        worker: { ...projection.presets[0].worker },
+        review: {
+          enabled: true,
+          providerId: 'relay',
+          model: 'deepseek-reasoner',
+          reasoningEffort: 'medium',
+        },
+      }]);
+      assert.equal(JSON.stringify(projection).includes('sk-'), false);
+      assert.equal(JSON.stringify(projection).includes('DSH_DELEGATE_RELAY_KEY_VALUE'), false);
+      assert.equal(projection.providers[0].credentialRef, 'DSH_DELEGATE_RELAY_KEY', 'a reference is a name, not a value');
+    }
+  } finally {
+    await cleanup(dir);
+  }
+});
+
+test('a stored document whose project key is not canonical is still found', async () => {
+  const dir = await makeTempDir();
+  try {
+    // Written by a build that keyed overrides by the caller's spelling.
+    const legacy = validSettings({
+      projectOverrides: {
+        'c:/work/project/': {
+          worker: { providerId: 'relay', model: 'deepseek-chat', reasoningEffort: 'low', timeoutSeconds: 900, maxParallelism: 1, isolation: 'shared' },
+        },
+      },
+    });
+    await writeFileAtomic(`${dir}/settings.json`, JSON.stringify(legacy));
+    const service = new SettingsService(dir);
+    const stored = await service.read();
+    assert.deepEqual(Object.keys(stored.projectOverrides), ['c:\\work\\project'], 'validation canonicalizes the key on load');
+    const effective = resolveEffectiveConfig(stored, { projectPath: 'C:\\Work\\Project' });
+    assert.equal(effective.worker.reasoningEffort, 'low');
+  } finally {
+    await cleanup(dir);
   }
 });

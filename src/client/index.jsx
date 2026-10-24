@@ -1,0 +1,1854 @@
+// dsh-delegate — native DSH bundle-configuration page (browser half of the plugin).
+//
+// This file is the whole operator GUI. It is a *client plugin*, not a standalone
+// dashboard and not a Codex surface: it registers the dsh-delegate bundle's
+// configuration in the native **Plugins manager** (`plugins.bundle.config`,
+// keyed by the bundle's npm package name), so it renders on this bundle's own
+// details page inside that manager and disappears when the plugin is disabled.
+// Desktop and Web both compose the same client-plugin/module system, so one
+// `platform: "web"` client declaration serves both shells.
+//
+// Contract facts this file is written against (installed
+// `@deepseek-ai/dsh-client-ui-plugin-manager` 0.2.1-rc.2,
+// `lib/types/client/slot-contract.d.ts`):
+//
+//   * `plugins.bundle.config` is `kind: 'keyed'`, `scope: 'root'`, keyed by the
+//     bundle package name, and is rendered only with `view: 'page'` (the manager's
+//     bundle detail page calls `renderSlot(..., { view: 'page' }, { entryKey })`).
+//     The slot's `owner` is `{ view }` plus an optional host `form`; this page
+//     keeps its own controls and does not use the host form.
+//   * `ctx.slots.inject(name, register)` runs `register` once the slot name is
+//     declared by its owning entry and disposes the registration when it is not.
+//     `ctx.slots.register(options, Component)` returns that disposer.
+//   * A slot registration declaring `locale` receives a `t` seat and requires an
+//     installed locale face. This page is deliberately Chinese-only and declares
+//     no `locale`, so it does not depend on the locale plugin being composed; all
+//     operator copy is written here once, in Chinese.
+//   * `inject` on a registration is either a plain props object or a
+//     `{ hooks, keyedHooks }` face. We return a plain object holding the store, so
+//     the component subscribes to the store itself with `useSyncExternalStore`.
+//   * A registrant merges the slot contract with `import type` and registers
+//     through `ctx.slots`; it never imports the plugin-manager package at
+//     runtime. Ordering comes from `dsh.client.inject` in package.json, which
+//     names `@deepseek-ai/dsh-client-ui-plugin-manager` so its factory is
+//     registered (and its slot declared) before this registration materializes.
+//
+// Security properties that must survive any edit of this file:
+//
+//   * No `dangerouslySetInnerHTML` anywhere: model output, diffs and host
+//     diagnostics are rendered as text nodes only.
+//   * Provider credentials are not entered here. New selections come from DSH's
+//     registered provider list, so their existing credential configuration stays
+//     inside DSH.
+//   * Nothing here submits a task. The GUI controls local MCP access and settings;
+//     the MCP host submits. The task panel offers cancel and retry guidance.
+//
+// React and `react/jsx-runtime` are the only module requests this bundle makes
+// beyond `@deepseek-ai/*` platform modules, which is why the native loader can
+// resolve every external against its frozen platform table.
+
+import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
+
+import {
+  CONNECTIVITY_LAYERS,
+  EFFORT_LABELS,
+  EFFORT_UNSET,
+  GRANT_KIND_LABELS,
+  ISOLATION_LABELS,
+  ISOLATION_MODES,
+  KNOWN_EFFORTS,
+  LIMITS,
+  REVIEW_STATE_LABELS,
+  REVIEW_VERDICT_LABELS,
+  SUPPORTED_PROTOCOLS,
+  TASK_STATES,
+  boundedText,
+  changedFiles,
+  clone,
+  createApi,
+  createStore,
+  describeError,
+  documentFromDraft,
+  draftFromSettings,
+  duplicateProviderIds,
+  exportDocument,
+  formatTime,
+  grantState,
+  isCancellable,
+  precheckDraft,
+  previewEffective,
+  taskOutcome,
+  taskStateLabel,
+} from './api.js';
+import { injectStyles } from './styles.js';
+
+/** Plugins-manager config slot this page occupies. */
+export const PLUGIN_CONFIG_SLOT = 'plugins.bundle.config';
+
+/**
+ * Key of this bundle's configuration entry: exactly the bundle's npm package
+ * name. The Plugins manager looks the entry up by `pkg.name`, so any other key
+ * registers a page that never renders.
+ */
+export const PLUGIN_BUNDLE_KEY = 'dsh-delegate';
+
+/** Required client services: slot registration only. */
+export const inject = ['slots'];
+
+/**
+ * Register the bundle configuration page on a client context.
+ *
+ * Split out from {@link apply} so a test can drive it with a fake `ctx` and
+ * assert the registration contract (slot name, key, inject face) without a
+ * browser.
+ * @param {object} ctx - client Cordis context providing `slots`.
+ * @param {object} options - `store`.
+ * @returns {Function} disposer releasing the registration.
+ */
+export function registerBundleConfiguration(ctx, options) {
+  const store = options.store;
+  const injectFace = () => ({ store });
+  return ctx.slots.inject(PLUGIN_CONFIG_SLOT, () => ctx.slots.register({
+    name: PLUGIN_CONFIG_SLOT,
+    key: PLUGIN_BUNDLE_KEY,
+    inject: injectFace,
+  }, DelegateConfigPage));
+}
+
+/**
+ * Client plugin body.
+ * @param {object} ctx - client Cordis context.
+ */
+export function apply(ctx) {
+  ctx.effect(() => injectStyles(globalThis.document), 'dsh-delegate: settings styles');
+  const store = createStore({ api: createApi() });
+  ctx.effect(() => () => store.dispose(), 'dsh-delegate: settings store');
+  ctx.effect(() => registerBundleConfiguration(ctx, { store }), 'dsh-delegate: bundle configuration');
+}
+
+// ---------------------------------------------------------------------------
+// Small presentational helpers
+// ---------------------------------------------------------------------------
+
+/** @param {object} props @returns {object} */
+function Badge({ tone = 'off', children }) {
+  return <span className={`dshdg-badge dshdg-badge-${tone}`}>{children}</span>;
+}
+
+/** @param {object} props @returns {object} */
+function Field({ label, hint, htmlFor, children }) {
+  return (
+    <div className="dshdg-field">
+      {label === undefined ? null : <label htmlFor={htmlFor}>{label}</label>}
+      {children}
+      {hint === undefined ? null : <span className="dshdg-hint">{hint}</span>}
+    </div>
+  );
+}
+
+/**
+ * Integer input bounded by the host validator's limits.
+ * @param {object} props - `label`, `value`, `min`, `max`, `onChange`, `hint`, `disabled`.
+ * @returns {object} a numeric field.
+ */
+function IntegerField({ label, value, min, max, onChange, hint, disabled = false, id }) {
+  return (
+    <Field label={label} hint={hint} htmlFor={id}>
+      <input
+        id={id}
+        type="number"
+        inputMode="numeric"
+        min={min}
+        max={max}
+        step={1}
+        disabled={disabled}
+        value={Number.isFinite(Number(value)) ? String(value) : ''}
+        onChange={(event) => {
+          const raw = event.target.value;
+          onChange(raw === '' ? '' : Number(raw));
+        }}
+      />
+    </Field>
+  );
+}
+
+/**
+ * Provider/model/effort selector triple.
+ *
+ * The effort list is derived from the *selected model's declared* capabilities,
+ * never from a global list, so an unsupported combination cannot be produced by
+ * the form in the first place. A model that declares no efforts shows only "不指定".
+ * @param {object} props - `providers`, `value`, `onChange`, `idPrefix`, `modelCatalog`.
+ * @returns {object} three fields.
+ */
+function SelectionFields(props) {
+  const { providers, value, onChange, idPrefix } = props;
+  const provider = providers.find((entry) => entry.id === value.providerId) ?? null;
+  const models = provider === null ? [] : (provider.models ?? []);
+  const model = models.find((entry) => entry.id === value.model) ?? null;
+  const efforts = model === null ? [] : (model.efforts ?? []);
+  return (
+    <div className="dshdg-grid">
+      <Field label="提供方" htmlFor={`${idPrefix}-provider`}>
+        <select
+          id={`${idPrefix}-provider`}
+          value={value.providerId ?? ''}
+          onChange={(event) => {
+            onChange({ providerId: event.target.value === '' ? null : event.target.value, model: null, reasoningEffort: null });
+          }}
+        >
+          <option value="">（未选择）</option>
+          {providers.map((entry) => (
+            <option key={entry.id} value={entry.id}>{entry.name === '' ? entry.id : `${entry.name}（${entry.id}）`}</option>
+          ))}
+        </select>
+      </Field>
+      <Field label="模型" htmlFor={`${idPrefix}-model`}>
+        <select
+          id={`${idPrefix}-model`}
+          value={value.model ?? ''}
+          disabled={provider === null}
+          onChange={(event) => {
+            const nextModel = event.target.value === '' ? null : event.target.value;
+            const declared = (models.find((entry) => entry.id === nextModel)?.efforts ?? []);
+            const keep = value.reasoningEffort === null || declared.includes(value.reasoningEffort)
+              ? value.reasoningEffort
+              : null;
+            onChange({ providerId: value.providerId ?? null, model: nextModel, reasoningEffort: keep });
+          }}
+        >
+          <option value="">（未选择）</option>
+          {models.map((entry) => (
+            <option key={entry.id} value={entry.id}>{entry.id}</option>
+          ))}
+        </select>
+      </Field>
+      <Field
+        label="推理强度"
+        htmlFor={`${idPrefix}-effort`}
+        hint={model === null
+          ? '选择模型后显示该模型声明的推理强度'
+          : (efforts.length === 0 ? '该模型未声明推理强度，只能不指定' : '仅列出该模型声明的能力')}
+      >
+        <select
+          id={`${idPrefix}-effort`}
+          value={value.reasoningEffort ?? EFFORT_UNSET}
+          disabled={model === null || efforts.length === 0}
+          onChange={(event) => {
+            onChange({ ...value, reasoningEffort: event.target.value === EFFORT_UNSET ? null : event.target.value });
+          }}
+        >
+          <option value={EFFORT_UNSET}>（不指定）</option>
+          {efforts.map((effort) => (
+            <option key={effort} value={effort}>{`${EFFORT_LABELS[effort] ?? effort}（${effort}）`}</option>
+          ))}
+        </select>
+      </Field>
+    </div>
+  );
+}
+
+/**
+ * One connectivity layer row.
+ * @param {object} props - `label`, `result`, `name`.
+ * @returns {object} a row.
+ */
+function ConnectivityLayer({ label, name, result }) {
+  const ok = result?.ok;
+  const tone = ok === true ? 'dshdg-ok' : (ok === false ? 'dshdg-fail' : 'dshdg-unknown');
+  const verdict = ok === true ? '通过' : (ok === false ? '未通过' : '未确认');
+  const detail = result?.detail ?? null;
+  const detailText = detail === null
+    ? ''
+    : (typeof detail === 'string' ? detail : `${detail.code ?? ''}${detail.message === undefined ? '' : ` · ${detail.message}`}`);
+  return (
+    <div className="dshdg-layer">
+      <span>
+        {label}
+        {' '}
+        <span className={tone}>{verdict}</span>
+      </span>
+      <span className="dshdg-layer-detail dshdg-mono" data-layer={name}>
+        {detailText === '' ? '—' : detailText}
+      </span>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Notices
+// ---------------------------------------------------------------------------
+
+/** @param {object} props @returns {object|null} the notice strip. */
+function Notices({ store, notices }) {
+  if (notices.length === 0) return null;
+  return (
+    <div className="dshdg-notices" role="status" aria-live="polite">
+      {notices.map((notice) => (
+        <div key={String(notice.id)} className={`dshdg-notice dshdg-notice-${notice.level}`}>
+          <span>{notice.text}</span>
+          <button type="button" onClick={() => store.dismissNotice(notice.id)} aria-label="关闭提示">关闭</button>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Authorization (rendered above the four areas)
+// ---------------------------------------------------------------------------
+
+/** @param {object} props @returns {object} the authorization card. */
+function AuthorizationPanel({ store, snapshot }) {
+  const enabled = snapshot.status?.delegation?.mode === 'switch'
+    ? snapshot.status.delegation.authorized === true
+    : snapshot.settings?.delegationEnabled === true;
+  const busy = snapshot.loading?.delegationSwitch === true;
+  return (
+    <section className="dshdg-card" aria-labelledby="dshdg-auth-title">
+      <div className="dshdg-row">
+        <h3 id="dshdg-auth-title">本机调用授权</h3>
+        <span className="dshdg-spacer" />
+        <Badge tone={enabled ? 'on' : 'off'}>{enabled ? '已开启' : '已关闭'}</Badge>
+      </div>
+      <div className="dshdg-row">
+        <label className="dshdg-switch" htmlFor="dshdg-delegation-switch">
+          <input
+            id="dshdg-delegation-switch"
+            type="checkbox"
+            role="switch"
+            checked={enabled}
+            disabled={busy || snapshot.status === null}
+            onChange={(event) => { void store.setDelegationEnabled(event.target.checked); }}
+          />
+          允许本机 MCP 调用 DSH 委派
+        </label>
+        <span className="dshdg-spacer" />
+        <span className="dshdg-hint">{busy ? '正在更新…' : (enabled ? '关闭后会拒绝新任务并停止运行中的任务' : '关闭状态会拒绝所有委派请求')}</span>
+      </div>
+    </section>
+  );
+}
+
+function LegacyAuthorizationPanel({ store, snapshot }) {
+  const [label, setLabel] = useState('codex');
+  const [kind, setKind] = useState('task');
+  const [workspacePath, setWorkspacePath] = useState('');
+  const [ttlSeconds, setTtlSeconds] = useState('');
+  const [copied, setCopied] = useState('');
+  const posture = snapshot.status?.delegation ?? null;
+  const connections = snapshot.connections ?? [];
+  const live = connections.filter((entry) => entry.revoked !== true);
+  const selected = live.find((entry) => entry.connectionId === snapshot.selectedConnectionId) ?? null;
+  const grants = snapshot.grants ?? [];
+  const now = Date.now();
+
+  const busy = (key) => snapshot.loading?.[key] === true;
+  // The engine reports `{ authorized, reason }`; `authorized` is the only
+  // authority. The page never derives authorization from what it displays.
+  const authorized = posture?.authorized === true;
+
+  return (
+    <section className="dshdg-card" aria-labelledby="dshdg-auth-title">
+      <div className="dshdg-row">
+        <h3 id="dshdg-auth-title">授权（外部连接）</h3>
+        <span className="dshdg-spacer" />
+        {posture === null
+          ? <Badge tone="off">状态未知</Badge>
+          : (authorized
+            ? <Badge tone="on">已授权</Badge>
+            : <Badge tone="off">默认关闭</Badge>)}
+      </div>
+      <p className="dshdg-muted">
+        委托默认关闭，安装、重启或提到 DeepSeek 都不会自动开启。只有在这里给<strong>宿主签发的连接</strong>授权后，
+        MCP 宿主才能提交任务；插件与 MCP 都无法自行授权。授权由服务端校验，界面只是入口。
+      </p>
+      <div className="dshdg-kv dshdg-mono">
+        <dt>执行通道</dt>
+        <dd>
+          {snapshot.status?.runtime?.executionPlane ?? '—'}
+          {snapshot.status?.runtime?.executionPlaneLocalOnly === true ? '（仅本机）' : '（非本机绑定，请确认暴露面）'}
+        </dd>
+        <dt>本机绑定</dt>
+        <dd>{snapshot.status?.runtime?.bind ?? '—'}:{snapshot.status?.runtime?.port ?? '—'}</dd>
+        <dt>宿主裁决</dt>
+        <dd>{posture === null ? '—' : (authorized ? '当前存在有效授权' : (posture.reason ?? '未授权'))}</dd>
+      </div>
+
+      <div className="dshdg-row">
+        <Field label="连接显示名" htmlFor="dshdg-conn-label" hint="仅用于你区分连接，不影响权限。">
+          <input
+            id="dshdg-conn-label"
+            type="text"
+            value={label}
+            maxLength={60}
+            onChange={(event) => setLabel(event.target.value)}
+          />
+        </Field>
+        <button
+          type="button"
+          className="dshdg-primary"
+          disabled={busy('issueConnection')}
+          onClick={() => { void store.issueConnection(label); }}
+        >
+          {busy('issueConnection') ? '签发中…' : '签发新连接'}
+        </button>
+      </div>
+
+      {snapshot.token === null ? null : (
+        <div className="dshdg-secret-warning">
+          <strong>连接令牌只显示这一次</strong>
+          <p className="dshdg-muted">
+            请立即复制到 MCP 宿主配置（形如 <span className="dshdg-mono">Authorization: Bearer …</span>）。
+            令牌仅保存在本页面内存中，不会写入地址栏、日志、localStorage 或 sessionStorage；关闭对话框或刷新后无法再次查看，只能重新签发。
+          </p>
+          <code className="dshdg-token dshdg-mono">{snapshot.token}</code>
+          <div className="dshdg-row">
+            <button
+              type="button"
+              onClick={async () => {
+                try {
+                  await globalThis.navigator?.clipboard?.writeText(snapshot.token);
+                  setCopied('已复制到剪贴板');
+                } catch {
+                  setCopied('无法访问剪贴板，请手动选中复制');
+                }
+              }}
+            >
+              复制令牌
+            </button>
+            <button type="button" onClick={() => { setCopied(''); store.clearToken(); }}>我已完成，清除显示</button>
+            {copied === '' ? null : <span className="dshdg-hint">{copied}</span>}
+          </div>
+        </div>
+      )}
+
+      <div className="dshdg-grid">
+        <Field label="选择连接" htmlFor="dshdg-conn-select" hint="授权只能绑定宿主签发的连接身份，不接受手填身份。">
+          <select
+            id="dshdg-conn-select"
+            value={snapshot.selectedConnectionId ?? ''}
+            onChange={(event) => { void store.selectConnection(event.target.value === '' ? null : event.target.value); }}
+          >
+            <option value="">（未选择）</option>
+            {live.map((entry) => (
+              <option key={entry.connectionId} value={entry.connectionId}>
+                {`${entry.label ?? '连接'} · ${entry.connectionId.slice(0, 8)}…`}
+              </option>
+            ))}
+          </select>
+        </Field>
+        <Field label="授权范围" htmlFor="dshdg-grant-kind">
+          <select id="dshdg-grant-kind" value={kind} onChange={(event) => setKind(event.target.value)}>
+            <option value="task">{GRANT_KIND_LABELS.task}</option>
+            <option value="session">{GRANT_KIND_LABELS.session}</option>
+          </select>
+        </Field>
+        <Field label="授权工作区（绝对路径）" htmlFor="dshdg-grant-workspace" hint="任务只能改这个目录；隔离方式在执行设置里。">
+          <input
+            id="dshdg-grant-workspace"
+            type="text"
+            value={workspacePath}
+            placeholder="C:\\work\\project"
+            onChange={(event) => setWorkspacePath(event.target.value)}
+          />
+        </Field>
+        <Field
+          label="有效期（秒，可留空用默认）"
+          htmlFor="dshdg-grant-ttl"
+          hint={kind === 'task'
+            ? `${LIMITS.taskGrantTtlSecondsMin}–${LIMITS.taskGrantTtlSecondsMax} 秒`
+            : `${LIMITS.sessionGrantTtlSecondsMin}–${LIMITS.sessionGrantTtlSecondsMax} 秒`}
+        >
+          <input
+            id="dshdg-grant-ttl"
+            type="number"
+            min={kind === 'task' ? LIMITS.taskGrantTtlSecondsMin : LIMITS.sessionGrantTtlSecondsMin}
+            max={kind === 'task' ? LIMITS.taskGrantTtlSecondsMax : LIMITS.sessionGrantTtlSecondsMax}
+            step={1}
+            value={ttlSeconds}
+            onChange={(event) => setTtlSeconds(event.target.value)}
+          />
+        </Field>
+      </div>
+
+      <div className="dshdg-row">
+        <button
+          type="button"
+          className="dshdg-primary"
+          disabled={busy('issueGrant') || snapshot.selectedConnectionId === null}
+          onClick={() => {
+            void store.issueGrant({
+              connectionId: snapshot.selectedConnectionId,
+              kind,
+              workspacePath,
+              ttlSeconds: ttlSeconds === '' ? undefined : Number(ttlSeconds),
+            });
+          }}
+        >
+          {busy('issueGrant') ? '签发中…' : (kind === 'task' ? '授权一次任务' : '授权本连接会话')}
+        </button>
+        <button
+          type="button"
+          disabled={busy('issueGrant') || snapshot.selectedConnectionId === null}
+          onClick={() => { void store.loadGrants(snapshot.selectedConnectionId); }}
+        >
+          刷新授权
+        </button>
+        <span className="dshdg-spacer" />
+        <button
+          type="button"
+          className="dshdg-danger"
+          disabled={busy('revokeAll')}
+          onClick={() => { void store.revokeAll(); }}
+        >
+          {busy('revokeAll') ? '撤销中…' : '立即全部撤销'}
+        </button>
+      </div>
+
+      {selected === null ? (
+        <p className="dshdg-faint">还没有选择连接。先“签发新连接”，再把令牌配置到 MCP 宿主。</p>
+      ) : (
+        <div className="dshdg-list">
+          <div className="dshdg-item-head">
+            <strong>{selected.label ?? '连接'}</strong>
+            <span className="dshdg-mono dshdg-faint">{selected.connectionId}</span>
+            <span className="dshdg-spacer" />
+            <button
+              type="button"
+              className="dshdg-danger"
+              disabled={busy('revokeConnection')}
+              onClick={() => { void store.revokeConnection(selected.connectionId); }}
+            >
+              撤销该连接
+            </button>
+          </div>
+          {grants.length === 0 ? (
+            <p className="dshdg-faint">该连接没有未撤销的授权；此时 MCP 提交任务会被拒绝。</p>
+          ) : grants.map((grant) => {
+            const gstate = grantState(grant, now);
+            return (
+              <div className="dshdg-item" key={grant.grantId}>
+                <div className="dshdg-item-head">
+                  <Badge tone={gstate.key === 'live' ? 'on' : 'off'}>{gstate.label}</Badge>
+                  <span>{GRANT_KIND_LABELS[grant.kind] ?? grant.kind}</span>
+                  <span className="dshdg-mono dshdg-faint">{grant.workspacePath}</span>
+                  <span className="dshdg-spacer" />
+                  <button
+                    type="button"
+                    className="dshdg-danger"
+                    disabled={busy('revokeGrant') || gstate.key !== 'live'}
+                    onClick={() => { void store.revokeGrant(grant.grantId); }}
+                  >
+                    撤销
+                  </button>
+                </div>
+                <div className="dshdg-kv">
+                  <dt>签发</dt>
+                  <dd>{formatTime(grant.createdAt)}</dd>
+                  <dt>到期</dt>
+                  <dd>{formatTime(grant.expiresAt)}</dd>
+                  {grant.consumedByTaskId === null || grant.consumedByTaskId === undefined ? null : (
+                    <>
+                      <dt>用掉于任务</dt>
+                      <dd className="dshdg-mono">{grant.consumedByTaskId}</dd>
+                    </>
+                  )}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </section>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// API management
+// ---------------------------------------------------------------------------
+
+/**
+ * One provider profile editor, including its separate credential seam.
+ * @param {object} props - `provider`, `store`, `snapshot`, `index`.
+ * @returns {object} an editor card.
+ */
+function ProviderEditor({ provider, store, snapshot, index }) {
+  const providerId = provider.id;
+  const credential = snapshot.credentials?.[providerId] ?? null;
+  // The secret never leaves this component's local state. It is not part of the
+  // draft, so it cannot be exported, saved with the document, or restored.
+  const [secret, setSecret] = useState('');
+  const [confirmRemove, setConfirmRemove] = useState(false);
+  const [checkModel, setCheckModel] = useState('');
+  const [checkEffort, setCheckEffort] = useState('');
+  const busyKey = snapshot.loading?.[`credential:${providerId}`] === true;
+  const report = snapshot.connectivity?.[providerId] ?? null;
+  const fetched = snapshot.modelCatalog?.[providerId] ?? null;
+  const models = provider.models ?? [];
+
+  const editProvider = useCallback((mutate) => {
+    store.editDraft((draft) => {
+      const target = draft.providers.find((entry) => entry.id === providerId);
+      if (target !== undefined) mutate(target);
+    });
+  }, [store, providerId]);
+
+  const selectedModel = models.find((entry) => entry.id === checkModel) ?? null;
+
+  return (
+    <div className="dshdg-item">
+      <div className="dshdg-item-head">
+        <strong>{provider.name === '' ? `提供方 ${index + 1}` : provider.name}</strong>
+        <span className="dshdg-mono dshdg-faint">{provider.id || '（标识未填）'}</span>
+        <span className="dshdg-spacer" />
+        <button
+          type="button"
+          className="dshdg-danger"
+          disabled={snapshot.dirty !== true}
+          title="删除后需要保存才会生效"
+          onClick={() => {
+            store.editDraft((draft) => {
+              draft.providers = draft.providers.filter((entry) => entry.id !== providerId);
+            });
+          }}
+        >
+          删除
+        </button>
+      </div>
+
+      <div className="dshdg-grid">
+        <Field label="标识" htmlFor={`dshdg-p${index}-id`} hint="3–40 位小写字母、数字、连字符；保存后用作路由 id。">
+          <input
+            id={`dshdg-p${index}-id`}
+            type="text"
+            value={provider.id}
+            onChange={(event) => {
+              const nextId = event.target.value.trim().toLowerCase();
+              store.editDraft((draft) => {
+                const target = draft.providers.find((entry) => entry.id === providerId);
+                if (target === undefined) return;
+                target.id = nextId;
+                for (const block of [draft.worker, draft.review]) {
+                  if (block?.providerId === providerId) block.providerId = nextId;
+                }
+              });
+            }}
+          />
+        </Field>
+        <Field label="显示名称" htmlFor={`dshdg-p${index}-name`}>
+          <input
+            id={`dshdg-p${index}-name`}
+            type="text"
+            value={provider.name}
+            onChange={(event) => editProvider((target) => { target.name = event.target.value; })}
+          />
+        </Field>
+        <Field label="协议" htmlFor={`dshdg-p${index}-protocol`}>
+          <select
+            id={`dshdg-p${index}-protocol`}
+            value={provider.protocol}
+            onChange={(event) => editProvider((target) => { target.protocol = event.target.value; })}
+          >
+            {SUPPORTED_PROTOCOLS.map((protocol) => (
+              <option key={protocol} value={protocol}>OpenAI 兼容 Chat Completions（{protocol}）</option>
+            ))}
+          </select>
+        </Field>
+        <Field label="接口地址" htmlFor={`dshdg-p${index}-baseurl`} hint="http/https，不带账号密码、查询串或片段。">
+          <input
+            id={`dshdg-p${index}-baseurl`}
+            type="text"
+            value={provider.baseUrl}
+            placeholder="https://api.example.com/v1"
+            onChange={(event) => editProvider((target) => { target.baseUrl = event.target.value; })}
+          />
+        </Field>
+        <Field label="凭据引用名（可选）" htmlFor={`dshdg-p${index}-ref`} hint="复用宿主环境变量/凭据引用；不要填密钥本身。">
+          <input
+            id={`dshdg-p${index}-ref`}
+            type="text"
+            value={provider.credentialRef ?? ''}
+            placeholder="MY_PROVIDER_API_KEY"
+            onChange={(event) => {
+              const value = event.target.value.trim();
+              editProvider((target) => { target.credentialRef = value === '' ? null : value; });
+            }}
+          />
+        </Field>
+      </div>
+
+      <div className="dshdg-card">
+        <div className="dshdg-row">
+          <h4>密钥（独立通道）</h4>
+          <span className="dshdg-spacer" />
+          {credential === null || credential.loaded !== true ? (
+            <Badge tone="off">未检查</Badge>
+          ) : credential.unavailable === true ? (
+            <Badge tone="warn">宿主未提供凭据接口</Badge>
+          ) : credential.configured === true ? (
+            <Badge tone="on">{`已配置${credential.source === undefined ? '' : `（${credential.source}）`}`}</Badge>
+          ) : (
+            <Badge tone="off">未配置</Badge>
+          )}
+          <button
+            type="button"
+            disabled={busyKey}
+            onClick={() => { void store.credentialStatus(providerId); }}
+          >
+            检查状态
+          </button>
+        </div>
+        <p className="dshdg-hint">
+          密钥值不会进入设置文档、导出文本、任务历史或日志，也不会回显。保存成功后输入框会被清空。
+        </p>
+        {credential?.unavailable === true
+          ? <p className="dshdg-fail">{credential.reason}</p>
+          : null}
+        <div className="dshdg-row">
+          <input
+            id={`dshdg-p${index}-secret`}
+            type="password"
+            autoComplete="new-password"
+            spellCheck={false}
+            aria-label={`${provider.name || provider.id} 的密钥`}
+            placeholder={credential?.configured === true ? '已配置；输入新值可覆盖' : '粘贴密钥'}
+            value={secret}
+            onChange={(event) => setSecret(event.target.value)}
+          />
+          <button
+            type="button"
+            className="dshdg-primary"
+            disabled={busyKey || secret.trim() === ''}
+            onClick={async () => {
+              const result = await store.setCredential(providerId, secret);
+              // Clear on success only: a failed save keeps the operator's paste so
+              // they can retry, and nothing has been stored either way.
+              if (result.ok === true) setSecret('');
+            }}
+          >
+            {busyKey ? '保存中…' : '保存密钥'}
+          </button>
+          {confirmRemove ? (
+            <>
+              <button
+                type="button"
+                className="dshdg-danger"
+                disabled={busyKey}
+                onClick={async () => {
+                  setConfirmRemove(false);
+                  await store.unsetCredential(providerId);
+                }}
+              >
+                确认清除
+              </button>
+              <button type="button" onClick={() => setConfirmRemove(false)}>取消</button>
+            </>
+          ) : (
+            <button type="button" onClick={() => setConfirmRemove(true)}>清除密钥</button>
+          )}
+        </div>
+      </div>
+
+      <div className="dshdg-card">
+        <div className="dshdg-row">
+          <h4>模型与推理强度</h4>
+          <span className="dshdg-spacer" />
+          <button
+            type="button"
+            disabled={snapshot.loading?.[`models:${providerId}`] === true}
+            onClick={async () => {
+              const result = await store.fetchModels(providerId);
+              if (result.ok === true && Array.isArray(result.models)) store.mergeModelsIntoDraft(providerId, result.models);
+            }}
+          >
+            {snapshot.loading?.[`models:${providerId}`] === true ? '获取中…' : '从提供方获取模型'}
+          </button>
+        </div>
+        {fetched === null ? null : (
+          <p className={fetched.discovery?.failed === true ? 'dshdg-fail' : 'dshdg-hint'}>
+            {fetched.source === 'catalog'
+              ? '宿主尚未提供从提供方获取模型的接口，以下结果来自宿主模型目录（不是远程模型列表）。'
+              : fetched.discovery?.failed === true
+                ? `未能从提供方获取模型：${describeError(fetched.error ?? fetched.discovery)} 已保留现有手工配置，可继续使用。`
+                : `已从提供方接口获取 ${fetched.models.length} 个模型（${formatTime(fetched.fetchedAt)}）。`}
+            {fetched.source === 'catalog' || fetched.discovery?.failed === true
+              ? ''
+              : ' 模型列表不代表推理能力：导入后仍需为每个模型勾选其实际支持的推理强度。'}
+          </p>
+        )}
+        {models.length === 0 ? (
+          <p className="dshdg-faint">还没有模型。可以自动获取，也可以手动添加。</p>
+        ) : models.map((model, modelIndex) => (
+          <div className="dshdg-item" key={`${model.id}-${String(modelIndex)}`}>
+            <div className="dshdg-item-head">
+              <input
+                type="text"
+                aria-label={`模型 ${modelIndex + 1} 的 ID`}
+                value={model.id}
+                onChange={(event) => {
+                  editProvider((target) => {
+                    const found = target.models[modelIndex];
+                    if (found !== undefined) found.id = event.target.value.trim();
+                  });
+                }}
+              />
+              <span className="dshdg-spacer" />
+              <button
+                type="button"
+                className="dshdg-danger"
+                onClick={() => {
+                  store.editDraft((draft) => {
+                    const target = draft.providers.find((entry) => entry.id === providerId);
+                    if (target === undefined) return;
+                    const removed = target.models[modelIndex];
+                    target.models.splice(modelIndex, 1);
+                    // A selection pointing at the removed model would be
+                    // unroutable; clear it here so the operator sees the
+                    // consequence instead of saving an invalid pair.
+                    if (removed !== undefined) {
+                      for (const block of [draft.worker, draft.review]) {
+                        if (block?.providerId === providerId && block?.model === removed.id) {
+                          block.model = null;
+                          block.reasoningEffort = null;
+                        }
+                      }
+                    }
+                  });
+                }}
+              >
+                删除模型
+              </button>
+            </div>
+            <div className="dshdg-check" role="group" aria-label={`模型 ${model.id} 支持的推理强度`}>
+              {KNOWN_EFFORTS.map((effort) => (
+                <label key={effort}>
+                  <input
+                    type="checkbox"
+                    checked={(model.efforts ?? []).includes(effort)}
+                    onChange={(event) => {
+                      editProvider((target) => {
+                        const found = target.models[modelIndex];
+                        if (found === undefined) return;
+                        const next = new Set(found.efforts ?? []);
+                        if (event.target.checked) next.add(effort);
+                        else next.delete(effort);
+                        found.efforts = KNOWN_EFFORTS.filter((id) => next.has(id));
+                      });
+                    }}
+                  />
+                  {EFFORT_LABELS[effort]}（{effort}）
+                </label>
+              ))}
+            </div>
+          </div>
+        ))}
+        <div className="dshdg-row">
+          <button
+            type="button"
+            onClick={() => {
+              editProvider((target) => { target.models.push({ id: '', efforts: [] }); });
+            }}
+          >
+            手动添加模型
+          </button>
+        </div>
+      </div>
+
+      <div className="dshdg-card">
+        <div className="dshdg-row">
+          <h4>连通性检查</h4>
+          <span className="dshdg-spacer" />
+          <select aria-label="检查用模型" value={checkModel} onChange={(event) => { setCheckModel(event.target.value); setCheckEffort(''); }}>
+            <option value="">（用执行设置的模型）</option>
+            {models.map((entry) => <option key={entry.id} value={entry.id}>{entry.id}</option>)}
+          </select>
+          <select
+            aria-label="检查用推理强度"
+            value={checkEffort}
+            disabled={selectedModel === null || (selectedModel.efforts ?? []).length === 0}
+            onChange={(event) => setCheckEffort(event.target.value)}
+          >
+            <option value="">（不指定）</option>
+            {(selectedModel?.efforts ?? []).map((effort) => (
+              <option key={effort} value={effort}>{EFFORT_LABELS[effort] ?? effort}</option>
+            ))}
+          </select>
+          <button
+            type="button"
+            disabled={snapshot.loading?.[`connectivity:${providerId}`] === true}
+            onClick={() => {
+              void store.checkConnectivity({
+                providerId,
+                ...(checkModel === '' ? {} : { model: checkModel }),
+                ...(checkEffort === '' ? {} : { reasoningEffort: checkEffort }),
+              });
+            }}
+          >
+            {snapshot.loading?.[`connectivity:${providerId}`] === true ? '检查中…' : '开始检查'}
+          </button>
+        </div>
+        <p className="dshdg-hint">四层分别判定：地址可达、认证可用、目录可读、模型真的回了话。任何一层未通过都不会显示成“连通”。</p>
+        {report === null ? <p className="dshdg-faint">尚未检查。</p> : (
+          <div className="dshdg-layers">
+            {CONNECTIVITY_LAYERS.map((layer) => (
+              <ConnectivityLayer
+                key={layer.key}
+                name={layer.key}
+                label={layer.label}
+                result={report[layer.key] ?? null}
+              />
+            ))}
+            {report.modelResponse?.response?.reasoningOnly === true
+              ? <p className="dshdg-hint">模型只返回了推理内容（reasoning-only），已按协议视为有效响应。</p>
+              : null}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/** @param {object} props @returns {object} the API management panel. */
+function ProvidersPanel({ store, snapshot }) {
+  const providers = snapshot.draft?.providers ?? [];
+  const selectedIds = new Set(providers.map((provider) => provider.id));
+  const available = (snapshot.nativeProviders ?? []).filter((provider) => !selectedIds.has(provider.id));
+  const [candidateId, setCandidateId] = useState('');
+  const nativeProviders = snapshot.nativeProviders ?? [];
+
+  function isUsed(id) {
+    const draft = snapshot.draft ?? {};
+    const selections = [draft.worker, draft.review, ...(draft.presets ?? []).flatMap((preset) => [preset.worker, preset.review])];
+    for (const block of Object.values(draft.projectOverrides ?? {})) {
+      selections.push(block?.worker, block?.review);
+    }
+    return selections.some((selection) => selection?.providerId === id);
+  }
+
+  return (
+    <div className="dshdg-panel">
+      <div className="dshdg-row">
+        <Field label="DSH 已启用的接口" htmlFor="dshdg-native-provider">
+          <select id="dshdg-native-provider" value={candidateId} onChange={(event) => setCandidateId(event.target.value)}>
+            <option value="">（选择已有接口）</option>
+            {available.map((provider) => <option key={provider.id} value={provider.id}>{`${provider.name} (${provider.id})`}</option>)}
+          </select>
+        </Field>
+        <button
+          type="button"
+          className="dshdg-primary"
+          disabled={candidateId === ''}
+          onClick={() => {
+            const provider = nativeProviders.find((entry) => entry.id === candidateId);
+            if (provider === undefined) return;
+            store.editDraft((draft) => {
+              if (draft.providers.some((entry) => entry.id === provider.id)) return;
+              draft.providers.push({
+                id: provider.id,
+                name: provider.name,
+                source: 'native',
+                protocol: null,
+                baseUrl: null,
+                credentialRef: null,
+                models: (provider.models ?? []).map((model) => ({ ...model, efforts: [...(model.efforts ?? [])] })),
+              });
+            });
+            setCandidateId('');
+          }}
+        >
+          添加所选接口
+        </button>
+        <button type="button" disabled={snapshot.loading?.nativeProviders === true} onClick={() => { void store.loadNativeProviders(); }}>
+          {snapshot.loading?.nativeProviders === true ? '刷新中…' : '刷新接口列表'}
+        </button>
+      </div>
+      {snapshot.nativeProvidersError ? <p className="dshdg-fail">{snapshot.nativeProvidersError}</p> : null}
+      {nativeProviders.length === 0 ? <p className="dshdg-muted">DSH 当前没有可选的已启用接口。先在 DSH 的模型设置中配置并启用接口。</p> : null}
+      {providers.length === 0 ? <p className="dshdg-muted">尚未选择委派可用的接口。</p> : null}
+      {providers.map((provider) => {
+        const current = nativeProviders.find((entry) => entry.id === provider.id);
+        const legacy = provider.source !== 'native';
+        const used = isUsed(provider.id);
+        return (
+          <div className="dshdg-item" key={provider.id}>
+            <div className="dshdg-item-head">
+              <strong>{provider.name}</strong>
+              <span className="dshdg-mono dshdg-faint">{provider.id}</span>
+              <Badge tone={legacy ? 'warn' : 'on'}>{legacy ? '旧版自定义接口' : 'DSH 接口'}</Badge>
+              <span className="dshdg-spacer" />
+              {current !== undefined && !legacy ? (
+                <button
+                  type="button"
+                  disabled={snapshot.loading?.nativeProviders === true || (current.models ?? []).length === 0}
+                  onClick={() => store.editDraft((draft) => {
+                    const target = draft.providers.find((entry) => entry.id === provider.id);
+                    if (target === undefined) return;
+                    target.name = current.name;
+                    target.models = current.models.map((model) => ({ ...model, efforts: [...(model.efforts ?? [])] }));
+                  })}
+                >
+                  同步模型
+                </button>
+              ) : null}
+              <button
+                type="button"
+                className="dshdg-danger"
+                disabled={used}
+                title={used ? '先将执行、审查和预设中的该接口改为其他接口' : undefined}
+                onClick={() => store.editDraft((draft) => { draft.providers = draft.providers.filter((entry) => entry.id !== provider.id); })}
+              >
+                移除
+              </button>
+            </div>
+            {legacy ? <p className="dshdg-hint">此接口来自旧版插件配置。新接口请从上方 DSH 列表选择。</p> : null}
+            {current?.error ? <p className="dshdg-fail">{current.error}</p> : null}
+            <div className="dshdg-list">
+              {(current?.models ?? provider.models ?? []).map((model) => (
+                <div className="dshdg-item-head" key={model.id}>
+                  <span className="dshdg-mono">{model.id}</span>
+                  <span className="dshdg-spacer" />
+                  <span className="dshdg-hint">{(model.efforts ?? []).map((effort) => EFFORT_LABELS[effort] ?? effort).join('、') || '未声明思考强度'}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function LegacyProvidersPanel({ store, snapshot }) {
+  const providers = snapshot.draft?.providers ?? [];
+  const duplicates = duplicateProviderIds(snapshot.draft);
+  const [nextId, setNextId] = useState('');
+
+  return (
+    <div className="dshdg-panel">
+      {duplicates.length > 0 ? (
+        <p className="dshdg-fail">{`提供方标识重复：${duplicates.join('、')}`}</p>
+      ) : null}
+      {providers.length === 0 ? (
+        <p className="dshdg-muted">还没有接口配置。至少添加一个 OpenAI 兼容提供方，才能选择模型。</p>
+      ) : providers.map((provider, index) => (
+        <ProviderEditor
+          key={`${provider.id}-${String(index)}`}
+          provider={provider}
+          store={store}
+          snapshot={snapshot}
+          index={index}
+        />
+      ))}
+      <div className="dshdg-row">
+        <input
+          type="text"
+          aria-label="新提供方标识"
+          placeholder="新提供方标识，例如 deepseek-relay"
+          value={nextId}
+          onChange={(event) => setNextId(event.target.value)}
+        />
+        <button
+          type="button"
+          className="dshdg-primary"
+          disabled={providers.length >= LIMITS.providers}
+          onClick={() => {
+            const id = nextId.trim().toLowerCase();
+            if (id === '') return;
+            store.editDraft((draft) => {
+              draft.providers.push({
+                id,
+                name: id,
+                protocol: SUPPORTED_PROTOCOLS[0],
+                baseUrl: '',
+                credentialRef: null,
+                models: [],
+              });
+            });
+            setNextId('');
+          }}
+        >
+          添加提供方
+        </button>
+        <span className="dshdg-hint">{`最多 ${LIMITS.providers} 个`}</span>
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Execution settings
+// ---------------------------------------------------------------------------
+
+/**
+ * Read-only view of the configuration a job would actually use.
+ * @param {object} props - `label`, `effective`, `note`.
+ * @returns {object} a description list.
+ */
+function EffectiveSummary({ label, effective, note }) {
+  const worker = effective?.worker ?? {};
+  const review = effective?.review ?? {};
+  return (
+    <div className="dshdg-card">
+      <h4>{label}</h4>
+      <dl className="dshdg-kv">
+        <dt>执行提供方</dt>
+        <dd className="dshdg-mono">{worker.providerId ?? worker.providerRoute ?? '（未配置）'}</dd>
+        <dt>执行模型</dt>
+        <dd className="dshdg-mono">{worker.model ?? '（未配置）'}</dd>
+        <dt>执行推理强度</dt>
+        <dd className="dshdg-mono">{worker.reasoningEffort ?? '（不指定）'}</dd>
+        <dt>超时</dt>
+        <dd>{worker.timeoutSeconds === undefined ? '—' : `${worker.timeoutSeconds} 秒`}</dd>
+        <dt>最大并发</dt>
+        <dd>{worker.maxParallelism ?? '—'}</dd>
+        <dt>工作区隔离</dt>
+        <dd>{ISOLATION_LABELS[worker.isolation] ?? worker.isolation ?? '—'}</dd>
+        <dt>附加审查</dt>
+        <dd>
+          {review.enabled === true
+            ? `开启 · ${review.providerId ?? '（未配置）'} / ${review.model ?? '（未配置）'} / ${review.reasoningEffort ?? '不指定'}`
+            : '关闭'}
+        </dd>
+      </dl>
+      {note === undefined ? null : <p className="dshdg-hint">{note}</p>}
+    </div>
+  );
+}
+
+/**
+ * Presets, non-secret export and project overrides.
+ * @param {object} props - `store`, `snapshot`.
+ * @returns {object} the sharing card.
+ */
+function PresetsCard({ store, snapshot }) {
+  const draft = snapshot.draft;
+  const presets = draft?.presets ?? [];
+  const overrides = draft?.projectOverrides ?? {};
+  const [presetName, setPresetName] = useState('');
+  const [presetId, setPresetId] = useState('');
+  const [importText, setImportText] = useState('');
+  const [importError, setImportError] = useState('');
+  const [exportCopied, setExportCopied] = useState('');
+  const [overridePath, setOverridePath] = useState('');
+  const [overrideJson, setOverrideJson] = useState('');
+  const [overrideError, setOverrideError] = useState('');
+  const [editingPath, setEditingPath] = useState('');
+
+  const exportText = useMemo(() => (draft === null ? '' : exportDocument(draft)), [draft]);
+
+  return (
+    <div className="dshdg-card">
+      <h4>预设、导出与项目覆盖</h4>
+      <p className="dshdg-hint">
+        预设只包含执行/审查组合；导出内容全部是非敏感配置，任何密钥都不会出现（密钥只存在宿主的凭据存储里）。
+        正在运行的任务保留它自己的生效快照，之后的修改不会改写历史。
+      </p>
+
+      <div className="dshdg-row">
+        <input
+          type="text"
+          aria-label="预设名称"
+          placeholder="预设标识，例如 fast-local"
+          value={presetId}
+          onChange={(event) => setPresetId(event.target.value.trim().toLowerCase())}
+        />
+        <input
+          type="text"
+          aria-label="预设显示名"
+          placeholder="显示名"
+          value={presetName}
+          onChange={(event) => setPresetName(event.target.value)}
+        />
+        <button
+          type="button"
+          disabled={presetId === ''}
+          onClick={() => {
+            store.editDraft((current) => {
+              const existing = current.presets.find((entry) => entry.id === presetId);
+              const snapshotWorker = clone(current.worker);
+              const snapshotReview = current.review?.enabled === true ? clone(current.review) : null;
+              if (existing === undefined) {
+                current.presets.push({
+                  id: presetId,
+                  name: presetName === '' ? presetId : presetName,
+                  worker: snapshotWorker,
+                  ...(snapshotReview === null ? {} : { review: snapshotReview }),
+                });
+              } else {
+                existing.name = presetName === '' ? existing.name : presetName;
+                existing.worker = snapshotWorker;
+                existing.review = snapshotReview;
+              }
+            });
+            setPresetId('');
+            setPresetName('');
+          }}
+        >
+          用当前设置保存预设
+        </button>
+      </div>
+
+      {presets.length === 0 ? <p className="dshdg-faint">还没有预设。</p> : (
+        <div className="dshdg-list">
+          {presets.map((preset) => (
+            <div className="dshdg-item" key={preset.id}>
+              <div className="dshdg-item-head">
+                <strong>{preset.name}</strong>
+                <span className="dshdg-mono dshdg-faint">{preset.id}</span>
+                <span className="dshdg-spacer" />
+                <button
+                  type="button"
+                  onClick={() => {
+                    store.editDraft((current) => {
+                      if (preset.worker !== null && preset.worker !== undefined) current.worker = { ...preset.worker };
+                      if (preset.review !== null && preset.review !== undefined) current.review = { ...preset.review };
+                    });
+                  }}
+                >
+                  应用到草稿
+                </button>
+                <button
+                  type="button"
+                  className="dshdg-danger"
+                  onClick={() => {
+                    store.editDraft((current) => {
+                      current.presets = current.presets.filter((entry) => entry.id !== preset.id);
+                    });
+                  }}
+                >
+                  删除
+                </button>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      <Field label="导出（非敏感）" htmlFor="dshdg-export" hint="复制这段文本即可备份或在另一台机器恢复。">
+        <textarea id="dshdg-export" readOnly rows={6} value={exportText} />
+      </Field>
+      <div className="dshdg-row">
+        <button
+          type="button"
+          onClick={async () => {
+            try {
+              await globalThis.navigator?.clipboard?.writeText(exportText);
+              setExportCopied('已复制');
+            } catch {
+              setExportCopied('无法访问剪贴板，请手动复制');
+            }
+          }}
+        >
+          复制导出内容
+        </button>
+        {exportCopied === '' ? null : <span className="dshdg-hint">{exportCopied}</span>}
+        <span className="dshdg-spacer" />
+        <button
+          type="button"
+          onClick={async () => {
+            try {
+              const text = await globalThis.navigator?.clipboard?.readText?.();
+              if (typeof text === 'string') setImportText(text);
+            } catch {
+              setExportCopied('无法访问剪贴板，请手动粘贴');
+            }
+          }}
+        >
+          从剪贴板粘贴
+        </button>
+      </div>
+
+      <Field
+        label="导入（覆盖草稿，保存后才生效）"
+        htmlFor="dshdg-import"
+        hint="只接受本插件导出的非敏感文档；包含密钥的字段会被宿主拒绝。"
+      >
+        <textarea
+          id="dshdg-import"
+          rows={6}
+          value={importText}
+          onChange={(event) => { setImportText(event.target.value); setImportError(''); }}
+        />
+      </Field>
+      <div className="dshdg-row">
+        <button
+          type="button"
+          onClick={() => {
+            try {
+              const parsed = JSON.parse(importText);
+              const next = draftFromSettings(parsed);
+              store.editDraft((current) => {
+                current.providers = next.providers;
+                current.worker = next.worker;
+                current.review = next.review;
+                current.authorization = next.authorization;
+                current.projectOverrides = next.projectOverrides;
+                current.presets = next.presets;
+              });
+              setImportError('');
+            } catch (error) {
+              setImportError(`无法解析：${String(error?.message ?? error).slice(0, 160)}`);
+            }
+          }}
+          disabled={importText.trim() === ''}
+        >
+          解析并应用到草稿
+        </button>
+        {importError === '' ? null : <span className="dshdg-fail">{importError}</span>}
+      </div>
+
+      <h4>项目覆盖</h4>
+      <p className="dshdg-hint">为某个绝对路径单独指定执行/审查覆盖；任务生效值会显示实际用了哪一层。</p>
+      {Object.keys(overrides).length === 0 ? <p className="dshdg-faint">还没有项目覆盖。</p> : (
+        <div className="dshdg-list">
+          {Object.entries(overrides).map(([path, block]) => (
+            <div className="dshdg-item" key={path}>
+              <div className="dshdg-item-head">
+                <span className="dshdg-mono">{path}</span>
+                <span className="dshdg-spacer" />
+                <button
+                  type="button"
+                  onClick={() => {
+                    setEditingPath(path);
+                    setOverridePath(path);
+                    setOverrideJson(`${JSON.stringify(block, null, 2)}\n`);
+                    setOverrideError('');
+                  }}
+                >
+                  编辑
+                </button>
+                <button
+                  type="button"
+                  className="dshdg-danger"
+                  onClick={() => {
+                    store.editDraft((current) => {
+                      const copy = { ...current.projectOverrides };
+                      delete copy[path];
+                      current.projectOverrides = copy;
+                    });
+                    if (editingPath === path) setEditingPath('');
+                  }}
+                >
+                  删除
+                </button>
+              </div>
+              <pre className="dshdg-pre">{boundedText(block, 4000)}</pre>
+            </div>
+          ))}
+        </div>
+      )}
+      <Field
+        label={editingPath === '' ? '新增覆盖：绝对路径' : `编辑覆盖：${editingPath}`}
+        htmlFor="dshdg-override-path"
+      >
+        <input
+          id="dshdg-override-path"
+          type="text"
+          value={overridePath}
+          readOnly={editingPath !== ''}
+          placeholder="C:\\work\\project"
+          onChange={(event) => setOverridePath(event.target.value)}
+        />
+      </Field>
+      <Field
+        label={`覆盖内容（JSON，仅允许 worker / review）`}
+        htmlFor="dshdg-override-json"
+        hint={'例如 {"worker":{"model":"deepseek-chat","reasoningEffort":"high"},"review":{"enabled":false}}'}
+      >
+        <textarea
+          id="dshdg-override-json"
+          rows={5}
+          value={overrideJson}
+          onChange={(event) => { setOverrideJson(event.target.value); setOverrideError(''); }}
+        />
+      </Field>
+      <div className="dshdg-row">
+        <button
+          type="button"
+          disabled={overridePath.trim() === ''}
+          onClick={() => {
+            let parsed;
+            try {
+              parsed = overrideJson.trim() === '' ? {} : JSON.parse(overrideJson);
+            } catch (error) {
+              setOverrideError(`无法解析：${String(error?.message ?? error).slice(0, 160)}`);
+              return;
+            }
+            const unknown = Object.keys(parsed).filter((key) => key !== 'worker' && key !== 'review');
+            if (unknown.length > 0) {
+              setOverrideError(`不支持的字段：${unknown.join('、')}`);
+              return;
+            }
+            setOverrideError('');
+            const path = overridePath.trim().replace(/[\\/]+$/, '');
+            store.editDraft((current) => {
+              const copy = { ...current.projectOverrides };
+              if (editingPath !== '' && editingPath !== path) delete copy[editingPath];
+              copy[path] = parsed;
+              current.projectOverrides = copy;
+            });
+            setEditingPath('');
+            setOverrideJson('');
+            setOverridePath('');
+          }}
+        >
+          {editingPath === '' ? '添加覆盖' : '保存覆盖'}
+        </button>
+        {editingPath === '' ? null : (
+          <button type="button" onClick={() => { setEditingPath(''); setOverrideJson(''); setOverridePath(''); setOverrideError(''); }}>
+            取消编辑
+          </button>
+        )}
+        {overrideError === '' ? null : <span className="dshdg-fail">{overrideError}</span>}
+      </div>
+    </div>
+  );
+}
+
+/** @param {object} props @returns {object} the execution settings panel. */
+function ExecutionPanel({ store, snapshot }) {
+  const draft = snapshot.draft;
+  const providers = draft?.providers ?? [];
+  const worker = draft?.worker ?? {};
+  // Global preview only: which project a task will run in is decided at submit
+  // time, so previewing against an arbitrary override key would be a guess.
+  const preview = draft === null ? null : previewEffective(draft, null);
+  const served = snapshot.catalog?.effective ?? null;
+  if (draft === null) return <p className="dshdg-faint">正在读取设置…</p>;
+  return (
+    <div className="dshdg-panel">
+      <SelectionFields
+        providers={providers}
+        idPrefix="dshdg-worker"
+        value={{ providerId: worker.providerId ?? null, model: worker.model ?? null, reasoningEffort: worker.reasoningEffort ?? null }}
+        onChange={(next) => {
+          store.editDraft((current) => {
+            current.worker.providerId = next.providerId;
+            current.worker.model = next.model;
+            current.worker.reasoningEffort = next.reasoningEffort;
+          });
+        }}
+      />
+      <div className="dshdg-grid">
+        <IntegerField
+          id="dshdg-worker-timeout"
+          label="超时（秒）"
+          value={worker.timeoutSeconds}
+          min={LIMITS.timeoutSecondsMin}
+          max={LIMITS.timeoutSecondsMax}
+          hint={`${LIMITS.timeoutSecondsMin}–${LIMITS.timeoutSecondsMax}`}
+          onChange={(value) => {
+            store.editDraft((current) => { current.worker.timeoutSeconds = value; });
+          }}
+        />
+        <IntegerField
+          id="dshdg-worker-parallelism"
+          label="最大并发"
+          value={worker.maxParallelism}
+          min={LIMITS.maxParallelismMin}
+          max={LIMITS.maxParallelismMax}
+          hint={`${LIMITS.maxParallelismMin}–${LIMITS.maxParallelismMax}，超出会被拒绝而不是自动调整`}
+          onChange={(value) => {
+            store.editDraft((current) => { current.worker.maxParallelism = value; });
+          }}
+        />
+        <Field label="工作区隔离" htmlFor="dshdg-worker-isolation" hint="默认独立工作树；共享工作区需要你明确选择。">
+          <select
+            id="dshdg-worker-isolation"
+            value={worker.isolation ?? ISOLATION_MODES[0]}
+            onChange={(event) => {
+              store.editDraft((current) => { current.worker.isolation = event.target.value; });
+            }}
+          >
+            {ISOLATION_MODES.map((mode) => (
+              <option key={mode} value={mode}>{ISOLATION_LABELS[mode]}</option>
+            ))}
+          </select>
+        </Field>
+      </div>
+      <p className="dshdg-hint">
+        不会自动回退到别的模型，也不会隐式使用 Harness 默认模型：选中的组合不可路由时任务直接拒绝。
+      </p>
+      {preview === null ? null : (
+        <EffectiveSummary
+          label="保存后生效（当前草稿预览）"
+          effective={preview}
+          note={preview.applied.length === 0
+            ? '未命中项目覆盖。'
+            : `已应用：${preview.applied.join('；')}`}
+        />
+      )}
+      {served === null ? (
+        <p className="dshdg-faint">宿主尚未回报实际生效值（模型目录不可用或尚未加载）。</p>
+      ) : (
+        <EffectiveSummary
+          label="宿主当前实际生效"
+          effective={served}
+          note="这是任务真正会用的配置快照；模型目录无法解析时会在这里显示拒绝原因。"
+        />
+      )}
+      <PresetsCard store={store} snapshot={snapshot} />
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Additional review
+// ---------------------------------------------------------------------------
+
+/** @param {object} props @returns {object} the review panel. */
+function ReviewPanel({ store, snapshot }) {
+  const draft = snapshot.draft;
+  const providers = draft?.providers ?? [];
+  const review = draft?.review ?? { enabled: false };
+  const enabled = review.enabled === true;
+  const worker = draft?.worker ?? {};
+  const sameRoute = enabled
+    && review.providerId === (worker.providerId ?? null)
+    && review.model === (worker.model ?? null);
+  if (draft === null) return <p className="dshdg-faint">正在读取设置…</p>;
+  return (
+    <div className="dshdg-panel">
+      <div className="dshdg-card">
+        <div className="dshdg-row">
+          <label htmlFor="dshdg-review-enabled">
+            <input
+              id="dshdg-review-enabled"
+              type="checkbox"
+              checked={enabled}
+              onChange={(event) => {
+                store.editDraft((current) => { current.review.enabled = event.target.checked; });
+              }}
+            />
+            {' '}启用附加模型审查（默认关闭）
+          </label>
+          <span className="dshdg-spacer" />
+          <Badge tone={enabled ? 'on' : 'off'}>{enabled ? '已启用' : '关闭'}</Badge>
+        </div>
+        <p className="dshdg-muted">
+          附加审查是独立的只读检查：它读交付的 diff 与证据，给出建议，但<strong>不能</strong>代替宿主验收、不能修改文件、
+          也不会触发自动修复循环。它和本机调用开关相互独立。
+        </p>
+        {sameRoute ? (
+          <p className="dshdg-fail">
+            审查与执行的提供方/模型相同，独立性问题无法保证；建议换一个模型。宿主可能会拒绝这种组合。
+          </p>
+        ) : null}
+      </div>
+      {enabled ? (
+        <SelectionFields
+          providers={providers}
+          idPrefix="dshdg-review"
+          value={{
+            providerId: review.providerId ?? null,
+            model: review.model ?? null,
+            reasoningEffort: review.reasoningEffort ?? null,
+          }}
+          onChange={(next) => {
+            store.editDraft((current) => {
+              current.review.providerId = next.providerId;
+              current.review.model = next.model;
+              if ('reasoningEffort' in next) current.review.reasoningEffort = next.reasoningEffort;
+            });
+          }}
+        />
+      ) : (
+        <p className="dshdg-faint">关闭时不创建审查代理，也不发出任何审查请求。</p>
+      )}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Task records
+// ---------------------------------------------------------------------------
+
+/**
+ * One task's details: effective config, diff, evidence, usage, review outcome.
+ * @param {object} props - `store`, `task`.
+ * @returns {object} the detail card.
+ */
+function TaskDetail({ store, task }) {
+  const outcome = taskOutcome(task);
+  const files = changedFiles(task);
+  // `view()` freezes the configuration that actually ran; a later settings edit
+  // does not retroactively change what a finished task reports.
+  const worker = task.effective?.worker ?? {};
+  const review = task.review ?? null;
+  const reviewState = review === null ? 'not_run' : (review.state ?? 'not_run');
+  const diff = task.diff ?? null;
+  const execution = task.execution ?? null;
+  const error = task.error ?? execution?.error ?? null;
+  return (
+    <div className="dshdg-item">
+      <div className="dshdg-item-head">
+        <strong className="dshdg-mono">{task.taskId}</strong>
+        <Badge tone={task.state === 'awaiting-host-review' ? 'warn' : (task.state === 'failed' ? 'warn' : 'off')}>
+          {taskStateLabel(task.state)}
+        </Badge>
+        <span className="dshdg-spacer" />
+        <button
+          type="button"
+          className="dshdg-danger"
+          disabled={!isCancellable(task.state)}
+          onClick={() => { void store.cancelTask(task.taskId); }}
+        >
+          取消任务
+        </button>
+      </div>
+      <p className="dshdg-muted">{outcome.note}</p>
+
+      <dl className="dshdg-kv">
+        <dt>生效提供方</dt>
+        <dd className="dshdg-mono">{worker.providerId ?? '—'}</dd>
+        <dt>生效模型</dt>
+        <dd className="dshdg-mono">{worker.model ?? '—'}</dd>
+        <dt>推理强度</dt>
+        <dd className="dshdg-mono">{worker.reasoningEffort ?? '（不指定）'}</dd>
+        <dt>工作区</dt>
+        <dd className="dshdg-mono">{task.workspacePath ?? '—'}</dd>
+        <dt>隔离</dt>
+        <dd>{ISOLATION_LABELS[task.isolation ?? worker.isolation] ?? task.isolation ?? worker.isolation ?? '—'}</dd>
+        <dt>创建</dt>
+        <dd>{formatTime(task.createdAt)}</dd>
+        <dt>结束</dt>
+        <dd>{formatTime(task.endedAt)}</dd>
+        <dt>用量</dt>
+        <dd>{execution?.usage === null || execution?.usage === undefined ? '不可用' : boundedText(execution.usage, 600)}</dd>
+        <dt>附加审查</dt>
+        <dd>
+          {REVIEW_STATE_LABELS[reviewState] ?? reviewState}
+          {review?.verdict === null || review?.verdict === undefined
+            ? ''
+            : ` · ${REVIEW_VERDICT_LABELS[review.verdict] ?? review.verdict}`}
+        </dd>
+        <dt>宿主验收</dt>
+        <dd>{task.hostAcceptance === null || task.hostAcceptance === undefined ? '未记录（插件不会自行验收）' : '已由宿主记录'}</dd>
+      </dl>
+
+      <h4>改动文件</h4>
+      {files === null
+        ? <p className="dshdg-faint">宿主未回报可识别的文件摘要，请以下方原始 diff 为准。</p>
+        : <ul className="dshdg-mono">{files.map((file) => <li key={file}>{file}</li>)}</ul>}
+      {diff?.patchWithheld === true
+        ? <p className="dshdg-fail">宿主判定这批改动不宜展示内容（命中敏感路径或超出上限），只给出说明。</p>
+        : null}
+      {diff?.patchTruncated === true ? <p className="dshdg-hint">diff 已截断。</p> : null}
+
+      <h4>diff</h4>
+      <pre className="dshdg-pre">{boundedText(diff?.patchText ?? '（无 diff 内容）')}</pre>
+
+      <h4>验证证据</h4>
+      <pre className="dshdg-pre">{boundedText(execution?.text ?? execution ?? '（无验证证据）')}</pre>
+
+      {error === null ? null : (
+        <>
+          <h4>错误</h4>
+          <pre className="dshdg-pre">{boundedText(error, 4000)}</pre>
+        </>
+      )}
+
+      {review?.text === undefined || review?.text === null || review.text === '' ? null : (
+        <>
+          <h4>审查发现</h4>
+          <pre className="dshdg-pre">{boundedText(review.text, 8000)}</pre>
+        </>
+      )}
+
+      <p className="dshdg-hint">
+        重试前请确认顶部的本机调用开关已开启，然后在 MCP 宿主重新提交任务。本界面不会直接提交任务。
+      </p>
+    </div>
+  );
+}
+
+/** @param {object} props @returns {object} the task records panel. */
+function TasksPanel({ store, snapshot }) {
+  const tasks = snapshot.tasks ?? [];
+  const detail = snapshot.taskDetail;
+  return (
+    <div className="dshdg-panel">
+      <div className="dshdg-row">
+        <p className="dshdg-muted">这里只记录执行事实。执行完成不等于被接受：“等待宿主审查”要由宿主（例如 Codex）单独给出结论。</p>
+        <span className="dshdg-spacer" />
+        <button type="button" disabled={snapshot.loading?.tasks === true} onClick={() => { void store.loadTasks(); }}>
+          {snapshot.loading?.tasks === true ? '读取中…' : '刷新'}
+        </button>
+      </div>
+      {tasks.length === 0 ? <p className="dshdg-faint">还没有任务记录。</p> : (
+        <div className="dshdg-list">
+          {tasks.map((task) => (
+            <div className="dshdg-item" key={task.taskId}>
+              <div className="dshdg-item-head">
+                <span className="dshdg-mono">{task.taskId}</span>
+                <Badge tone={task.state === 'awaiting-host-review' ? 'warn' : (task.state === 'failed' ? 'warn' : 'off')}>
+                  {taskStateLabel(task.state)}
+                </Badge>
+                <span className="dshdg-mono dshdg-faint">
+                  {task.config?.worker?.model ?? '—'}
+                  {' / '}
+                  {task.config?.worker?.reasoningEffort ?? '不指定'}
+                </span>
+                <span className="dshdg-spacer" />
+                <span className="dshdg-faint">{formatTime(task.createdAt)}</span>
+                <button
+                  type="button"
+                  disabled={snapshot.loading?.taskDetail === true}
+                  onClick={() => { void store.openTask(task.taskId); }}
+                >
+                  详情
+                </button>
+                <button
+                  type="button"
+                  className="dshdg-danger"
+                  disabled={!isCancellable(task.state)}
+                  onClick={() => { void store.cancelTask(task.taskId); }}
+                >
+                  取消
+                </button>
+              </div>
+              <p className="dshdg-hint">{taskStateLabel(task.state) === '等待宿主审查' ? taskOutcome(task).note : ''}</p>
+            </div>
+          ))}
+        </div>
+      )}
+      {detail === null ? null : <TaskDetail store={store} task={detail} />}
+      <p className="dshdg-faint">{`状态集合：${TASK_STATES.map(taskStateLabel).join(' / ')}`}</p>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Root page
+// ---------------------------------------------------------------------------
+
+/** Tab definitions: authorization is not a tab — it renders above all four. */
+const TABS = Object.freeze([
+  { key: 'providers', label: '接口管理' },
+  { key: 'execution', label: '执行设置' },
+  { key: 'review', label: '附加审查' },
+  { key: 'tasks', label: '任务记录' },
+]);
+
+/**
+ * The page registered as this bundle's configuration in the Plugins manager.
+ *
+ * Props arrive from the slot registration's `inject` face: `{ store }`, plus the
+ * slot owner props `{ view }` (always `'page'` here) and the optional host
+ * `form`, which this page deliberately ignores — its save control belongs to
+ * the plugin's own user-plane store, not to the host config form.
+ * @param {object} props - `store`, and the slot owner props.
+ * @returns {object} the page.
+ */
+export function DelegateConfigPage(props) {
+  const store = props.store;
+  const snapshot = useSyncExternalStore(
+    useCallback((listener) => store.subscribe(listener), [store]),
+    useCallback(() => store.getSnapshot(), [store]),
+    useCallback(() => store.getSnapshot(), [store]),
+  );
+  const [tab, setTab] = useState(TABS[0].key);
+  const [saving, setSaving] = useState(false);
+  const loaded = useRef(false);
+
+  useEffect(() => {
+    if (loaded.current) return;
+    loaded.current = true;
+    void store.init();
+  }, [store]);
+
+  const problems = useMemo(
+    () => (snapshot.draft === null ? [] : precheckDraft(snapshot.draft)),
+    [snapshot.draft],
+  );
+  const tabRefs = useRef(new Map());
+
+  return (
+    <div className="dshdg-root">
+      <Notices store={store} notices={snapshot.notices ?? []} />
+
+      <AuthorizationPanel store={store} snapshot={snapshot} />
+
+      <div className="dshdg-tabs" role="tablist" aria-label="DSH 委托设置">
+        {TABS.map((entry) => (
+          <button
+            key={entry.key}
+            type="button"
+            role="tab"
+            className="dshdg-tab"
+            id={`dshdg-tab-${entry.key}`}
+            aria-selected={tab === entry.key}
+            aria-controls={`dshdg-panel-${entry.key}`}
+            tabIndex={tab === entry.key ? 0 : -1}
+            ref={(node) => {
+              if (node === null) tabRefs.current.delete(entry.key);
+              else tabRefs.current.set(entry.key, node);
+            }}
+            onClick={() => setTab(entry.key)}
+            onKeyDown={(event) => {
+              if (event.key !== 'ArrowRight' && event.key !== 'ArrowLeft') return;
+              event.preventDefault();
+              const index = TABS.findIndex((candidate) => candidate.key === tab);
+              const step = event.key === 'ArrowRight' ? 1 : -1;
+              const next = TABS[(index + step + TABS.length) % TABS.length];
+              setTab(next.key);
+              tabRefs.current.get(next.key)?.focus?.();
+            }}
+          >
+            {entry.label}
+          </button>
+        ))}
+      </div>
+
+      <div
+        className="dshdg-panel"
+        role="tabpanel"
+        id={`dshdg-panel-${tab}`}
+        aria-labelledby={`dshdg-tab-${tab}`}
+        tabIndex={-1}
+      >
+        {tab === 'providers' ? <ProvidersPanel store={store} snapshot={snapshot} /> : null}
+        {tab === 'execution' ? <ExecutionPanel store={store} snapshot={snapshot} /> : null}
+        {tab === 'review' ? <ReviewPanel store={store} snapshot={snapshot} /> : null}
+        {tab === 'tasks' ? <TasksPanel store={store} snapshot={snapshot} /> : null}
+      </div>
+
+      <div className="dshdg-row">
+        <span className="dshdg-hint">
+          {snapshot.dirty === true ? '有未保存的修改。' : '所有修改已保存。'}
+          {problems.length === 0 ? '' : ` 待修正：${problems[0]}${problems.length > 1 ? ` 等 ${problems.length} 项` : ''}`}
+        </span>
+        <span className="dshdg-spacer" />
+        <button
+          type="button"
+          disabled={snapshot.dirty !== true || snapshot.loading?.save === true}
+          onClick={() => { store.resetDraft(); }}
+        >
+          放弃修改
+        </button>
+        <button
+          type="button"
+          className="dshdg-primary"
+          disabled={snapshot.dirty !== true || snapshot.loading?.save === true || saving}
+          onClick={async () => {
+            setSaving(true);
+            try {
+              await store.saveSettings();
+            } finally {
+              setSaving(false);
+            }
+          }}
+        >
+          {snapshot.loading?.save === true || saving ? '保存中…' : '保存设置'}
+        </button>
+      </div>
+      <p className="dshdg-faint">
+        保存会整体替换设置文档；正在运行的任务保留它自己的快照。密钥从不随设置保存或导出。
+      </p>
+    </div>
+  );
+}
+
+/** Re-exported so the documented contract and tests share one name for the body document. */
+export { documentFromDraft, describeError, exportDocument };

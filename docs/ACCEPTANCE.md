@@ -1,5 +1,9 @@
 # Coordinator acceptance plan
 
+> This checklist was written for the superseded per-connection grant design.
+> Current switch-mode acceptance is covered by `tests/engine.test.js`,
+> `tests/http.test.js` and `tests/mcp.test.js`.
+
 The coordinator will review diffs and rerun meaningful checks independently.
 Worker self-tests and Crew completion are delivery evidence, not acceptance.
 

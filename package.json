@@ -1,45 +1,93 @@
 {
   "name": "dsh-delegate",
-  "version": "0.1.0",
-  "description": "DSH-side delegation service: explicit provider/model routing, user-authorized external connections, native agent execution and independent read-only review.",
+  "version": "0.1.5",
+  "description": "DSH plugin for switch-controlled local MCP delegation using configured providers, explicit model routing and optional read-only review.",
   "license": "MIT",
   "type": "module",
   "engines": {
     "node": ">=24",
-    "dsh": "0.2.0-rc.2"
+    "dsh": "0.2.0-rc.2 || 0.2.1-rc.2"
   },
   "main": "src/index.js",
+  "types": "src/index.d.ts",
   "exports": {
-    ".": "./src/index.js",
+    ".": {
+      "types": "./src/index.d.ts",
+      "default": "./src/index.js"
+    },
+    "./client": {
+      "types": "./lib/client.d.ts",
+      "default": "./lib/client.js"
+    },
+    "./mcp": {
+      "types": "./bin/dsh-delegate-mcp.d.ts",
+      "default": "./bin/dsh-delegate-mcp.js"
+    },
     "./package.json": "./package.json"
+  },
+  "bin": {
+    "dsh-delegate-mcp": "bin/dsh-delegate-mcp.js",
+    "dsh-delegate-codex-agent": "bin/dsh-delegate-codex-agent.js"
   },
   "files": [
     "src/**/*.js",
+    "src/**/*.jsx",
+    "src/**/*.d.ts",
+    "lib/client.js",
+    "lib/client.d.ts",
+    "bin/dsh-delegate-mcp.js",
+    "bin/dsh-delegate-mcp.d.ts",
+    "bin/dsh-delegate-codex-agent.js",
+    "codex/dsh-delegate.toml",
     "cordis.patch.yml",
-    "LICENSE",
     "README.md",
-    "docs/native-integration-audit.md",
-    "docs/contracts-stage-b.md"
+    "LICENSE",
+    "docs/auth-contract.md",
+    "docs/contracts-stage-b.md",
+    "docs/redaction-contract.md",
+    "docs/workspace-contract.md"
   ],
   "dsh": {
     "manifestVersion": 1,
     "bundle": {
       "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-renderer",
+        "@deepseek-ai/dsh-client-ui-plugin-manager"
+      ],
+      "platform": "web"
     }
   },
   "peerDependencies": {
-    "@deepseek-ai/dsh-agent": "0.2.0-rc.2",
-    "@deepseek-ai/dsh-llm": "0.2.0-rc.2",
-    "@deepseek-ai/dsh-llm-pi-ai": "0.2.0-rc.2"
+    "@deepseek-ai/dsh-agent": "0.2.0-rc.2 || 0.2.1-rc.2",
+    "@deepseek-ai/dsh-llm": "0.2.0-rc.2 || 0.2.1-rc.2",
+    "@deepseek-ai/dsh-llm-pi-ai": "0.2.0-rc.2 || 0.2.1-rc.2",
+    "@deepseek-ai/dsh-tool-fs": "0.2.0-rc.2 || 0.2.1-rc.2",
+    "@deepseek-ai/dsh-tool-fs-search": "0.2.0-rc.2 || 0.2.1-rc.2",
+    "@earendil-works/pi-ai": "^0.87.1 || ^1.1.0"
+  },
+  "dependencies": {
+    "@deepseek-ai/schemastery": "~3.18.4"
   },
   "devDependencies": {
     "@deepseek-ai/dsh-agent": "0.2.0-rc.2",
     "@deepseek-ai/dsh-llm": "0.2.0-rc.2",
-    "@deepseek-ai/dsh-llm-pi-ai": "0.2.0-rc.2"
+    "@deepseek-ai/dsh-llm-pi-ai": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-tool-fs": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-tool-fs-search": "0.2.0-rc.2",
+    "@deepseek-ai/schemastery": "~3.18.4",
+    "@earendil-works/pi-ai": "^0.87.1",
+    "esbuild": "0.25.11"
   },
   "scripts": {
-    "test": "node --test-isolation=none --test tests/*.test.js",
+    "test": "node --test --test-concurrency=1 tests/*.test.js",
     "test:isolated": "node --test tests/*.test.js",
+    "build:client": "node scripts/build-client.mjs",
+    "check:client": "node scripts/build-client.mjs --check",
+    "mcp": "node bin/dsh-delegate-mcp.js",
+    "codex-agent": "node bin/dsh-delegate-codex-agent.js",
     "pack:dry": "npm pack --dry-run"
   },
   "keywords": [

@@ -77,7 +77,19 @@ export function createExecutionHandler(deps) {
         return;
       }
 
-      const connection = authenticateRequest(deps, req);
+      let connection;
+      if (deps.engine.authorizationMode === 'switch') {
+        if (key === 'POST /tasks' && deps.engine.posture().authorized !== true) {
+          sendJson(res, 403, {
+            ok: false,
+            error: { code: 'DELEGATION_DISABLED', message: 'delegation is disabled in DSH settings' },
+          });
+          return;
+        }
+        connection = { connectionId: 'local-mcp', label: 'Local MCP' };
+      } else {
+        connection = authenticateRequest(deps, req);
+      }
       if (connection === null) {
         // One refusal for every authentication failure: distinguishing "no token"
         // from "bad token" from "revoked connection" would help an attacker and
@@ -123,7 +135,7 @@ async function status({ res, connection, deps }) {
     connection: { connectionId: connection.connectionId, label: connection.label },
     // The external caller is told which workspaces it may act on, and nothing
     // about models, providers, credentials or other connections.
-    grants: deps.auth.listGrants(connection.connectionId).filter((grant) => {
+    grants: deps.engine.authorizationMode === 'switch' ? [] : deps.auth.listGrants(connection.connectionId).filter((grant) => {
       if (grant.revokedAt !== null) return false;
       return grant.kind === 'session' ? true : grant.consumedAt === null;
     }),
@@ -133,6 +145,16 @@ async function status({ res, connection, deps }) {
 
 async function submitTask({ req, res, connection, deps }) {
   const body = await readJsonBody(req);
+  if (deps.engine.authorizationMode === 'switch') {
+    const task = await deps.engine.start({
+      connectionId: connection.connectionId,
+      workspacePath: body.workspacePath,
+      prompt: body.prompt,
+      overrides: body.overrides,
+    });
+    sendJson(res, 202, { ok: true, task });
+    return;
+  }
   const authorization = body.authorization === 'session' ? 'session' : 'task';
   if (authorization === 'task' && typeof body.grantId !== 'string') {
     throw new HttpError(400, 'GRANT_ID_REQUIRED', 'grantId is required for a single-task submission');
