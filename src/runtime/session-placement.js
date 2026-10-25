@@ -110,9 +110,9 @@ export function sameSessionPath(a, b) {
 /**
  * Narrow a dependency object to the two native controllers.
  *
- * Both are read here, once, so every caller sees the same capability decision and
- * a missing service is one refusal code instead of a property read that happens
- * to throw.
+ * Both are read here, once per placement, so every caller sees the same capability
+ * decision and a missing service is one refusal code instead of a property read
+ * that happens to throw.
  *
  * The two names are not interchangeable and this function is the only place that
  * answers the question, so the mapping is stated once:
@@ -126,20 +126,102 @@ export function sameSessionPath(a, b) {
  * has no `create`/`resolveAgent` at all. Reading it here would either report the
  * session controller as missing on a harness that composes both, or accept a
  * non-planner object and fail later with an opaque error.
+ *
+ * Both values are resolved HERE, at the start of every placement, not when the
+ * dependency object was built. The production wiring therefore hands in a
+ * {@link liveControllerAccessor} instead of a snapshot: a harness that composes a
+ * controller after the plugin activated (or replaces it) is observed on the next
+ * run, which is what makes the two services a runtime capability rather than a
+ * fact frozen at load. A plain object is still accepted unchanged, which is how the
+ * tests and older callers describe the controllers.
  * @param {object} deps - dependency object with optional `workspaces` and `sessionController`.
  * @returns {{ workspaces: object | null, sessions: object | null }} the available controllers.
  */
 function controllersOf(deps) {
-  const workspaces = deps?.workspaces;
-  const sessions = deps?.sessionController;
+  const workspaces = controllerOf(deps?.workspaces);
+  const sessions = controllerOf(deps?.sessionController);
   return {
-    workspaces: workspaces !== null && workspaces !== undefined && typeof workspaces.create === 'function'
-      ? workspaces
-      : null,
-    sessions: sessions !== null && sessions !== undefined && typeof sessions.create === 'function'
-      ? sessions
-      : null,
+    // `create` is the capability `ensureWorkspace`/`createWorkspaceSession` need;
+    // nothing is placed through a service that cannot create.
+    workspaces: typeof workspaces?.create === 'function' ? workspaces : null,
+    sessions: typeof sessions?.create === 'function' ? sessions : null,
   };
+}
+
+/**
+ * The runtime-resolved accessor for one native controller.
+ *
+ * The problem this solves is a load-order one: a DSH harness may compose
+ * `workspaceController` / `sessionController` *after* this plugin activated, or
+ * replace one later in the same process. A dependency object that captured
+ * `ctx.get(name, false)` once during `apply` fixes the answer at load, so every
+ * later run sees `null` and fails closed with `SESSION_*_UNAVAILABLE` on a harness
+ * that actually composes both.
+ *
+ * This accessor is deliberately live on both axes:
+ *
+ *  * `create` is a getter, so a placement performed *now* reads whatever the
+ *    harness exposes *now*;
+ *  * the accessor never caches or freezes the service, so a controller that
+ *    appears, is replaced, or disappears is observed per placement, never once.
+ *
+ * Synchronous by design: {@link controllersOf} resolves both controllers in one
+ * tick, at the start of `placeSession`, and a placement therefore cannot act on a
+ * Workspace from one generation of the service and a Session from another.
+ *
+ * The accessor exposes the whole service's *shape*, not only `create`: a placement
+ * also needs `resolveAgent` (to attach the Agent of the Session it just created),
+ * so narrowing to `create` would report a composed harness as unable to resolve
+ * and refuse every run with `SESSION_RESUME_UNAVAILABLE`.
+ * @param {() => unknown} resolve - reads the current service; may throw or answer null.
+ * @param {object} [options] - `onError(error)`: called with a read refusal, which is
+ *   reported as an absent controller (the placement then returns its stated
+ *   `SESSION_*_UNAVAILABLE` code). A failed read must never crash a run.
+ * @returns {{ readonly current: object | null }} accessor; `null` means absent.
+ */
+export function liveControllerAccessor(resolve, options = {}) {
+  const onError = typeof options?.onError === 'function' ? options.onError : null;
+  return {
+    /**
+     * The service as it is NOW, or null when the harness does not expose it.
+     * @returns {object | null} live service.
+     */
+    get current() {
+      try {
+        const service = resolve();
+        return service === undefined || service === null ? null : service;
+      } catch (error) {
+        // An unreadable service is an absent service for placement purposes: the
+        // caller then refuses with `SESSION_*_UNAVAILABLE` instead of surfacing a
+        // property-access error as an execution failure.
+        onError?.(error);
+        return null;
+      }
+    },
+    get create() {
+      const service = this.current;
+      const method = service?.create;
+      // Bound to the LIVE service, so a caller reading `create` calls through the
+      // service this instant rather than through an object it saw before.
+      return typeof method === 'function' ? method.bind(service) : null;
+    },
+  };
+}
+
+/**
+ * Read one controller off a dependency value, following an accessor when it is one.
+ * @param {unknown} value - a controller, an accessor, or nothing.
+ * @returns {object | null} the service as it is now, or null.
+ */
+function controllerOf(value) {
+  if (value === undefined || value === null) return null;
+  // An accessor is the only dependency value that carries a live `current`
+  // member; the services themselves never do.
+  if (typeof value === 'object' && 'current' in value) {
+    const live = value.current;
+    return live === null || live === undefined ? null : live;
+  }
+  return value;
 }
 
 /**

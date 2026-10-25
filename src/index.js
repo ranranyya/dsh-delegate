@@ -6,7 +6,7 @@
 // persisted local-call switch is restored at startup and defaults to OFF; no
 // task is dispatched until an operator enables it in the DSH plugin settings.
 //
-// Service access is deliberately split in two:
+// Service access is deliberately split in three:
 //
 //   * `inject` lists the services this plugin cannot work without at all. While
 //     any is missing, Cordis does not activate the plugin — which is the correct
@@ -16,6 +16,12 @@
 //     plugin failing to load) and the agent preset registry. A bare property read
 //     would throw `cannot get property "…" without inject`, so the non-strict
 //     accessor is the only safe way to express "optional".
+//   * the two native placement controllers (`workspaceController`,
+//     `sessionController`) are optional TOO, but read through a live accessor and
+//     not through a `ctx.get` call performed during activation: DSH may compose
+//     them after this plugin activated, and the snapshot would then be `null`
+//     forever, refusing every run with `SESSION_*_UNAVAILABLE`. A dispatch that
+//     meets no controller still fails closed; it just cannot be decided at load.
 //
 // The plugin's own face is published with `ctx.provide('dshDelegate', …)` rather
 // than by assigning `ctx.dshDelegate`: an unprovided property assignment throws
@@ -46,7 +52,7 @@ import { probeModel } from './model/probe.js';
 import { createExecutionHandler, EXECUTION_PREFIX } from './http/execution-plane.js';
 import { wrapUserPlaneRoutes } from './http/user-plane.js';
 import { diagnostic } from './runtime/agent-runner.js';
-import { SessionStore } from './runtime/session-placement.js';
+import { SessionStore, liveControllerAccessor } from './runtime/session-placement.js';
 import { publishRuntimeEndpoint, resolveDefaultEndpointDiscoveryPath } from './runtime/endpoint-discovery.js';
 import { resolveCodexActionSeam } from './codex/seam.js';
 import { ReviewPreset } from './review/preset.js';
@@ -165,17 +171,43 @@ export async function apply(ctx, config = {}) {
     },
   };
 
+  /**
+   * Report a native controller whose read was refused, on the plugin's logger.
+   *
+   * The accessors below are non-strict by design (`ctx.get(name, false)`), so a
+   * service the harness does not expose answers `undefined` rather than throwing.
+   * A throw can still happen when the service's own resolution fails; that must
+   * reach the operator's log instead of vanishing into the fail-closed refusal the
+   * run then reports.
+   * @param {string} serviceName - `workspaceController` or `sessionController`.
+   * @param {unknown} error - whatever the accessor threw.
+   * @returns {void}
+   */
+  const warnControllerRead = (serviceName, error) => {
+    logger?.warn?.(`dsh-delegate: the DSH ${serviceName} could not be read (${diagnostic(error?.message ?? error, 200)})`);
+  };
+
   const deps = {
     agents: ctx.agents,
     agentPresets,
     reviewPresets,
     sessions: ctx.sessions,
-    // The native Workspace and Session controllers. Both are read non-strictly:
-    // a harness that does not compose them must load the plugin and then refuse a
-    // dispatch with a stated code (`SESSION_*_UNAVAILABLE`), not fail to activate.
+    // The native Workspace and Session controllers. Both are read non-strictly
+    // and, more importantly, LAZILY: a harness that does not compose them must
+    // load the plugin and then refuse a dispatch with a stated code
+    // (`SESSION_*_UNAVAILABLE`), not fail to activate — and a harness that
+    // composes them AFTER this plugin activated (or replaces one) must still be
+    // able to place the next run. These are therefore live accessors, not the
+    // snapshot `ctx.get` would return here: see {@link liveControllerAccessor}.
     // A run is never created outside a Workspace as a fallback.
-    workspaces: optionalService(ctx, 'workspaceController'),
-    sessionController: optionalService(ctx, 'sessionController'),
+    workspaces: liveControllerAccessor(
+      () => ctx.get('workspaceController', false),
+      { onError: (error) => warnControllerRead('workspaceController', error) },
+    ),
+    sessionController: liveControllerAccessor(
+      () => ctx.get('sessionController', false),
+      { onError: (error) => warnControllerRead('sessionController', error) },
+    ),
     sessionStore,
     llm: ctx.llm,
     tools: ctx.tools,
@@ -321,9 +353,11 @@ export async function apply(ctx, config = {}) {
     presetRegistry: agentPresets === null ? 'unavailable' : 'available',
     // Whether this harness can group a run into a DSH Workspace and create the
     // session inside it. Reported so an operator can tell a configuration problem
-    // from a missing native service before dispatching.
-    workspaceController: deps.workspaces === null ? 'unavailable' : 'available',
-    sessionController: deps.sessionController === null ? 'unavailable' : 'available',
+    // from a missing native service before dispatching. Read at report time, so a
+    // controller composed after activation is reported as available instead of
+    // being described by the load-time snapshot.
+    workspaceController: deps.workspaces?.current === null ? 'unavailable' : 'available',
+    sessionController: deps.sessionController?.current === null ? 'unavailable' : 'available',
     conversationMode: initialSettings.conversation.mode,
     // Whether the review's own composition was ever registered, i.e. whether a
     // read-only review has been attempted in this activation. Lazy by design.
@@ -401,23 +435,6 @@ export async function apply(ctx, config = {}) {
     deps,
     reviewPreset,
   });
-}
-
-/**
- * Read one optional native service without treating its absence as a failure.
- *
- * `ctx.get(name, false)` is the non-strict accessor: a bare property read throws
- * `cannot get property "…" without inject`, which would turn "this harness does
- * not compose the controller" into "the plugin does not load at all". The seam is
- * a function so a service that appears or is replaced after load is observed on
- * the next run instead of being frozen at activation.
- * @param {object} ctx - plugin context.
- * @param {string} name - native service name (`workspaceController`, `sessionController`).
- * @returns {object | null} the service, or null when it is not composed.
- */
-function optionalService(ctx, name) {
-  const service = ctx.get(name, false);
-  return service === undefined || service === null ? null : service;
 }
 
 /** Version reported by the runtime facts block. Mirrors `package.json`. */
