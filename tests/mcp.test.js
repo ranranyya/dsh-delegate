@@ -43,6 +43,8 @@ import {
   cleanup,
   fakeAgents,
   fakeLlm,
+  fakeSessionController,
+  fakeWorkspaceController,
   llmTable,
   makeTempDir,
   validSettings,
@@ -67,14 +69,20 @@ function fixture(options = {}) {
   return { server, seen };
 }
 
-/** The tool-name list, sorted, asserted as an exact closed set. */
-const EXPECTED_TOOLS = ['delegate_cancel', 'delegate_result', 'delegate_status', 'delegate_submit'];
+/**
+ * The tool-name list, sorted, asserted as an exact closed set.
+ *
+ * `delegate_preflight` is included deliberately: it is a read-only workspace read,
+ * not a fifth control-plane verb, so it belongs in the closed set rather than
+ * beside it. Anything else appearing here must be a decision, not a diff.
+ */
+const EXPECTED_TOOLS = ['delegate_cancel', 'delegate_preflight', 'delegate_result', 'delegate_status', 'delegate_submit'];
 
 // ---------------------------------------------------------------------------
 // 1. The exposed surface cannot authorize, configure or touch credentials
 // ---------------------------------------------------------------------------
 
-test('the MCP surface exposes exactly four bounded tools and no control-plane tool', () => {
+test('the MCP surface exposes exactly five bounded tools and no control-plane tool', () => {
   assert.deepEqual(TOOLS.map((tool) => tool.name).sort(), EXPECTED_TOOLS);
   // Named explicitly so the reason is in the failure message, not only in a diff.
   for (const forbidden of ['connection', 'grant', 'settings', 'credential', 'secret', 'authorize']) {
@@ -103,6 +111,9 @@ test('each tool reaches exactly its own execution-plane route', async () => {
       { workspacePath: 'C:\\w', prompt: 'go' }],
     ['delegate_result', { taskId: 't1' }, 'result', { taskId: 't1' }],
     ['delegate_cancel', { taskId: 't1' }, 'cancel', { taskId: 't1' }],
+    ['delegate_preflight', { workspacePath: 'C:\\w' }, 'preflight', { workspacePath: 'C:\\w' }],
+    ['delegate_preflight', { workspacePath: 'C:\\w', allowShared: true }, 'preflight',
+      { workspacePath: 'C:\\w', allowShared: true }],
   ];
   for (const [name, args, route, forwarded] of cases) {
     seen.length = 0;
@@ -110,6 +121,27 @@ test('each tool reaches exactly its own execution-plane route', async () => {
     assert.equal(response.result.isError, undefined, `${name} must not be an error`);
     assert.deepEqual(seen, [{ route, payload: forwarded }], `${name} must reach only ${route}`);
   }
+});
+
+test('delegate_preflight refuses a missing, non-boolean or undeclared argument', async () => {
+  const { server, seen } = fixture();
+  await server.handle({ jsonrpc: '2.0', id: 1, method: 'initialize', params: {} });
+  const cases = [
+    [{}, 'MCP_ARGUMENT_REQUIRED'],
+    [{ workspacePath: '   ' }, 'MCP_ARGUMENT_REQUIRED'],
+    [{ workspacePath: 'C:\\w', allowShared: 'true' }, 'MCP_ARGUMENT_TYPE'],
+    [{ workspacePath: 'C:\\w', isolation: 'worktree' }, 'MCP_ARGUMENT_UNKNOWN'],
+    [{ workspacePath: 'C:\\w', prompt: 'go' }, 'MCP_ARGUMENT_UNKNOWN'],
+  ];
+  for (const [args, code] of cases) {
+    const response = await server.handle({
+      jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'delegate_preflight', arguments: args },
+    });
+    assert.equal(response.result.isError, true, `${JSON.stringify(args)} must be refused`);
+    assert.equal(JSON.parse(response.result.content[0].text).error.code, code);
+  }
+  // A refused call reaches no route at all: the plane is never asked to guess.
+  assert.deepEqual(seen, []);
 });
 
 test('submit does not accept connection or per-task authorization parameters', async () => {
@@ -657,7 +689,7 @@ test('the stdio loop answers one message per line and survives a malformed line'
   assert.equal(lines.length, 3);
   assert.equal(lines[0].result.serverInfo.name, 'dsh-delegate');
   assert.equal(lines[1].error.code, RPC_ERRORS.parse);
-  assert.equal(lines[2].result.tools.length, 4);
+  assert.equal(lines[2].result.tools.length, 5);
 });
 
 /**
@@ -820,6 +852,28 @@ async function executionPlaneFixture(options = {}) {
   // The fakes answer the provider route and one assistant turn in memory. No
   // credential, endpoint or model is reached.
   const agents = options.agents ?? fakeAgents({ respond: { text: 'implemented the change' } });
+  // A placed run drives the Agent the session controller resolves, so the
+  // controller gets the same scripted turn the agent fake would have produced.
+  const workspaces = fakeWorkspaceController();
+  const sessionController = fakeSessionController({
+    workspaces,
+    ...(options.busy === true
+      // A never-idle conversation: only a cancel can end such a run.
+      ? {}
+      : (agents.respondPlan === undefined ? {} : { respond: agents.respondPlan })),
+  });
+  if (options.busy === true) {
+    const resolveOriginal = sessionController.resolveAgent.bind(sessionController);
+    sessionController.resolveAgent = async (sessionId) => {
+      const found = await resolveOriginal(sessionId);
+      const agent = found.agent;
+      if (agent !== undefined) {
+        agent.followup = (message) => { agent.followups.push(message); };
+        agent.whenIdle = async () => { await new Promise(() => {}); };
+      }
+      return found;
+    };
+  }
   const deps = {
     agents,
     agentPresets: {
@@ -831,6 +885,12 @@ async function executionPlaneFixture(options = {}) {
       },
     },
     sessions: { async flush() {} },
+    // Placement, wired the way `src/index.js` wires it: a worker run must be
+    // grouped into a real DSH Workspace keyed by its execution directory. Without
+    // these the engine (correctly) refuses every dispatch with
+    // `JOB_CONVERSATION_UNAVAILABLE`, which is not what these tests measure.
+    workspaces,
+    sessionController,
     llm: fakeLlm({ providers: { 'relay-native': llmTable().relay } }),
     settings,
     auth,
@@ -1174,24 +1234,11 @@ test('the plane refuses an unrouted path, so the route table cannot be slack', a
 
 test('delegate_cancel stops a live task through the real plane and records its origin', async () => {
   // A live cancel is the only case that proves the route, because cancelling an
-  // already-terminal task is a legitimate no-op. The fake agent's turn is held
-  // open by a promise this test controls, so the task is genuinely running when
-  // the tool call arrives and no timing assumption is involved. The hold is
-  // installed through the fake's `script` hook, which runs after `respond`.
-  let releaseTurn;
-  const held = new Promise((resolvePromise) => { releaseTurn = resolvePromise; });
-  const agents = fakeAgents({
-    script: async ({ record }) => {
-      record.agent.followup = (message) => {
-        record.followups.push(message);
-        record.idle = false;
-        // The turn settles only when this test lets it, or when the engine's own
-        // cancel path disposes the agent (which resolves the idle waiters).
-        void held.then(() => { record.agent.cancel('test-release'); });
-      };
-    },
-  });
-  const plane = await executionPlaneFixture({ agents });
+  // already-terminal task is a legitimate no-op. A PLACED run drives a resolved
+  // agent, so the busy turn is modelled on the session controller's side: its
+  // agent absorbs the prompt and never becomes idle, which keeps the task
+  // genuinely running until the tool call arrives.
+  const plane = await executionPlaneFixture({ busy: true });
   const origin = 'http://127.0.0.1:3210';
   try {
     await withPlane(plane, origin, async (client) => {
@@ -1206,7 +1253,6 @@ test('delegate_cancel stops a live task through the real plane and records its o
       assert.equal(cancelled.task.cancelledBy, 'connection', 'the MCP cancellation must retain its origin');
     });
   } finally {
-    releaseTurn();
     await plane.close();
   }
 });

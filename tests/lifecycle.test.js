@@ -25,20 +25,73 @@ import {
   runAgent,
   userMessage,
 } from '../src/runtime/agent-runner.js';
-import { fakeAgentPresets, fakeAgents } from './helpers/fakes.js';
+import { fakeAgentPresets, fakeAgents, fakeSessionController, fakeWorkspaceController } from './helpers/fakes.js';
 
 const CWD = process.platform === 'win32' ? 'C:\\work\\project' : '/work/project';
 const SELECTION = { providerRoute: 'relay', model: 'deepseek-chat', reasoningEffort: 'medium' };
 
 /**
- * Dependency set every run needs: the agent registry plus the preset registry
- * its setup mounts. A test that omits `agentPresets` is asserting the refusal.
+ * Dependency set every run needs: the agent registry, the preset registry its
+ * setup mounts, and the two native controllers that place the run in a DSH
+ * Workspace. A run WITHOUT placement is a separate, explicit mode; the default
+ * every worker run takes is grouped, so the fakes are grouped by default too.
+ * A test that omits `agentPresets` is asserting the refusal.
+ *
+ * The two controller names are the ones the production wiring uses, and they are
+ * deliberately distinct: `workspaces` is `ctx.workspaceController` and
+ * `sessionController` is `ctx.sessionController`. `sessions` is the native
+ * persistence service the runner flushes through, which is why `placement.sessions`
+ * is wired to `sessionController` and NOT to `sessions` — a deps object that put a
+ * session planner under `sessions` would be a wiring bug this helper cannot mask.
  * @param {object} agents - fake agent registry.
  * @param {object} [presets] - fake preset registry.
+ * @param {object} [placement] - `workspaces`, `sessionController`, `sessionStore`, `sessions` (flush).
  * @returns {object} dependency object.
  */
-function depsFor(agents, presets = fakeAgentPresets()) {
-  return { agents, agentPresets: presets };
+function depsFor(agents, presets = fakeAgentPresets(), placement = {}) {
+  const workspaces = placement.workspaces ?? fakeWorkspaceController();
+  // A placed run drives the Agent the controller RESOLVED for its Session (in
+  // both conversation modes), not one this run created, so the controller is
+  // given the same scripted turn the test handed to the agent registry: the
+  // assertions below then read the reply from the conversation the run actually
+  // drove, which is the point of placing it.
+  const sessionController = placement.sessionController
+    ?? fakeSessionController({ workspaces, ...(agents.respondPlan === undefined ? {} : { respond: agents.respondPlan }) });
+  return {
+    agents,
+    agentPresets: presets,
+    workspaces,
+    // `ctx.sessionController`: the only service that can create or resolve a
+    // Session. Not `ctx.sessions`, which cannot.
+    sessionController,
+    ...(placement.sessionStore === undefined ? {} : { sessionStore: placement.sessionStore }),
+    ...(placement.sessions === undefined ? {} : { sessions: placement.sessions }),
+    // Test-only handle on the controller, so an assertion can read the Agent the
+    // run drove without the test holding a second reference to the same fake.
+    // Never read by production code.
+    testControllers: { workspaces, sessionController },
+  };
+}
+
+/**
+ * The Agent a placed run actually drove, found in the session controller that
+ * resolved it.
+ *
+ * A placed run never calls `agents.create`, so `agents.created` is empty by
+ * design; the conversation it drove is the one the controller resolved for its
+ * Session. Reading it from there is what lets a lifecycle assertion follow the
+ * run instead of the old creation path.
+ * @param {object} result - a run result with `conversation`.
+ * @param {object} deps - the dependency object the run was given.
+ * @returns {object} the resolved agent.
+ */
+function drivenAgentOf(result, deps) {
+  const controller = deps?.testControllers?.sessionController;
+  const sessionId = result?.conversation?.sessionId ?? result?.sessionId;
+  assert.ok(controller !== undefined, 'a placed run needs its session controller to read the driven agent');
+  const agent = controller.agents.get(sessionId);
+  assert.ok(agent !== undefined, `no agent was resolved for session ${sessionId}`);
+  return agent;
 }
 
 test('a run passes the exact provider, model and effort to the harness', async () => {
@@ -46,26 +99,30 @@ test('a run passes the exact provider, model and effort to the harness', async (
     respond: { text: 'done: changed 2 files', usage: { inputTokens: 10, outputTokens: 5, totalTokens: 15 } },
   });
 
-  const result = await runAgent(depsFor(agents), {
+  const deps = depsFor(agents);
+  const result = await runAgent(deps, {
     prompt: 'do the thing',
     cwd: CWD,
     selection: SELECTION,
     timeoutMs: 5000,
   });
 
-  assert.equal(agents.created.length, 1);
-  const options = agents.created[0].options;
-  assert.equal(options.provider, 'relay');
-  assert.equal(options.model, 'deepseek-chat');
-  assert.equal(options.reasoningEffort, 'medium');
+  // A placed run drives the Agent the session controller resolved for its
+  // Session, so the selection is asserted where it was actually installed: on
+  // that Agent's own context, reported back as the run's `selection` fact.
+  assert.equal(result.selection.provider, 'relay');
+  assert.equal(result.selection.model, 'deepseek-chat');
+  assert.equal(result.selection.reasoningEffort, 'medium');
+  assert.equal(result.selection.applied, true, 'the selection must reach the agent, not just be reported');
   // A usable output budget, not 1: a reasoning model must not be starved.
-  assert.ok(options.maxTokens >= 1024, `unexpected maxTokens ${options.maxTokens}`);
+  assert.ok(result.maxTokens >= 1024, `unexpected maxTokens ${result.maxTokens}`);
 
   assert.equal(result.outcome, RUN_OUTCOMES.completed);
   assert.equal(result.text, 'done: changed 2 files');
   assert.equal(result.usage.totalTokens, 15);
-  assert.equal(agents.created[0].disposed, true, 'the handle must be disposed');
-  assert.equal(agents.created[0].followups.length, 1, 'exactly one prompt delivery');
+  const driven = drivenAgentOf(result, deps);
+  assert.equal(driven.followups.length, 1, 'exactly one prompt delivery');
+  assert.equal(agents.created.length, 0, 'a placed run must not create a second agent beside its Session');
 });
 
 // --- Request output budget ---------------------------------------------------
@@ -77,26 +134,25 @@ test('a run passes the exact provider, model and effort to the harness', async (
 test('a native worker request gets at least 32768 output tokens by default', async () => {
   const agents = fakeAgents({ respond: { text: 'ok' } });
 
-  await runAgent(depsFor(agents), { prompt: 'go', cwd: CWD, selection: SELECTION, timeoutMs: 5000 });
+  const result = await runAgent(depsFor(agents), { prompt: 'go', cwd: CWD, selection: SELECTION, timeoutMs: 5000 });
 
-  const options = agents.created[0].options;
-  assert.equal(options.maxTokens, DEFAULT_MAX_TOKENS);
+  assert.equal(result.maxTokens, DEFAULT_MAX_TOKENS);
   assert.equal(DEFAULT_MAX_TOKENS, 32768);
-  assert.ok(options.maxTokens >= 32768, `a default worker budget must be at least 32768, got ${options.maxTokens}`);
+  assert.ok(result.maxTokens >= 32768, `a default worker budget must be at least 32768, got ${result.maxTokens}`);
 });
 
 test('an explicit, valid caller budget is preserved unchanged', async () => {
   const agents = fakeAgents({ respond: { text: 'ok' } });
 
   for (const requested of [MAX_TOKENS_BOUNDS.min, 4096, MAX_TOKENS_BOUNDS.max]) {
-    await runAgent(depsFor(agents), {
+    const result = await runAgent(depsFor(agents), {
       prompt: 'go',
       cwd: CWD,
       selection: SELECTION,
       timeoutMs: 5000,
       maxTokens: requested,
     });
-    assert.equal(agents.created.at(-1).options.maxTokens, requested, `budget ${requested} must travel unchanged`);
+    assert.equal(result.maxTokens, requested, `budget ${requested} must travel unchanged`);
   }
 });
 
@@ -129,12 +185,36 @@ test('an invalid budget is refused before an agent exists, never clamped or drop
   assert.equal(agents.created.length, 0, 'no request may be made with an unusable budget');
 });
 
+// --- The unplaced creation contract -----------------------------------------
+//
+// Two paths exist in the runner and they are not interchangeable:
+//
+//  * a PLACED run (the default for every worker task) drives the Agent that
+//    `ctx.sessionController.resolveAgent` returns for a Session already created
+//    in a DSH Workspace. It never calls `agents.create`, never mounts a preset
+//    (the Session's own composition is what the Agent joined), and its identity
+//    is the Session's;
+//  * an UNPLACED run (`allowUnplaced: true`) creates its own Agent through
+//    `agents.create`, which is where the preset mount, the `meta.cwd`, the model
+//    options and the caller-owned session identity are observable.
+//
+// The review is the production caller of the unplaced path (it must not join the
+// operator's Workspace history or be resumable by a later `reuse` run), so the
+// tests below — which all assert on the CREATION call — state that mode
+// explicitly instead of relying on it as an implicit default.
+
 test('the default preset is mounted before the prompt is delivered', async () => {
   const order = [];
   const presets = fakeAgentPresets({ order });
   const agents = fakeAgents({ respond: { text: 'ok' }, order });
 
-  await runAgent(depsFor(agents, presets), { prompt: 'go', cwd: CWD, selection: SELECTION, timeoutMs: 5000 });
+  await runAgent(depsFor(agents, presets), {
+    prompt: 'go',
+    cwd: CWD,
+    selection: SELECTION,
+    timeoutMs: 5000,
+    allowUnplaced: true,
+  });
 
   assert.equal(presets.mounts.length, 1, 'the default native preset must be mounted exactly once');
   // The preset identity is left to the registry: no id means "the default".
@@ -143,10 +223,35 @@ test('the default preset is mounted before the prompt is delivered', async () =>
   assert.equal(presets.mounts[0].ctx, agents.created[0].agentCtx, 'the mount must join this agent scope');
 });
 
+test('a placed run mounts no second composition onto its resolved agent', async () => {
+  // The property that keeps a worker run's tool surface intact: the Agent it
+  // drives already joined a composition when the Session was created, and
+  // mounting another one here would stack two presets on one agent.
+  const presets = fakeAgentPresets();
+  const agents = fakeAgents({ respond: { text: 'ok' } });
+
+  const result = await runAgent(depsFor(agents, presets), {
+    prompt: 'go',
+    cwd: CWD,
+    selection: SELECTION,
+    timeoutMs: 5000,
+  });
+
+  assert.equal(result.outcome, RUN_OUTCOMES.completed);
+  assert.equal(presets.mounts.length, 0, 'a resolved agent must not receive a second preset mount');
+  assert.equal(agents.created.length, 0, 'and no agent may be created beside the Session');
+});
+
 test('a missing preset registry is refused before an agent exists', async () => {
   const agents = fakeAgents({ respond: { text: 'ok' } });
+  const workspaces = fakeWorkspaceController();
   await assert.rejects(
-    () => runAgent({ agents }, { prompt: 'go', cwd: CWD, selection: SELECTION, timeoutMs: 5000 }),
+    () => runAgent({ agents, workspaces, sessionController: fakeSessionController({ workspaces }) }, {
+      prompt: 'go',
+      cwd: CWD,
+      selection: SELECTION,
+      timeoutMs: 5000,
+    }),
     (error) => error instanceof RunError && error.code === RUN_CODES.agentPresetsUnavailable,
   );
   assert.equal(agents.created.length, 0);
@@ -172,11 +277,18 @@ test('a caller-owned preset id is forwarded to the mount, and the default is sti
     timeoutMs: 5000,
     presetId: 'owned-review-preset',
     presetOwnership: ownership,
+    allowUnplaced: true,
   });
   assert.equal(presets.mounts[0].id, 'owned-review-preset', 'the named composition must be the one mounted');
 
   // A run that names nothing still asks for the registry default.
-  await runAgent(depsFor(agents, presets), { prompt: 'go', cwd: CWD, selection: SELECTION, timeoutMs: 5000 });
+  await runAgent(depsFor(agents, presets), {
+    prompt: 'go',
+    cwd: CWD,
+    selection: SELECTION,
+    timeoutMs: 5000,
+    allowUnplaced: true,
+  });
   assert.equal(presets.mounts[1].id, undefined);
 });
 
@@ -197,6 +309,7 @@ test('a preset id the caller does not own is refused before an agent exists', as
         cwd: CWD,
         selection: SELECTION,
         timeoutMs: 5000,
+        allowUnplaced: true,
         ...request,
       }),
       (error) => error instanceof RunError && error.code === RUN_CODES.presetNotOwned,
@@ -209,8 +322,14 @@ test('a preset id the caller does not own is refused before an agent exists', as
 
 test('a preset registry without mount is refused the same way', async () => {
   const agents = fakeAgents({ respond: { text: 'ok' } });
+  const workspaces = fakeWorkspaceController();
   await assert.rejects(
-    () => runAgent({ agents, agentPresets: {} }, { prompt: 'go', cwd: CWD, selection: SELECTION, timeoutMs: 5000 }),
+    () => runAgent({ agents, agentPresets: {}, workspaces, sessionController: fakeSessionController({ workspaces }) }, {
+      prompt: 'go',
+      cwd: CWD,
+      selection: SELECTION,
+      timeoutMs: 5000,
+    }),
     (error) => error instanceof RunError && error.code === RUN_CODES.agentPresetsUnavailable,
   );
   assert.equal(agents.created.length, 0);
@@ -221,7 +340,13 @@ test('a preset mount failure fails the run closed and delivers no prompt', async
   const agents = fakeAgents({ respond: { text: 'should not run' } });
 
   await assert.rejects(
-    () => runAgent(depsFor(agents, presets), { prompt: 'go', cwd: CWD, selection: SELECTION, timeoutMs: 5000 }),
+    () => runAgent(depsFor(agents, presets), {
+      prompt: 'go',
+      cwd: CWD,
+      selection: SELECTION,
+      timeoutMs: 5000,
+      allowUnplaced: true,
+    }),
     (error) => error instanceof RunError && error.code === RUN_CODES.presetMountFailed,
   );
   assert.equal(presets.mounts.length, 1);
@@ -254,8 +379,15 @@ test('the plugin-owned review composition never becomes the registry default', a
   assert.equal(registry.definitions.size, 1, 'exactly the plugin-owned composition exists');
 
   // A worker run still joins the default; only the review names the owned id.
+  // Asserted on the unplaced creation path, which is where a mount happens.
   const agents = fakeAgents({ respond: { text: 'ok' } });
-  await runAgent(depsFor(agents, registry), { prompt: 'go', cwd: CWD, selection: SELECTION, timeoutMs: 5000 });
+  await runAgent(depsFor(agents, registry), {
+    prompt: 'go',
+    cwd: CWD,
+    selection: SELECTION,
+    timeoutMs: 5000,
+    allowUnplaced: true,
+  });
   const workerRun = registry.mounts.at(-1);
   assert.equal(workerRun.requested, undefined, 'a worker run leaves the preset identity to the registry');
   assert.equal(workerRun.mounted, 'standard', 'and therefore still joins the configured default');
@@ -274,29 +406,69 @@ test('the plugin-owned review composition never becomes the registry default', a
 
 test('the workspace cwd reaches the native session metadata', async () => {
   const agents = fakeAgents({ respond: { text: 'ok' } });
-  await runAgent(depsFor(agents), { prompt: 'go', cwd: CWD, selection: SELECTION, timeoutMs: 5000 });
+  await runAgent(depsFor(agents), {
+    prompt: 'go',
+    cwd: CWD,
+    selection: SELECTION,
+    timeoutMs: 5000,
+    allowUnplaced: true,
+  });
   assert.equal(agents.created[0].meta.cwd, CWD);
 });
 
+test('a placed run resolves its Session in the run\'s execution directory', async () => {
+  // The placed counterpart of the assertion above: the cwd is not metadata on a
+  // create call any more, it is the directory the Session was created in, which is
+  // what makes the Workspace group and the `reuse` scope correct.
+  const agents = fakeAgents({ respond: { text: 'ok' } });
+  const deps = depsFor(agents);
+  const result = await runAgent(deps, { prompt: 'go', cwd: CWD, selection: SELECTION, timeoutMs: 5000 });
+
+  const workspace = deps.testControllers.workspaces.workspaces.get(result.conversation.workspaceId);
+  assert.ok(workspace !== undefined, 'the run must be grouped into a real Workspace');
+  assert.equal(workspace.path, CWD, 'the Workspace must be the execution directory');
+  const session = deps.testControllers.sessionController.sessions.get(result.conversation.sessionId);
+  assert.equal(session.cwd, CWD, 'the Session must run in that directory');
+});
+
 test('an omitted effort is sent as absent, never defaulted', async () => {
+  const agents = fakeAgents({ respond: { text: 'ok' } });
+  const result = await runAgent(depsFor(agents), {
+    prompt: 'go',
+    cwd: CWD,
+    selection: { providerRoute: 'relay', model: 'deepseek-chat', reasoningEffort: null },
+    timeoutMs: 5000,
+  });
+  assert.equal(result.selection.reasoningEffort, null, 'an omitted effort must stay absent');
+});
+
+test('an omitted effort is absent in the unplaced create options too', async () => {
   const agents = fakeAgents({ respond: { text: 'ok' } });
   await runAgent(depsFor(agents), {
     prompt: 'go',
     cwd: CWD,
     selection: { providerRoute: 'relay', model: 'deepseek-chat', reasoningEffort: null },
     timeoutMs: 5000,
+    allowUnplaced: true,
   });
   assert.equal('reasoningEffort' in agents.created[0].options, false);
 });
 
 test('cancellation before creation settles still disposes the arriving handle', async () => {
   let releaseCreate;
+  // Resolved once the factory has actually been entered, so the abort below
+  // happens mid-creation rather than before the run started (a run aborted before
+  // it starts never reaches the factory at all — that is a separate case).
+  let creationEntered;
+  const entered = new Promise((resolvePromise) => { creationEntered = resolvePromise; });
   const agents = {
     created: [],
     disposed: [],
     async create(request) {
       // Resolve creation only when the test says so, to model a slow factory.
-      await new Promise((resolvePromise) => { releaseCreate = resolvePromise; });
+      const gate = new Promise((resolvePromise) => { releaseCreate = resolvePromise; });
+      creationEntered();
+      await gate;
       const record = { options: request.agentOptions ?? {}, meta: request.meta, followups: [], cancels: [], disposed: false };
       record.agent = {
         id: 'agent-late',
@@ -318,15 +490,21 @@ test('cancellation before creation settles still disposes the arriving handle', 
   };
 
   const controller = new AbortController();
-  const pending = runAgent(depsFor(agents), {
+  // This test is about the creation/disposal race on the CREATION path, so it
+  // states `allowUnplaced` and a caller-owned identity: a placed run never calls
+  // `agents.create` and therefore has no creation race to model.
+  const pending = runAgent({ agents, agentPresets: fakeAgentPresets() }, {
     prompt: 'long task',
     cwd: CWD,
+    sessionId: 'session-late',
     selection: SELECTION,
     timeoutMs: 60_000,
     signal: controller.signal,
+    allowUnplaced: true,
   });
 
   // Cancel while creation is still in flight.
+  await entered;
   controller.abort();
   releaseCreate();
   const result = await pending;
@@ -357,14 +535,16 @@ test('an already-cancelled signal never creates an agent', async () => {
   assert.equal(presets.mounts.length, 0, 'nor mount a composition for it');
 });
 
-test('cancellation during a pending mount disposes the late handle and never prompts', async () => {
-  let releaseMount;
-  const mountGate = new Promise((resolvePromise) => { releaseMount = resolvePromise; });
-  const presets = fakeAgentPresets({ defer: mountGate });
+test('a run cancelled before it starts creates no Workspace and no Session', async () => {
+  // The orphan this guards against: a cancelled task that still claimed a
+  // Workspace (and created a Session in it) leaves an empty group in DSH that no
+  // run will ever use, and a conversation a later `reuse` run could resume into.
   const agents = fakeAgents({ respond: { text: 'should not run' } });
-
+  const deps = depsFor(agents);
   const controller = new AbortController();
-  const pending = runAgent(depsFor(agents, presets), {
+  controller.abort();
+
+  const result = await runAgent(deps, {
     prompt: 'go',
     cwd: CWD,
     selection: SELECTION,
@@ -372,7 +552,37 @@ test('cancellation during a pending mount disposes the late handle and never pro
     signal: controller.signal,
   });
 
-  // Cancel while setup (the preset mount) is still in flight.
+  assert.equal(result.outcome, RUN_OUTCOMES.cancelled);
+  assert.equal(deps.testControllers.workspaces.creates.length, 0, 'no Workspace may be created for a cancelled run');
+  assert.equal(deps.testControllers.sessionController.creates.length, 0, 'no Session may be created for it either');
+  assert.equal(deps.testControllers.sessionController.resolves.length, 0, 'nor may an Agent be resolved');
+  assert.equal(agents.created.length, 0);
+  assert.equal(result.conversation, null, 'a run that was never placed reports no placement');
+});
+
+test('cancellation during a pending mount disposes the late handle and never prompts', async () => {
+  let releaseMount;
+  const mountGate = new Promise((resolvePromise) => { releaseMount = resolvePromise; });
+  const presets = fakeAgentPresets({ defer: mountGate });
+  const agents = fakeAgents({ respond: { text: 'should not run' } });
+
+  const controller = new AbortController();
+  // The unplaced creation path: this test is about a run cancelled while its
+  // preset mount is still in flight, which only the created-agent path performs.
+  const pending = runAgent({ agents, agentPresets: presets }, {
+    prompt: 'go',
+    cwd: CWD,
+    sessionId: 'session-mount-late',
+    selection: SELECTION,
+    timeoutMs: 60_000,
+    signal: controller.signal,
+    allowUnplaced: true,
+  });
+
+  // The mount is entered asynchronously inside `agents.create`, so wait until it
+  // has actually been entered before aborting: an abort that lands before the
+  // factory is reached is the "already cancelled" case, not this one.
+  while (presets.mounts.length === 0) await new Promise((resolvePromise) => { setImmediate(resolvePromise); });
   controller.abort();
   releaseMount();
   const result = await pending;
@@ -407,10 +617,44 @@ test('a timeout produces a distinct outcome and disposes the agent', async () =>
     cwd: CWD,
     selection: SELECTION,
     timeoutMs: 60,
+    allowUnplaced: true,
   });
 
   assert.equal(result.outcome, RUN_OUTCOMES.timedOut);
   assert.equal(agents.created[0].disposed, true);
+});
+
+test('a placed run times out the same way, and the resolved agent is never disposed', async () => {
+  // Two facts, and the second is the one `reuse` depends on: the timeout ends the
+  // run, and the Agent it was driving belongs to the Session, so the run must not
+  // end the conversation on its way out.
+  const agents = fakeAgents({ respond: { text: 'ok' } });
+  const workspaces = fakeWorkspaceController();
+  // A resolved agent that absorbs its prompt and stays busy: only the runner's own
+  // timer can end this run.
+  const sessionController = fakeSessionController({ workspaces });
+  const resolveOriginal = sessionController.resolveAgent.bind(sessionController);
+  sessionController.resolveAgent = async (id) => {
+    const found = await resolveOriginal(id);
+    if (found.agent !== undefined) {
+      found.agent.followup = (message) => { found.agent.followups.push(message); };
+      found.agent.whenIdle = async () => { await new Promise(() => {}); };
+    }
+    return found;
+  };
+  const deps = depsFor(agents, fakeAgentPresets(), { workspaces, sessionController });
+
+  const result = await runAgent(deps, {
+    prompt: 'slow task',
+    cwd: CWD,
+    selection: SELECTION,
+    timeoutMs: 60,
+  });
+
+  assert.equal(result.outcome, RUN_OUTCOMES.timedOut);
+  const driven = deps.testControllers.sessionController.agents.get(result.conversation.sessionId);
+  assert.ok(driven !== undefined, 'the conversation must still exist after the timeout');
+  assert.equal(driven.cancels.length, 1, 'the timeout must cancel the live agent');
 });
 
 test('an empty run is a failure, not a silent success', async () => {
@@ -562,7 +806,13 @@ const SESSION_ID_SHAPE = /^session-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{
 test('an omitted session id is generated once and used for creation', async () => {
   const agents = fakeAgents({ respond: { text: 'ok' } });
 
-  const result = await runAgent(depsFor(agents), { prompt: 'go', cwd: CWD, selection: SELECTION, timeoutMs: 5000 });
+  const result = await runAgent(depsFor(agents), {
+    prompt: 'go',
+    cwd: CWD,
+    selection: SELECTION,
+    timeoutMs: 5000,
+    allowUnplaced: true,
+  });
 
   assert.equal(agents.created.length, 1);
   const passed = agents.created[0].sessionId;
@@ -574,17 +824,60 @@ test('an omitted session id is generated once and used for creation', async () =
   assert.equal(result.agentId, passed);
 });
 
+test('a placed run takes its identity from the Session, and mints none of its own', async () => {
+  // The placed counterpart: the identity is the DSH Session's, not a generated
+  // one, and no `agents.create` call happens at all.
+  const agents = fakeAgents({ respond: { text: 'ok' } });
+  const deps = depsFor(agents);
+
+  const result = await runAgent(deps, { prompt: 'go', cwd: CWD, selection: SELECTION, timeoutMs: 5000 });
+
+  assert.equal(agents.created.length, 0, 'a placed run must not create an agent');
+  const created = deps.testControllers.sessionController.creates;
+  assert.equal(created.length, 1, 'exactly one Session is created for one run');
+  assert.equal(result.sessionId, result.conversation.sessionId);
+  assert.match(result.sessionId, /^session-\d+$/, 'a placed identity is the Session the controller created');
+});
+
 test('two runs without an id receive two distinct identities', async () => {
   const agents = fakeAgents({ respond: { text: 'ok' } });
 
-  const first = await runAgent(depsFor(agents), { prompt: 'a', cwd: CWD, selection: SELECTION, timeoutMs: 5000 });
-  const second = await runAgent(depsFor(agents), { prompt: 'b', cwd: CWD, selection: SELECTION, timeoutMs: 5000 });
+  const first = await runAgent(depsFor(agents), {
+    prompt: 'a',
+    cwd: CWD,
+    selection: SELECTION,
+    timeoutMs: 5000,
+    allowUnplaced: true,
+  });
+  const second = await runAgent(depsFor(agents), {
+    prompt: 'b',
+    cwd: CWD,
+    selection: SELECTION,
+    timeoutMs: 5000,
+    allowUnplaced: true,
+  });
 
   assert.equal(agents.created.length, 2);
   assert.notEqual(agents.created[0].sessionId, agents.created[1].sessionId, 'a shared id would collide in the registry');
   assert.notEqual(first.sessionId, second.sessionId);
   assert.match(first.sessionId, SESSION_ID_SHAPE);
   assert.match(second.sessionId, SESSION_ID_SHAPE);
+});
+
+test('two placed runs in one directory get two Sessions in one Workspace', async () => {
+  // `new` mode is the default: same directory, same Workspace group, two separate
+  // conversations. That is the behaviour the mode exists to guarantee.
+  const agents = fakeAgents({ respond: { text: 'ok' } });
+  const deps = depsFor(agents);
+
+  const first = await runAgent(deps, { prompt: 'a', cwd: CWD, selection: SELECTION, timeoutMs: 5000 });
+  const second = await runAgent(deps, { prompt: 'b', cwd: CWD, selection: SELECTION, timeoutMs: 5000 });
+
+  assert.notEqual(first.sessionId, second.sessionId, 'new mode must not continue the previous conversation');
+  assert.equal(first.conversation.workspaceId, second.conversation.workspaceId, 'both runs belong to one Workspace group');
+  assert.equal(first.conversation.reused, false);
+  assert.equal(second.conversation.reused, false);
+  assert.equal(deps.testControllers.workspaces.creates.length, 2, 'the Workspace is resolved once per run');
 });
 
 test('a null session id counts as absent and is generated', async () => {
@@ -595,6 +888,7 @@ test('a null session id counts as absent and is generated', async () => {
     cwd: CWD,
     selection: SELECTION,
     timeoutMs: 5000,
+    allowUnplaced: true,
   });
   assert.match(agents.created[0].sessionId, SESSION_ID_SHAPE);
   assert.equal(result.sessionId, agents.created[0].sessionId);

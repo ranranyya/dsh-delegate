@@ -62,6 +62,9 @@ const ROUTES = Object.freeze({
   submit: Object.freeze({ method: 'POST', path: '/tasks' }),
   result: Object.freeze({ method: 'POST', path: '/tasks/get' }),
   cancel: Object.freeze({ method: 'POST', path: '/tasks/cancel' }),
+  // Read-only workspace facts. Registered on the execution plane beside `/status`
+  // so it answers with the switch off; it creates nothing to clean up.
+  preflight: Object.freeze({ method: 'POST', path: '/workspace/preflight' }),
 });
 
 /**

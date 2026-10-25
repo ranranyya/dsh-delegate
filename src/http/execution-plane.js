@@ -19,6 +19,7 @@
 import { fenceExternalConnection } from '../auth/fence.js';
 import { AUTH_CODES } from '../auth/grants.js';
 import { classifyError, HttpError, readJsonBody, sendJson } from '../http/respond.js';
+import { preflightWorkspace } from '../workspace/preflight.js';
 
 /** Route prefix owned by this plane. Deliberately not under `/api`. */
 export const EXECUTION_PREFIX = '/dsh-delegate/x';
@@ -38,6 +39,11 @@ export function createExecutionHandler(deps) {
     ['GET /tasks', listTasks],
     ['POST /tasks/get', getTask],
     ['POST /tasks/cancel', cancelTask],
+    // Read-only workspace inspection for a dispatcher: the facts and the isolation
+    // recommendation that used to be discovered only when a job admitted. It is a
+    // separate route — not a field on `/tasks` — because it neither authorizes nor
+    // creates anything, so it must remain answerable when `submit` is refused.
+    ['POST /workspace/preflight', preflight],
   ]);
 
   return async function handleExecution(req, res) {
@@ -200,4 +206,32 @@ async function cancelTask({ req, res, connection, deps }) {
   }
   const task = await deps.engine.cancel(body.taskId, 'connection');
   sendJson(res, 200, { ok: true, task });
+}
+
+/**
+ * Report what a workspace looks like and which isolation it implies.
+ *
+ * Deliberately *not* gated on the switch or on the concurrency cap: this answers a
+ * question about the filesystem, so it must be usable while delegation is off
+ * (that is when a coordinator decides whether dispatch is worthwhile) and while
+ * every slot is busy. It is still behind the same transport fence and the same
+ * connection identity as every other route, and it consumes nothing: no grant, no
+ * slot, no task, no commit, no worktree.
+ *
+ * The `engine` is given the runner the workspace layer already uses
+ * (`deps.runGit`), so the preflight measures with the same seam, the same timeout
+ * and the same failure classification the job itself would.
+ * @param {object} context - `req`, `res`, `deps`.
+ * @returns {Promise<void>} resolves after the answer is sent.
+ */
+async function preflight({ req, res, deps }) {
+  const body = await readJsonBody(req);
+  if (typeof body.workspacePath !== 'string' || body.workspacePath.trim() === '') {
+    throw new HttpError(400, 'WORKSPACE_PATH_REQUIRED', 'workspacePath is required');
+  }
+  const result = await preflightWorkspace({ runGit: deps.runGit }, {
+    workspacePath: body.workspacePath,
+    allowShared: body.allowShared === true,
+  });
+  sendJson(res, 200, result);
 }

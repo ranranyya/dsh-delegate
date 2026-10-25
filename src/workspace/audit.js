@@ -58,6 +58,7 @@ export const AUDIT_CODES = Object.freeze({
   noCommits: 'AUDIT_NO_COMMITS',
   gitFailed: 'AUDIT_GIT_FAILED',
   baselineInvalid: 'AUDIT_BASELINE_INVALID',
+  notRepositoryRoot: 'AUDIT_NOT_A_REPOSITORY_ROOT',
 });
 
 /** Raised when the workspace cannot be audited. */
@@ -194,22 +195,70 @@ function requireResult(result, step) {
 }
 
 /**
+ * Measure the canonical top level of the repository that contains a path.
+ *
+ * This is the one read that answers "which directory is this workspace's
+ * repository?", and it is deliberately separate from {@link probeRepository}:
+ * containment decisions (is this path the repository itself? is a worktree root
+ * anywhere inside that repository?) need the top level even when the named path
+ * is a subdirectory, and they need it before any write.
+ *
+ * `--show-toplevel` is read-only and reports an absolute path with symbolic path
+ * components resolved, which is why the result is compared against real paths.
+ * The value is never returned unless git exited successfully with non-empty
+ * output: "could not tell" must not look like "no repository".
+ * @param {(cwd: string, args: string[]) => Promise<{stdout: string, code: number}>} runGit - runner.
+ * @param {string} workspacePath - resolved workspace path (may be a subdirectory).
+ * @returns {Promise<string | null>} real top-level directory, or null when this
+ *   path is not inside a git work tree.
+ */
+export async function readRepositoryTopLevel(runGit, workspacePath) {
+  const runner = normalizeRunner(runGit);
+  const result = requireResult(
+    await runner(workspacePath, ['rev-parse', '--show-toplevel']),
+    'rev-parse --show-toplevel',
+  );
+  if (result.code !== 0) return null;
+  const topLevel = result.stdout.trim();
+  return topLevel === '' ? null : topLevel;
+}
+
+/**
  * Probe whether a directory is a git work tree with at least one commit.
+ *
+ * `facts.repository` is true for any directory *inside* a work tree, not only
+ * for its root; `facts.workTreeRoot` records whether the named path is itself
+ * the top level. Callers that require a repository root — the preflight and the
+ * worktree manager both do — must read `workTreeRoot` (or compare against
+ * {@link readRepositoryTopLevel}) rather than `repository`.
+ *
+ * The top-level read is skipped when the path is not a work tree, so a
+ * non-repository workspace still costs two invocations and no more.
  * @param {(cwd: string, args: string[]) => Promise<{stdout: string, code: number}>} runGit - runner.
  * @param {string} workspacePath - resolved workspace path.
- * @returns {Promise<{ git: boolean, repository: boolean, hasCommits: boolean, head: string | null }>} facts.
+ * @returns {Promise<{ git: boolean, repository: boolean, workTreeRoot: boolean, topLevel: string | null, hasCommits: boolean, head: string | null }>} facts.
  */
 export async function probeRepository(runGit, workspacePath) {
   const runner = normalizeRunner(runGit);
-  const facts = { git: false, repository: false, hasCommits: false, head: null };
+  const facts = {
+    git: false,
+    repository: false,
+    workTreeRoot: false,
+    topLevel: null,
+    hasCommits: false,
+    head: null,
+  };
   const version = requireResult(await runner(workspacePath, ['--version']), '--version');
   facts.git = version.code === 0;
   if (!facts.git) return facts;
   const inside = requireResult(await runner(workspacePath, ['rev-parse', '--is-inside-work-tree']), 'rev-parse');
   // A work tree that is itself a nested repository inside another checkout still
-  // answers `true`; containment guards live in the worktree manager.
+  // answers `true`, and so does any directory inside a work tree. Containment
+  // guards therefore use the top level, never this flag alone.
   facts.repository = inside.code === 0 && inside.stdout.trim() === 'true';
   if (!facts.repository) return facts;
+  // The canonical top level: what a containment decision must compare against.
+  facts.topLevel = await readRepositoryTopLevel(runner, workspacePath);
   const head = requireResult(await runner(workspacePath, ['rev-parse', '--verify', 'HEAD']), 'rev-parse --verify HEAD');
   if (head.code === 0) {
     const sha = head.stdout.trim();
@@ -218,7 +267,25 @@ export async function probeRepository(runGit, workspacePath) {
       facts.head = sha;
     }
   }
+  // Only a path that resolves to the same directory as the measured top level is
+  // a repository root. An unmeasurable top level is never assumed to be the
+  // workspace: "could not tell" must not read as "this is the root".
+  facts.workTreeRoot = facts.topLevel !== null && samePath(facts.topLevel, workspacePath);
   return facts;
+}
+
+/**
+ * Whether two paths name the same directory, comparing real paths.
+ *
+ * Case-folded on Windows, where the filesystem is case-insensitive; both sides
+ * are expected to be real paths already (`realpath` / `--show-toplevel`).
+ * @param {string} left - absolute path.
+ * @param {string} right - absolute path.
+ * @returns {boolean} true when they are the same path.
+ */
+function samePath(left, right) {
+  const fold = (value) => (process.platform === 'win32' ? value.toLowerCase() : value);
+  return fold(String(left).replace(/[\\/]+$/, '')) === fold(String(right).replace(/[\\/]+$/, ''));
 }
 
 /**

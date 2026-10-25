@@ -35,6 +35,7 @@ import { listNativeProviderCatalog } from '../model/native-catalog.js';
 import { discoverProviderModels } from '../model/discovery.js';
 import { checkProviderConnectivity } from '../model/connectivity.js';
 import { MAX_CREDENTIAL_VALUE_CHARS } from '../credentials/seam.js';
+import { CODEX_ACTIONS, publicCodexStatus, runCodexAction } from '../codex/installer.js';
 import { classifyError, HttpError, jsonResponse, readJsonRequest } from '../http/respond.js';
 
 /**
@@ -518,6 +519,49 @@ export function userPlaneRoutes(deps) {
       },
     },
 
+    // ---- Codex integration -------------------------------------------------
+    // Two routes, both on the authenticated operator plane because both are
+    // operator actions about a *host-side* file (Codex's own config), not about
+    // this plugin's document.
+    //
+    //   GET  /codex  — read-only diagnosis. It never writes, and it is the only
+    //                  way the page learns what is installed.
+    //   POST /codex  — one explicit action: `install`, `repair` or `remove`.
+    //
+    // Nothing here runs on plugin load, and no action enables the delegation
+    // switch: installing a Codex agent is a separate decision from authorizing
+    // local dispatch, and the response reports the switch state without changing it.
+    {
+      path: `${USER_PLANE_PREFIX}/codex`,
+      methods: ['GET', 'POST'],
+      requestBody: BODY_MODE,
+      fetch: async (request) => {
+        const method = String(request.method ?? 'GET').toUpperCase();
+        if (method === 'GET') {
+          const outcome = await runCodexIntegration(deps, 'status');
+          return jsonResponse(200, { ok: true, ...outcome });
+        }
+        if (method !== 'POST') return methodRefusal(request, ['GET', 'POST']);
+        const body = await readJsonRequest(request);
+        const action = typeof body.action === 'string' ? body.action.trim() : '';
+        if (!CODEX_ACTIONS.includes(action) || action === 'status') {
+          throw new HttpError(
+            400,
+            'CODEX_ACTION_INVALID',
+            `action must be one of ${CODEX_ACTIONS.filter((entry) => entry !== 'status').join(', ')}`,
+            { allowed: CODEX_ACTIONS.filter((entry) => entry !== 'status') },
+          );
+        }
+        const outcome = await runCodexIntegration(deps, action);
+        deps.logger?.info?.('dsh-delegate: Codex integration action applied', {
+          action,
+          changed: outcome.changed,
+          refused: outcome.refused.map((entry) => entry.code),
+        });
+        return jsonResponse(200, { ok: true, ...outcome });
+      },
+    },
+
     // ---- layered connectivity ---------------------------------------------
     // One provider per request. The report is the four-layer structure documented
     // in `docs/native-integration-audit.md`; a layer that was not attempted is
@@ -547,6 +591,67 @@ export function userPlaneRoutes(deps) {
       },
     },
   ];
+}
+
+// ---- Codex integration ------------------------------------------------------
+
+/**
+ * Run one Codex integration action and shape the answer for the settings page.
+ *
+ * The three facts an operator needs are kept apart on purpose, because they fail
+ * independently and mean different things:
+ *
+ *   * `agent`  — the custom agent file exists (and is ours);
+ *   * `mcp`    — Codex is configured to launch this package's stdio MCP server;
+ *   * `switch` — the DSH local-call switch, which this route never changes.
+ *
+ * A `status` read is refused for a bad `CODEX_HOME` rather than silently falling
+ * back to the default: reporting on the wrong directory would be worse than
+ * saying that the configured one is unusable.
+ * @param {object} deps - dependency object with an optional `codex` seam.
+ * @param {string} action - `status`, `install`, `repair` or `remove`.
+ * @returns {Promise<object>} outcome with `changed`, `refused`, `codex` and `switch`.
+ * @throws {HttpError} `CODEX_INTEGRATION_UNAVAILABLE` when no seam is wired.
+ */
+async function runCodexIntegration(deps, action) {
+  const seam = deps.codex;
+  if (seam === null || seam === undefined || typeof seam.run !== 'function' || typeof seam.status !== 'function') {
+    throw new HttpError(
+      503,
+      'CODEX_INTEGRATION_UNAVAILABLE',
+      'this host does not expose the Codex integration, so nothing can be installed or reported',
+    );
+  }
+  let outcome;
+  try {
+    outcome = action === 'status' ? await seam.status() : await seam.run(action);
+  } catch (error) {
+    const code = typeof error?.code === 'string' ? error.code : 'CODEX_INTEGRATION_FAILED';
+    // The installer's own refusals carry a bounded details object; a filesystem
+    // error does not, and its message may contain a path but never a secret.
+    throw new HttpError(
+      code === 'CODEX_HOME_INVALID' ? 400 : code === 'CODEX_CONFIG_UNSUPPORTED' ? 409 : 500,
+      code,
+      typeof error?.message === 'string' ? error.message : 'the Codex integration action failed',
+      error?.details !== undefined && error.details !== null ? error.details : {},
+    );
+  }
+  const switchPosture = typeof deps.engine?.posture === 'function' ? deps.engine.posture() : null;
+  return {
+    action,
+    changed: Array.isArray(outcome?.changed) ? outcome.changed : [],
+    refused: Array.isArray(outcome?.refused) ? outcome.refused : [],
+    // `publicCodexStatus` drops the internal `agent.expect` bytes, which exist only
+    // for the installer's own compare-before-write step.
+    codex: redactDeep(publicCodexStatus(outcome?.status ?? {})),
+    // Reported, never written: installing the agent must not authorize dispatch.
+    switch: {
+      authorized: switchPosture?.authorized === true,
+      mode: switchPosture?.mode ?? 'switch',
+      reason: switchPosture?.reason ?? null,
+      changedByThisAction: false,
+    },
+  };
 }
 
 // ---- task-record projection (live engine + durable archive) ----------------

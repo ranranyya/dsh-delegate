@@ -51,6 +51,8 @@ import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore
 
 import {
   CONNECTIVITY_LAYERS,
+  CONVERSATION_LABELS,
+  CONVERSATION_MODES,
   EFFORT_LABELS,
   EFFORT_UNSET,
   GRANT_KIND_LABELS,
@@ -65,8 +67,12 @@ import {
   boundedText,
   changedFiles,
   clone,
+  codexTargetView,
+  conversationModeLabel,
+  conversationOf,
   createApi,
   createStore,
+  describeCodexOutcome,
   describeError,
   documentFromDraft,
   draftFromSettings,
@@ -1104,6 +1110,8 @@ function EffectiveSummary({ label, effective, note }) {
         <dd>{worker.maxParallelism ?? '—'}</dd>
         <dt>工作区隔离</dt>
         <dd>{ISOLATION_LABELS[worker.isolation] ?? worker.isolation ?? '—'}</dd>
+        <dt>对话模式</dt>
+        <dd>{conversationModeLabel(conversationOf(effective ?? {}).mode)}</dd>
         <dt>附加审查</dt>
         <dd>
           {review.enabled === true
@@ -1411,6 +1419,9 @@ function ExecutionPanel({ store, snapshot }) {
   const draft = snapshot.draft;
   const providers = draft?.providers ?? [];
   const worker = draft?.worker ?? {};
+  // The conversation block, resolved through the same helper the save path uses,
+  // so an absent block shows the default and a stored `reuse` shows `reuse`.
+  const conversation = conversationOf(draft ?? {});
   // Global preview only: which project a task will run in is decided at submit
   // time, so previewing against an arbitrary override key would be a guess.
   const preview = draft === null ? null : previewEffective(draft, null);
@@ -1466,10 +1477,35 @@ function ExecutionPanel({ store, snapshot }) {
             ))}
           </select>
         </Field>
+        <Field
+          label="对话模式"
+          htmlFor="dshdg-conversation-mode"
+          hint="默认每个任务在它实际执行目录的 Workspace 里新开一条对话。复用只在同一个执行目录内生效，绝不跨目录。"
+        >
+          <select
+            id="dshdg-conversation-mode"
+            aria-label="对话模式"
+            value={conversation.mode}
+            onChange={(event) => {
+              const next = event.target.value;
+              store.editDraft((current) => { current.conversation = { mode: next }; });
+            }}
+          >
+            {CONVERSATION_MODES.map((mode) => (
+              <option key={mode} value={mode}>{CONVERSATION_LABELS[mode]}</option>
+            ))}
+          </select>
+        </Field>
       </div>
       <p className="dshdg-hint">
         不会自动回退到别的模型，也不会隐式使用 Harness 默认模型：选中的组合不可路由时任务直接拒绝。
       </p>
+      {conversation.mode === 'reuse' ? (
+        <p className="dshdg-hint">
+          复用模式会继续<strong>同一执行目录</strong>最近一条 DSH 对话；换了目录（包括每个独立工作树）就是另一条对话。
+          记录的那条对话如果已不存在或无法恢复，任务会直接拒绝，而不是悄悄新开一条。
+        </p>
+      ) : null}
       {preview === null ? null : (
         <EffectiveSummary
           label="保存后生效（当前草稿预览）"
@@ -1610,6 +1646,13 @@ function TaskDetail({ store, task }) {
         <dd className="dshdg-mono">{task.workspacePath ?? '—'}</dd>
         <dt>隔离</dt>
         <dd>{ISOLATION_LABELS[task.isolation ?? worker.isolation] ?? task.isolation ?? worker.isolation ?? '—'}</dd>
+        <dt>对话</dt>
+        <dd>
+          {conversationModeLabel(conversationOf(task.effective ?? {}).mode)}
+          {execution?.conversation === null || execution?.conversation === undefined
+            ? ''
+            : ` · ${execution.conversation.reused === true ? '已接续' : '新开'} · 工作区 ${execution.conversation.workspaceId ?? '—'}`}
+        </dd>
         <dt>创建</dt>
         <dd>{formatTime(task.createdAt)}</dd>
         <dt>结束</dt>
@@ -1720,6 +1763,125 @@ function TasksPanel({ store, snapshot }) {
 }
 
 // ---------------------------------------------------------------------------
+// Codex integration
+// ---------------------------------------------------------------------------
+
+/**
+ * One target row: a single fact, with its own badge.
+ *
+ * The three targets are separate rows because they are separate facts. The page
+ * must never let an operator read "agent installed" as "delegation authorized".
+ * @param {object} props - `view`, a value from `codexTargetView`.
+ * @returns {object} the row.
+ */
+function CodexTargetRow({ view }) {
+  const paths = Array.isArray(view.paths) ? view.paths : [];
+  return (
+    <div className="dshdg-item">
+      <div className="dshdg-item-head">
+        <strong>{view.label}</strong>
+        <Badge tone={view.tone}>{view.detail}</Badge>
+        <span className="dshdg-spacer" />
+        <span className="dshdg-mono dshdg-faint">{paths[0] ?? ''}</span>
+      </div>
+      {paths.length > 1 ? <p className="dshdg-mono dshdg-faint">{paths.slice(1).join('；')}</p> : null}
+    </div>
+  );
+}
+
+/**
+ * The Codex integration card.
+ *
+ * Only explicit clicks write anything: `install` / `repair` / `remove` are the
+ * plugin's own buttons and nothing else in `init()` or a save calls them. The card
+ * also states, in the panel itself, what Codex has to do afterwards (reload) and
+ * that the plugin does not claim any particular `@`-selection behaviour for a Codex
+ * surface.
+ * @param {object} props - `store`, `snapshot`.
+ * @returns {object} the card.
+ */
+function CodexPanel({ store, snapshot }) {
+  const codex = snapshot.codex ?? null;
+  const error = snapshot.codexError ?? null;
+  const busy = snapshot.loading?.codexAction === true;
+  const refreshing = snapshot.loading?.codexStatus === true;
+  const agentView = codexTargetView(codex, null, 'agent');
+  const mcpView = codexTargetView(codex, null, 'mcp');
+  // The switch is reported from the delegation posture the page already reads. It
+  // is displayed here so "files installed" is never confused with "dispatch allowed";
+  // this card never turns it on.
+  const switchAuthorized = snapshot.status?.delegation?.authorized === true
+    || snapshot.settings?.delegationEnabled === true;
+  const switchView = codexTargetView(codex, { authorized: switchAuthorized }, 'switch');
+  const ready = codex?.ready === true;
+  const notes = Array.isArray(codex?.notes) ? codex.notes : [];
+  const disabled = busy || refreshing || codex === null;
+  return (
+    <section className="dshdg-card" aria-labelledby="dshdg-codex-title">
+      <div className="dshdg-row">
+        <h3 id="dshdg-codex-title">Codex 集成（子智能体 + MCP）</h3>
+        <span className="dshdg-spacer" />
+        <Badge tone={ready ? 'on' : 'off'}>{ready ? '已就绪' : '未就绪'}</Badge>
+      </div>
+      <p className="dshdg-muted">
+        {'点下面的按钮，把 '}
+        <span className="dshdg-mono">agents/dsh-delegate.toml</span>
+        {' 装进 Codex 目录，并在 Codex 的 '}
+        <span className="dshdg-mono">config.toml</span>
+        {' 里登记本插件的 stdio MCP 服务（delegate_status / delegate_submit / delegate_result / delegate_cancel）。'
+          + '只有你点击才会写文件：打开本页或安装插件都不会改动 Codex。'}
+      </p>
+      {error === null ? null : <p className="dshdg-fail">{error}</p>}
+      {codex === null ? (
+        <p className="dshdg-faint">正在读取 Codex 状态…</p>
+      ) : (
+        <>
+          <p className="dshdg-faint">
+            {'Codex 目录：'}
+            <span className="dshdg-mono">{String(codex.codexHome ?? '')}</span>
+            {'（设置环境变量 CODEX_HOME 可改到别处）'}
+          </p>
+          <div className="dshdg-list" data-dshdg-codex-targets="">
+            <CodexTargetRow view={agentView} />
+            <CodexTargetRow view={mcpView} />
+            <CodexTargetRow view={switchView} />
+          </div>
+          {notes.length === 0 ? null : (
+            <ul className="dshdg-hint">
+              {notes.map((note) => <li key={note.code}>{note.text}</li>)}
+            </ul>
+          )}
+          <div className="dshdg-row">
+            <button type="button" disabled={busy || refreshing} onClick={() => { void store.refreshCodexStatus(); }}>
+              {refreshing ? '读取中…' : '刷新状态'}
+            </button>
+            <button type="button" className="dshdg-primary" disabled={disabled} onClick={() => { void store.runCodexAction('install'); }}>
+              {busy ? '处理中…' : '安装 / 更新 Codex 集成'}
+            </button>
+            <button type="button" disabled={disabled} onClick={() => { void store.runCodexAction('repair'); }}>
+              仅修复 MCP 配置
+            </button>
+            <button type="button" className="dshdg-danger" disabled={disabled} onClick={() => { void store.runCodexAction('remove'); }}>
+              移除插件托管项
+            </button>
+          </div>
+          {snapshot.codexOutcome === null || snapshot.codexOutcome === undefined
+            ? null
+            : <p className="dshdg-hint">{describeCodexOutcome(snapshot.codexOutcome)}</p>}
+        </>
+      )}
+      <p className="dshdg-hint">
+        {'安装后需要让 Codex 重新载入：新开会话或重启 Codex，才会读到新的子智能体和 MCP 条目。'
+          + '本插件不宣称当前 Codex 桌面版/CLI 能在输入框用 @dsh-delegate 直接选中该子智能体——这取决于 Codex 版本自身是否提供提及选择；'
+          + '这里只保证子智能体文件与 MCP 工具存在，并由你在 Codex 提供的选择方式中指派它。'
+          + '子智能体只在明确指派时派发任务，并在提交前先检查上面的本机调用开关；本页不会替你打开该开关。'
+          + '同名的自定义 agent 会被保留并报告为冲突；没有本插件托管标记注释的同名 MCP 条目也视为你自己写的，不会被覆盖或删除。'}
+      </p>
+    </section>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Root page
 // ---------------------------------------------------------------------------
 
@@ -1729,6 +1891,7 @@ const TABS = Object.freeze([
   { key: 'execution', label: '执行设置' },
   { key: 'review', label: '附加审查' },
   { key: 'tasks', label: '任务记录' },
+  { key: 'codex', label: 'Codex 集成' },
 ]);
 
 /**
@@ -1812,6 +1975,7 @@ export function DelegateConfigPage(props) {
         {tab === 'execution' ? <ExecutionPanel store={store} snapshot={snapshot} /> : null}
         {tab === 'review' ? <ReviewPanel store={store} snapshot={snapshot} /> : null}
         {tab === 'tasks' ? <TasksPanel store={store} snapshot={snapshot} /> : null}
+        {tab === 'codex' ? <CodexPanel store={store} snapshot={snapshot} /> : null}
       </div>
 
       <div className="dshdg-row">

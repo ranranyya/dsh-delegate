@@ -29,6 +29,31 @@ export const ISOLATION_MODES = Object.freeze(['worktree', 'shared']);
 /** Isolation mode stored when a document does not name one. */
 export const DEFAULT_ISOLATION = 'worktree';
 
+/**
+ * Conversation modes: what a delegated run does with the DSH session it creates.
+ *
+ * `new` is the default and the safe one: every task gets its own DSH session in
+ * the Workspace for its actual execution directory. `reuse` opts into resuming
+ * the most recent recorded session for that same directory, which keeps a
+ * conversation going across tasks. Reuse is scoped by the canonical execution
+ * path and never crosses directories, so two isolated worktrees remain two
+ * conversations even when they were forked from one repository.
+ */
+export const CONVERSATION_MODES = Object.freeze(['new', 'reuse']);
+
+/** Conversation mode stored when a document does not name one. */
+export const DEFAULT_CONVERSATION_MODE = 'new';
+
+/**
+ * Session-identity map file name inside the plugin data directory.
+ *
+ * Holds only `canonical execution path -> DSH session id` plus the native
+ * Workspace id, so a later `reuse` run can ask the harness to resume that
+ * conversation. No transcript, prompt, credential or model output is stored
+ * here: the native session log remains the single owner of conversation content.
+ */
+export const SESSIONS_FILE = 'sessions.json';
+
 /** Hard bounds. Exceeding any of these is a validation error, not a clamp. */
 export const LIMITS = Object.freeze({
   providers: 32,
@@ -94,5 +119,11 @@ export function defaultSettings() {
     // in documents written before presets existed — validation fills it in, so
     // schema version 1 stays readable both ways.
     presets: [],
+    // What a delegated run does with its DSH conversation. `new` is the default
+    // for every stored document, including ones written before this field
+    // existed, so an upgrade never silently resumes somebody's old session.
+    conversation: {
+      mode: DEFAULT_CONVERSATION_MODE,
+    },
   };
 }

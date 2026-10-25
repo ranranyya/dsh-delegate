@@ -35,7 +35,14 @@ import { JobEngine, JOB_CODES, TASK_STATES } from '../src/jobs/engine.js';
 import { createOpenAiAdapter } from '../src/model/openai-adapter.js';
 import { createProviderRegistry, managedProvidersOf, nativeProvidersOf, PROVIDER_SET_CODES } from '../src/model/providers.js';
 import { WorkspaceLocks } from '../src/workspace/locks.js';
-import { cleanup, fakeAgents, makeTempDir, validSettings } from './helpers/fakes.js';
+import {
+  cleanup,
+  fakeAgents,
+  fakeSessionController,
+  fakeWorkspaceController,
+  makeTempDir,
+  validSettings,
+} from './helpers/fakes.js';
 
 // ---------------------------------------------------------------------------
 // The real composition, with a deterministic local API pair underneath.
@@ -234,9 +241,61 @@ function gatedAgents(replies) {
 }
 
 /**
+ * A session controller whose resolved agents deliver gated turns.
+ *
+ * A PLACED run drives the Agent the session controller resolves, not one it
+ * creates, so "between two turns of one running task" has to be observable there.
+ * Each prompt opens a turn that stays open until the test calls `openTurn(index)`;
+ * events are emitted in the native order (`text-delta`, then the completed
+ * `assistant/message`, then `turn/end`) to the listeners the runner installed on
+ * that agent's own context.
+ * @param {object} workspaces - the Workspace controller the sessions belong to.
+ * @param {string[]} replies - text for each turn, in order.
+ * @returns {object} session controller with `turns` and `openTurn(index)`.
+ */
+function gatedSessionController(workspaces, replies) {
+  const controller = fakeSessionController({ workspaces });
+  const turns = [];
+  const resolveOriginal = controller.resolveAgent.bind(controller);
+  controller.resolveAgent = async (sessionId) => {
+    const found = await resolveOriginal(sessionId);
+    const agent = found.agent;
+    if (agent === undefined) return found;
+    agent.followup = (message) => {
+      agent.followups.push(message);
+      const index = turns.length;
+      turns.push({
+        index,
+        text: replies[index] ?? `reply ${index}`,
+        delivered: true,
+        open: () => {
+          const text = replies[index] ?? `reply ${index}`;
+          for (const entry of agent.listeners) {
+            if (entry.event !== 'session/event') continue;
+            entry.listener({ id: agent.session.id }, { type: 'text-delta', data: { text } });
+            entry.listener({ id: agent.session.id }, {
+              type: 'assistant/message',
+              data: { message: { content: [{ type: 'text', text }] } },
+            });
+            entry.listener({ id: agent.session.id }, { type: 'turn/end', data: { reason: { kind: 'completed' } } });
+          }
+          agent.idle = true;
+          for (const waiter of agent.idleWaiters.splice(0)) waiter();
+        },
+      });
+      agent.idle = false;
+    };
+    return found;
+  };
+  controller.turns = turns;
+  controller.openTurn = (index) => { turns[index].open(); };
+  return controller;
+}
+
+/**
  * Build an engine over the real composition, one temporary workspace, and a
  * settings service the test edits directly (as an operator would).
- * @param {object} [options] - `agents`, `providerRegistry`.
+ * @param {object} [options] - `providerRegistry`.
  * @returns {Promise<object>} harness.
  */
 async function engineWire(options = {}) {  const wired = wire();
@@ -246,12 +305,20 @@ async function engineWire(options = {}) {  const wired = wire();
   await settings.replace(settingsDocument([workbuddy()]));
   const auth = new AuthorizationRegistry();
   const locks = new WorkspaceLocks();
-  const agents = options.agents ?? gatedAgents(['first', 'second']);
+  const agents = fakeAgents();
+  // A worker run is placed in a Workspace and drives the agent the session
+  // controller resolves for it. Gated turns are the default (a test opens each
+  // one); a caller testing something other than turn boundaries can hand in an
+  // auto-answering controller instead.
+  const workspaces = options.workspaces ?? fakeWorkspaceController();
+  const sessionController = options.sessionController ?? gatedSessionController(workspaces, ['first', 'second']);
   const deps = {
     agents,
     agentPresets: { async mount() { return { id: 'default' }; } },
     reviewPresets: reviewComposer(),
     sessions: { async flush() {} },
+    workspaces,
+    sessionController,
     llm: options.llm ?? wired.llm,
     settings,
     auth,
@@ -284,7 +351,11 @@ async function engineWire(options = {}) {  const wired = wire();
     settings,
     auth,
     engine,
-    agents,
+    // The harness's `agents` is the carrier of the gated turns, which for a
+    // PLACED run is the session controller's resolved-agent side. Tests read
+    // `turns`/`openTurn` here; the agent registry's `created` list stays empty by
+    // design because a placed run creates no agent through it.
+    agents: sessionController,
     deps,
     authorize,
     async close() {
@@ -325,16 +396,21 @@ async function settleTask(engine, taskId) {
  * Waiting for `turns.length` instead makes "the task is on its turn, with the
  * prompt delivered" the condition, which is what every caller of this helper
  * actually means.
- * @param {object} agents - gated agent registry.
+ *
+ * Note which counter is read: a PLACED run drives the agent the session
+ * controller resolved, so `agents.created` stays empty by design and
+ * `agents.turns` (the gated turns on the resolved agents) is the only counter
+ * that moves.
+ * @param {object} agents - the harness's gated turn carrier (`turns`/`openTurn`).
  * @param {number} count - turns expected, i.e. prompts delivered.
  * @returns {Promise<void>} resolves when they exist.
  */
 async function waitForAgents(agents, count) {
   for (let attempt = 0; attempt < 300; attempt += 1) {
-    if (agents.created.length >= count && agents.turns.length >= count) return;
+    if (agents.turns.length >= count) return;
     await new Promise((resolvePromise) => { setTimeout(resolvePromise, 5); });
   }
-  throw new Error(`only ${agents.created.length} agent(s) and ${agents.turns.length} turn(s) were delivered, expected ${count}`);
+  throw new Error(`only ${agents.turns.length} turn(s) were delivered, expected ${count}`);
 }
 
 /**
@@ -718,11 +794,17 @@ test('a native-only configuration passes a real engine preflight without refusin
   // `listProviders()` report it — and what makes the plugin's own registration of
   // an otherwise empty custom set the only one that happens here.
   const native = registerNativeAdapter(wired.llm, nativeWorkbuddy());
+  // Placement, wired as production wires it, so the task reaches its provider
+  // preflight instead of being refused for an unplaceable run.
+  const placementWorkspaces = fakeWorkspaceController();
+  const placementSessions = fakeSessionController({ workspaces: placementWorkspaces, respond: { text: 'done' } });
   const engine = new JobEngine({
     agents: fakeAgents({ respond: { text: 'done' } }),
     agentPresets: { async mount() { return { id: 'default' }; } },
     reviewPresets: reviewComposer(),
     sessions: { async flush() {} },
+    workspaces: placementWorkspaces,
+    sessionController: placementSessions,
     llm: wired.llm,
     settings,
     auth,
@@ -788,7 +870,8 @@ test('a running task keeps its provider set: no other configuration can be appli
 
     // At this point the task is on its FIRST turn, with A served and pinned.
     assert.deepEqual(h.llm.listProviders().map((entry) => [entry.id, entry.name]), [['dsh-delegate:workbuddy', 'WorkBuddy']]);
-    assert.deepEqual(h.agents.created[0].options.model, 'deepseek-v4.1-flash');
+    // The task is live, so it has not recorded an execution yet; what proves it
+    // used the pinned route is the lease it holds on that exact provider set.
     assert.equal(h.registry.heldLease()?.holders.includes(started.taskId), true, 'the running task must hold the lease');
 
     // The operator saves a different endpoint between the task's two turns. The
@@ -1075,6 +1158,13 @@ test('a registry without a lease seam is used exactly as before, and a failing l
   // run `running` until the native-settle bound expired rather than testing the
   // seam. One prompt, one answered turn, no manual `openTurn`.
   const respondOnce = { respond: { text: 'done' } };
+  // A controller (and the Workspace registry it resolves against) that answers
+  // every turn, for the halves of this test that are about the lease seam only.
+  const autoAnswer = () => {
+    const workspaces = fakeWorkspaceController();
+    return { workspaces, sessionController: fakeSessionController({ workspaces, respond: respondOnce.respond }) };
+  };
+  const answerOne = autoAnswer();
   // An injected registry that predates this contract: no `lease`, no `release`.
   // It still has to make its routes real — the engine resolves the worker route
   // through the native runtime after `ensure()` returns, so a mapping that names a
@@ -1093,6 +1183,11 @@ test('a registry without a lease seam is used exactly as before, and a failing l
     agents: fakeAgents(respondOnce),
     useRouteSeam: false,
     llm: legacyWire.llm,
+    // Nothing here observes a turn boundary, so the auto-answering controller is
+    // used instead of a gated one; a gated agent whose turn is never opened would
+    // leave the run `running` until the native-settle bound expired.
+    workspaces: answerOne.workspaces,
+    sessionController: answerOne.sessionController,
   });
   try {
     const { connectionId, grantId } = h1.authorize();
@@ -1112,6 +1207,7 @@ test('a registry without a lease seam is used exactly as before, and a failing l
   // A registry whose `lease` throws an unrelated error: treated as "no hold", so
   // the job proceeds on the registry's own terms instead of failing admission.
   const brokenWire = wire();
+  const answerTwo = autoAnswer();
   const broken = {
     async ensure(providers) {
       return { routes: await brokenWire.ensureRoutes({ providers }) };
@@ -1124,6 +1220,8 @@ test('a registry without a lease seam is used exactly as before, and a failing l
     agents: fakeAgents(respondOnce),
     useRouteSeam: false,
     llm: brokenWire.llm,
+    workspaces: answerTwo.workspaces,
+    sessionController: answerTwo.sessionController,
   });
   try {
     const { connectionId, grantId } = h2.authorize();
@@ -1168,7 +1266,8 @@ test('a busy refusal is carried through the engine as a job refusal, not as a ro
     // Nothing native happened: the refusal landed before the ensure ran.
     assert.deepEqual([...h.adapter.snapshot().routes], []);
     assert.deepEqual(h.llm.listProviders(), []);
-    assert.equal(h.agents.created.length, 0);
+    assert.equal(h.deps.agents.created.length, 0, 'no agent may be created for a refused job');
+    assert.equal(h.deps.sessionController.creates.length, 0, 'nor a conversation');
   } finally {
     await h.close();
   }

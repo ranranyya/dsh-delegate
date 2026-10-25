@@ -46,7 +46,9 @@ import { probeModel } from './model/probe.js';
 import { createExecutionHandler, EXECUTION_PREFIX } from './http/execution-plane.js';
 import { wrapUserPlaneRoutes } from './http/user-plane.js';
 import { diagnostic } from './runtime/agent-runner.js';
+import { SessionStore } from './runtime/session-placement.js';
 import { publishRuntimeEndpoint, resolveDefaultEndpointDiscoveryPath } from './runtime/endpoint-discovery.js';
+import { resolveCodexActionSeam } from './codex/seam.js';
 import { ReviewPreset } from './review/preset.js';
 
 /** Stable Cordis plugin name; also the settings/document namespace. */
@@ -132,6 +134,10 @@ export async function apply(ctx, config = {}) {
 
   const history = new HistoryStore(dataDir);
   const worktrees = new WorktreeManager({ runGit }, { rootDir: join(dataDir, 'worktrees') });
+  // The session-identity map: canonical execution path -> DSH Workspace/Session
+  // ids, so an opt-in `reuse` run can continue the conversation for the same
+  // directory. Stores identities only, never transcript content.
+  const sessionStore = new SessionStore(dataDir, { logger });
 
   // The independent review composes its own read-only agent preset instead of
   // joining the deployment default (which mounts `dsh-tool-subagent`, a tool a
@@ -164,6 +170,13 @@ export async function apply(ctx, config = {}) {
     agentPresets,
     reviewPresets,
     sessions: ctx.sessions,
+    // The native Workspace and Session controllers. Both are read non-strictly:
+    // a harness that does not compose them must load the plugin and then refuse a
+    // dispatch with a stated code (`SESSION_*_UNAVAILABLE`), not fail to activate.
+    // A run is never created outside a Workspace as a fallback.
+    workspaces: optionalService(ctx, 'workspaceController'),
+    sessionController: optionalService(ctx, 'sessionController'),
+    sessionStore,
     llm: ctx.llm,
     tools: ctx.tools,
     settings,
@@ -177,6 +190,11 @@ export async function apply(ctx, config = {}) {
     logger,
     delegationEnabled: initialSettings.delegationEnabled === true,
     authorizationMode: 'switch',
+    // The Codex integration is an explicit operator action reached from the
+    // settings page. It is constructed here (never run on load) and its version is
+    // this plugin's own, so an upgraded package reports the new agent template as
+    // available instead of silently leaving an older file behind.
+    codex: resolveCodexActionSeam({ version: PLUGIN_VERSION }),
   };
 
   /**
@@ -301,6 +319,12 @@ export async function apply(ctx, config = {}) {
     executionPlaneLocalOnly: ctx.webServer?.host === '127.0.0.1',
     credentialSeam: credentialsService === null ? 'unavailable' : 'available',
     presetRegistry: agentPresets === null ? 'unavailable' : 'available',
+    // Whether this harness can group a run into a DSH Workspace and create the
+    // session inside it. Reported so an operator can tell a configuration problem
+    // from a missing native service before dispatching.
+    workspaceController: deps.workspaces === null ? 'unavailable' : 'available',
+    sessionController: deps.sessionController === null ? 'unavailable' : 'available',
+    conversationMode: initialSettings.conversation.mode,
     // Whether the review's own composition was ever registered, i.e. whether a
     // read-only review has been attempted in this activation. Lazy by design.
     reviewPreset: reviewPreset.createdId ?? 'not-registered',
@@ -352,14 +376,15 @@ export async function apply(ctx, config = {}) {
     // runner that could mount a preset this disposer is about to remove.
     await reviewPreset.dispose();
     // History is flushed before the store is closed so a task that finished during
-    // teardown is still durable.
+    // teardown is still durable. The session map is flushed on the same terms.
     await history.dispose();
+    await sessionStore.dispose();
     providerRegistry.dispose();
     auth.revokeAll();
     locks.releaseAll();
   });
 
-  logger?.info?.(`dsh-delegate: loaded (local MCP switch ${initialSettings.delegationEnabled === true ? 'on' : 'off'})`);
+  logger?.info?.(`dsh-delegate: loaded (local MCP switch ${initialSettings.delegationEnabled === true ? 'on' : 'off'}, conversation ${initialSettings.conversation.mode})`);
 
   // Published as a Cordis service, not assigned: `ctx.provide` is the only legal
   // way to add a property, and its disposer removes the face on unload.
@@ -369,6 +394,7 @@ export async function apply(ctx, config = {}) {
     engine,
     locks,
     history,
+    sessionStore,
     worktrees,
     providerRegistry,
     credentials,
@@ -377,8 +403,25 @@ export async function apply(ctx, config = {}) {
   });
 }
 
+/**
+ * Read one optional native service without treating its absence as a failure.
+ *
+ * `ctx.get(name, false)` is the non-strict accessor: a bare property read throws
+ * `cannot get property "…" without inject`, which would turn "this harness does
+ * not compose the controller" into "the plugin does not load at all". The seam is
+ * a function so a service that appears or is replaced after load is observed on
+ * the next run instead of being frozen at activation.
+ * @param {object} ctx - plugin context.
+ * @param {string} name - native service name (`workspaceController`, `sessionController`).
+ * @returns {object | null} the service, or null when it is not composed.
+ */
+function optionalService(ctx, name) {
+  const service = ctx.get(name, false);
+  return service === undefined || service === null ? null : service;
+}
+
 /** Version reported by the runtime facts block. Mirrors `package.json`. */
-const PLUGIN_VERSION = '0.1.5';
+const PLUGIN_VERSION = '0.1.8';
 
 /**
  * Resolve the plugin's own data directory.

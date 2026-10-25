@@ -364,6 +364,12 @@ export async function reviewWork(deps, input) {
       // only mounted when the composer still owns it.
       presetId: composition.presetId,
       presetOwnership: composer ?? null,
+      // The review is not part of the operator's conversation history: it composes
+      // its own read-only preset and drives a throwaway session under the id above.
+      // Claiming a Workspace (and creating a Session in it) would put a review in
+      // the same group as the work it examined and would make it resumable by a
+      // later `reuse` run.
+      allowUnplaced: true,
       // Runs inside `agents.create` after the preset mount and before the prompt
       // is delivered: the tool policy is in place for every turn this reviewer
       // will ever take, and a policy that cannot be installed fails creation

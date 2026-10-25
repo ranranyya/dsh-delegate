@@ -66,7 +66,8 @@ import { resolveEffectiveConfig } from '../config/settings.js';
 import { AUTH_CODES, AuthError } from '../auth/grants.js';
 import { resolveRoute } from '../model/routing.js';
 import { PROVIDER_SET_CODES, managedProvidersOf } from '../model/providers.js';
-import { RUN_OUTCOMES, RunError, diagnostic, runAgent } from '../runtime/agent-runner.js';
+import { RUN_OUTCOMES, RunError, SessionPlacementRefusal, diagnostic, runAgent } from '../runtime/agent-runner.js';
+import { rememberSession } from '../runtime/session-placement.js';
 import { REVIEW_STATES, reviewWork } from '../review/reviewer.js';
 import { buildReviewPrompt, buildWorkerPrompt } from '../review/prompts.js';
 import { captureBaseline, captureDiff } from '../workspace/audit.js';
@@ -117,6 +118,10 @@ export const JOB_CODES = Object.freeze({
   failed: 'JOB_FAILED',
   nativeNotStopped: 'JOB_NATIVE_NOT_STOPPED',
   historyFailed: 'JOB_HISTORY_FAILED',
+  // Session placement refused: this harness cannot group the run into a DSH
+  // Workspace, or could not create/resume the Workspace's session. A specific
+  // `SESSION_*` code is carried in `details.session`.
+  conversationUnavailable: 'JOB_CONVERSATION_UNAVAILABLE',
 });
 
 /** Default interval of the internal authorization sweep. */
@@ -409,6 +414,14 @@ export class JobEngine {
       slotHeld: false,
       diff: null,
       execution: null,
+      // Session placement facts for this task: which DSH Workspace group it ran
+      // in, whether the conversation was new or continued, and whether the
+      // identity was saved for a later reuse. `conversationError` is recorded
+      // rather than thrown, because failing to save a resume handle must not
+      // change the run's outcome.
+      conversation: null,
+      conversationSaved: null,
+      conversationError: null,
       review: { state: REVIEW_STATES.notRun, verdict: null, text: '', error: null },
       error: null,
       cancelRequested: false,
@@ -1500,6 +1513,10 @@ export class JobEngine {
         selection: workerSelection,
         timeoutMs: task.effective.worker.timeoutSeconds * 1000,
         signal: task.controller.signal,
+        // Whether a run starts a fresh DSH conversation or resumes the last one for
+        // its actual execution directory. Frozen in `task.effective`, so a settings
+        // edit during the run cannot change what this task does.
+        conversationMode: task.effective.conversation.mode,
       });
       task.native.promise = pending;
       let run;
@@ -1518,9 +1535,25 @@ export class JobEngine {
         turnEnd: run.turnEnd,
         agentId: run.agentId,
         sessionId: run.sessionId,
+        // The provider/model/effort the run actually installed on the agent it
+        // drove, plus the output budget it requested. Reported because a placed
+        // run does not create its agent through `agents.create`, so `agentOptions`
+        // is not observable for it — and "which model did this run on" must still
+        // be answerable from the task record.
+        selection: run.selection ?? null,
+        maxTokens: run.maxTokens ?? null,
+        // Where the conversation landed. Reported per run so an operator can tell a
+        // fresh session from a continued one, and which Workspace group it is in.
+        conversation: run.conversation ?? null,
         cancelCause: run.cancelCause,
         error: run.error,
       };
+
+      // Remember the session this run drove, so an opt-in `reuse` run in the SAME
+      // directory can continue it. Only the identity is stored; the transcript
+      // stays in the native session log. A failure here is recorded and never
+      // changes the run's outcome.
+      await this.rememberConversation(task);
 
       // Evidence is captured even for a failed or cancelled run: a partial
       // change still needs to be visible to the host.
@@ -1599,13 +1632,39 @@ export class JobEngine {
       }
       task.state = TASK_STATES.failed;
       task.phase = 'failed';
-      task.error = error instanceof RunError
-        ? { code: error.code, message: error.message, details: redactDeep(error.details ?? null) }
-        : this.errorOf(error);
+      task.error = this.errorOf(error);
       task.endedAt = Date.now();
     } finally {
       await this.finishTask(task);
     }
+  }
+
+  /**
+   * Shape any thrown value into the bounded error record a task reports.
+   *
+   * A session-placement refusal keeps its own `SESSION_*` code as a detail and is
+   * reported as the job-level `JOB_CONVERSATION_UNAVAILABLE`, because the cause an
+   * operator needs is "this harness cannot place the run in a Workspace", not the
+   * name of the missing service. It is never mapped onto a generic execution
+   * failure: the run did not fail, it never started.
+   * @param {unknown} error - thrown value.
+   * @returns {{ code: string, message: string, details?: object }} bounded error.
+   */
+  errorOf(error) {
+    if (error instanceof SessionPlacementRefusal) {
+      return {
+        code: JOB_CODES.conversationUnavailable,
+        message: error.message,
+        details: { session: error.code, ...redactDeep(error.details ?? {}) },
+      };
+    }
+    if (error instanceof RunError) {
+      return { code: error.code, message: error.message, details: redactDeep(error.details ?? null) };
+    }
+    return {
+      code: typeof error?.code === 'string' ? error.code : JOB_CODES.internal,
+      message: diagnostic(error?.message ?? error, 300),
+    };
   }
 
   /**
@@ -1684,6 +1743,41 @@ export class JobEngine {
       task.historySavedAt = null;
     } finally {
       if (timer !== null) clearTimeout(timer);
+    }
+  }
+
+  /**
+   * Persist the minimal session identity a later `reuse` run needs.
+   *
+   * Three deliberate properties, mirroring {@link persistHistory}:
+   *
+   *   * only `{ path, workspaceId, sessionId }` is stored — no prompt, transcript,
+   *     output, usage or credential has a field in the map;
+   *   * a failure is recorded on the task (`conversationError`) instead of thrown,
+   *     because losing the ability to *resume* a conversation is not a reason to
+   *     fail or un-finish the run that just succeeded;
+   *   * a missing store is silent: an engine constructed without one simply never
+   *     reuses, which is the safe default.
+   * @param {object} task - task record with a completed `task.execution`.
+   * @returns {Promise<void>} resolves after the attempt, never rejects.
+   */
+  async rememberConversation(task) {
+    const store = this.deps?.sessionStore ?? null;
+    const placement = task.execution?.conversation ?? null;
+    if (store === null || store === undefined || placement === null) return;
+    try {
+      const saved = await rememberSession(store, {
+        workspaceId: placement.workspaceId,
+        sessionId: placement.sessionId,
+      }, task.executionPath);
+      task.conversationSaved = saved;
+      task.conversationError = null;
+    } catch (error) {
+      task.conversationSaved = false;
+      task.conversationError = {
+        code: typeof error?.code === 'string' ? error.code : 'CONVERSATION_SAVE_FAILED',
+        message: diagnostic(error?.message ?? error, 300),
+      };
     }
   }
 
@@ -1858,6 +1952,10 @@ export class JobEngine {
     const effective = task.effective === null ? null : {
       worker: { ...task.effective.worker },
       review: { ...task.effective.review },
+      // What this task did with its conversation, frozen with the rest of the
+      // snapshot. Nonsecret, and it is what a task detail renders: whether the
+      // run started a new conversation or continued one, for which directory.
+      conversation: { ...task.effective.conversation },
       provenance: task.effective.provenance,
     };
     const view = {
@@ -1903,9 +2001,21 @@ export class JobEngine {
         turnEnd: task.execution.turnEnd,
         agentId: task.execution.agentId,
         sessionId: task.execution.sessionId,
+        // The provider/model/effort actually installed on the agent this run
+        // drove, and the request budget. Observable for BOTH paths: a placed run
+        // drives a resolved Agent, so `agents.create` options cannot be read.
+        selection: task.execution.selection ?? null,
+        maxTokens: task.execution.maxTokens ?? null,
+        conversation: task.execution.conversation ?? null,
         cancelCause: task.execution.cancelCause,
         error: task.execution.error,
       },
+      // Where the run's conversation was placed in DSH. `workspaceId` is the group
+      // an operator sees; `mode` is the setting that was frozen for this task, and
+      // `reused` says whether the run continued an existing conversation.
+      conversation: task.execution?.conversation ?? null,
+      conversationSaved: task.conversationSaved,
+      conversationError: task.conversationError,
       review: task.review,
       error: task.error,
       cancelledBy: task.cancelledBy,

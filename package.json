@@ -1,12 +1,12 @@
 {
   "name": "dsh-delegate",
-  "version": "0.1.5",
+  "version": "0.1.8",
   "description": "DSH plugin for switch-controlled local MCP delegation using configured providers, explicit model routing and optional read-only review.",
   "license": "MIT",
   "type": "module",
   "engines": {
     "node": ">=24",
-    "dsh": "0.2.0-rc.2 || 0.2.1-rc.2"
+    "dsh": "0.2.0-rc.2 || 0.2.1-rc.2 || 0.2.1-rc.3"
   },
   "main": "src/index.js",
   "types": "src/index.d.ts",
@@ -43,6 +43,8 @@
     "README.md",
     "LICENSE",
     "docs/auth-contract.md",
+    "docs/codex-integration.md",
+    "docs/conversation-placement.md",
     "docs/contracts-stage-b.md",
     "docs/redaction-contract.md",
     "docs/workspace-contract.md"
@@ -61,11 +63,11 @@
     }
   },
   "peerDependencies": {
-    "@deepseek-ai/dsh-agent": "0.2.0-rc.2 || 0.2.1-rc.2",
-    "@deepseek-ai/dsh-llm": "0.2.0-rc.2 || 0.2.1-rc.2",
-    "@deepseek-ai/dsh-llm-pi-ai": "0.2.0-rc.2 || 0.2.1-rc.2",
-    "@deepseek-ai/dsh-tool-fs": "0.2.0-rc.2 || 0.2.1-rc.2",
-    "@deepseek-ai/dsh-tool-fs-search": "0.2.0-rc.2 || 0.2.1-rc.2",
+    "@deepseek-ai/dsh-agent": "0.2.0-rc.2 || 0.2.1-rc.2 || 0.2.1-rc.3",
+    "@deepseek-ai/dsh-llm": "0.2.0-rc.2 || 0.2.1-rc.2 || 0.2.1-rc.3",
+    "@deepseek-ai/dsh-llm-pi-ai": "0.2.0-rc.2 || 0.2.1-rc.2 || 0.2.1-rc.3",
+    "@deepseek-ai/dsh-tool-fs": "0.2.0-rc.2 || 0.2.1-rc.2 || 0.2.1-rc.3",
+    "@deepseek-ai/dsh-tool-fs-search": "0.2.0-rc.2 || 0.2.1-rc.2 || 0.2.1-rc.3",
     "@earendil-works/pi-ai": "^0.87.1 || ^1.1.0"
   },
   "dependencies": {

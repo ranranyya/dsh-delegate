@@ -37,13 +37,42 @@ const MANIFEST = JSON.parse(readFileSync(join(ROOT, 'package.json'), 'utf8'));
 
 /**
  * The DSH runtimes that were actually verified. `0.2.0-rc.2` is the development
- * runtime; `0.2.1-rc.2` was accepted in an isolated profile. Nothing else has been
- * exercised, so the advertised range may not be wider than these two versions.
+ * runtime; `0.2.1-rc.2` was accepted in an isolated profile and `0.2.1-rc.3` is
+ * the current host runtime. Nothing else has been exercised.
  */
-const SUPPORTED_DSH_VERSIONS = ['0.2.0-rc.2', '0.2.1-rc.2'];
+const SUPPORTED_DSH_VERSIONS = ['0.2.0-rc.2', '0.2.1-rc.2', '0.2.1-rc.3'];
 
-/** The exact union range that admits precisely {@link SUPPORTED_DSH_VERSIONS}. */
+/**
+ * The exact union range that admits precisely {@link SUPPORTED_DSH_VERSIONS}.
+ */
 const SUPPORTED_DSH_RANGE = SUPPORTED_DSH_VERSIONS.join(' || ');
+
+/**
+ * The package version this build must declare everywhere a human writes it.
+ *
+ * Pinned rather than derived: `MANIFEST.version` is one of the places checked below,
+ * so asserting it against itself would pass for any value. `0.1.8` adds DSH
+ * Workspace placement and conversation reuse on top of the Codex MCP executable fix.
+ */
+const DELIVERABLE_VERSION = '0.1.8';
+
+// Published prior builds are retained only where the migration/ownership contract
+// names them. Other operator-facing and shipped code must not carry stale versions.
+const HISTORICAL_VERSION_PATHS = new Set(['src/codex/installer.js', 'docs/codex-integration.md']);
+
+/** A semver value: `MAJOR.MINOR.PATCH` with an optional prerelease suffix. */
+const SEMVER = /^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)(?:-[0-9A-Za-z.-]+)?$/u;
+
+/**
+ * Parse a semver string into comparable parts.
+ * @param {string} version - semver text.
+ * @returns {{ major: number, minor: number, patch: number }} numeric identity.
+ */
+function semverParts(version) {
+  const [core] = version.split('-');
+  const [major, minor, patch] = core.split('.').map(Number);
+  return { major, minor, patch };
+}
 
 /** Split a semver range into its `||`-separated union members. */
 function rangeMembers(range) {
@@ -306,11 +335,43 @@ test('the stdio MCP executable is declared as a bin and points at a real script'
   assert.ok(PACKED.includes('codex/dsh-delegate.toml'), 'the custom-agent template must be published');
   const codexAgent = readFileSync(join(ROOT, 'codex/dsh-delegate.toml'), 'utf8');
   assert.match(codexAgent, /^name = "dsh-delegate"$/mu);
-  assert.match(codexAgent, /without the optional overrides field/u);
-  assert.match(codexAgent, /including any matching project override/u);
-  assert.match(codexAgent, /actual provider\/model\/effort from the result/u);
+  // The managed copy is stamped with the package version, so an upgrade can tell an
+  // older file of ours (safe to refresh) from an operator's edit (never touched).
+  assert.match(codexAgent, new RegExp(`^version = "${MANIFEST.version.replace(/\./gu, '\\.')}"$`, 'mu'));
+  // Dispatch rules: explicit selection only, switch checked first, isolation-only
+  // override for shared runs, one task polled, evidence returned to Codex.
+  assert.match(codexAgent, /is NOT a dispatch request/u);
+  assert.match(codexAgent, /delegate_status/u);
+  assert.match(codexAgent, /For a `shared` decision, pass only\s+`overrides = \{ isolation = "shared" \}`/u);
+  assert.match(codexAgent, /Never\s+override the configured provider, model, reasoning effort or timeout/u);
+  assert.match(codexAgent, /configured isolation and matching project\s+override apply/u);
+  assert.match(codexAgent, /configured isolation and matching project\s+override apply/u);
+  assert.match(codexAgent, /actual provider\/model\/effort from the\s+result/u);
+  assert.match(codexAgent, /Codex remains responsible/u);
+  // The pre-dispatch workspace check, and the rule that keeps it from becoming an
+  // automatic downgrade. Both are part of the shipped file, so they are asserted
+  // against the archive's own copy rather than the repository checkout.
+  assert.match(codexAgent, /delegate_preflight/u);
+  assert.match(codexAgent, /Do NOT downgrade to\s+shared isolation silently/u);
+  assert.match(codexAgent, /`allowShared: true`/u);
   assert.doesNotMatch(codexAgent, /workbuddy|deepseek-v4\.1-flash/u, 'the companion must follow DSH plugin routing');
   assert.doesNotMatch(codexAgent, /^\[mcp_servers\./mu, 'the companion inherits MCP tools from the parent session');
+
+  // The preflight module is imported by the execution plane, which the MCP
+  // executable reaches, so it has to be in the archive for the tool to exist.
+  for (const path of ['src/workspace/preflight.js', 'src/workspace/audit.js', 'src/workspace/locks.js']) {
+    assert.ok(PACKED.includes(path), `the preflight module must be published: ${path}`);
+  }
+
+  // The Codex integration ships as source plus the template: the settings page
+  // imports `src/codex/installer.js` at runtime, so it must be inside the archive.
+  for (const path of ['src/codex/installer.js', 'src/codex/toml.js', 'src/codex/seam.js']) {
+    assert.ok(PACKED.includes(path), `the Codex integration module must be published: ${path}`);
+    assert.ok(
+      readFileSync(join(ROOT, path), 'utf8').length > 0,
+      `${path} must not be empty`,
+    );
+  }
 
   const source = readFileSync(join(ROOT, binPath), 'utf8');
   assert.match(source, /^#!\/usr\/bin\/env node/u, 'a bin needs a shebang');
@@ -464,6 +525,93 @@ test('scripts expose the build check, the MCP entry and the test command', () =>
   assert.equal(MANIFEST.scripts['codex-agent'], 'node bin/dsh-delegate-codex-agent.js');
 });
 
+test('the release metadata is one version everywhere it is written by hand', () => {
+  // The version appears in several places that no tool keeps in sync for us. A release
+  // that disagrees with itself produces an artifact whose reported version is wrong,
+  // so the duplication is asserted rather than trusted.
+  const runtimeFacts = readFileSync(join(ROOT, 'src', 'index.js'), 'utf8');
+  const mcpServer = readFileSync(join(ROOT, 'src', 'mcp', 'server.js'), 'utf8');
+  const discovery = readFileSync(join(ROOT, 'src', 'runtime', 'endpoint-discovery.js'), 'utf8');
+  const readme = readFileSync(join(ROOT, 'README.md'), 'utf8');
+  const escape = (text) => text.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&');
+
+  assert.match(runtimeFacts, new RegExp(`const PLUGIN_VERSION = '${escape(MANIFEST.version)}';`, 'u'));
+  assert.match(mcpServer, new RegExp(`version: '${escape(MANIFEST.version)}'`, 'u'));
+  assert.match(discovery, new RegExp(`dsh-delegate ${escape(MANIFEST.version)}`, 'u'));
+  assert.match(readme, new RegExp(`dsh-delegate-${escape(MANIFEST.version)}\\.tgz`, 'u'));
+  // Every *release* literal in the package is this version. The 0.2.x references are
+  // DSH runtime versions quoted in comments, not this package's own version.
+  for (const path of ['src/index.js', 'src/mcp/server.js', 'src/runtime/endpoint-discovery.js']) {
+    const text = readFileSync(join(ROOT, path), 'utf8');
+    const literals = (text.match(/\b0\.1\.\d+\b/gu) ?? []);
+    for (const literal of literals) {
+      assert.equal(literal, MANIFEST.version, `${path} still mentions ${literal}`);
+    }
+  }
+});
+
+test('the release is 0.1.8, one semver step above the shipped 0.1.7 baseline', () => {
+  // Pinned, not derived: Workspace placement is a new release, and a manifest that
+  // still advertises 0.1.7 would let an operator install the previous build as if it
+  // were the same one. `package.json`, the lockfile (both fields), the agent template
+  // and the two documents an operator reads must agree.
+  assert.match(MANIFEST.version, SEMVER);
+  assert.equal(MANIFEST.version, DELIVERABLE_VERSION, 'package.json must declare the released version');
+
+  const previous = semverParts('0.1.7');
+  const current = semverParts(MANIFEST.version);
+  assert.equal(current.major, previous.major, 'a defect fix is a patch release: the major version may not move');
+  assert.equal(current.minor, previous.minor, 'a defect fix is a patch release: the minor version may not move');
+  assert.equal(current.patch, previous.patch + 1, 'the release must be exactly one patch above 0.1.6');
+
+  const lock = JSON.parse(readFileSync(join(ROOT, 'package-lock.json'), 'utf8'));
+  assert.equal(lock.version, DELIVERABLE_VERSION, 'package-lock.json#version must match package.json');
+  assert.equal(lock.packages[''].version, DELIVERABLE_VERSION, 'the lockfile root entry must match package.json');
+
+  const template = readFileSync(join(ROOT, 'codex', 'dsh-delegate.toml'), 'utf8');
+  assert.match(template, new RegExp(`^version = "${escape(DELIVERABLE_VERSION)}"$`, 'mu'));
+
+  const readme = readFileSync(join(ROOT, 'README.md'), 'utf8');
+  assert.match(readme, new RegExp(`dsh-delegate-${escape(DELIVERABLE_VERSION)}\\.tgz`, 'u'));
+  const contract = readFileSync(join(ROOT, 'docs', 'codex-integration.md'), 'utf8');
+  assert.match(contract, new RegExp(`implemented in ${escape(DELIVERABLE_VERSION)}`, 'u'), 'the Codex contract names the release it describes');
+  assert.match(contract, new RegExp(`"packageVersion": "${escape(DELIVERABLE_VERSION)}"`, 'u'));
+  assert.match(contract, /bundled runtime/u, 'the contract must document where the executable comes from');
+
+  // No stale release literal may survive in code or in the documents an operator
+  // reads, except for the two explicit historical-contract locations that identify
+  // the previous build whose bytes and migration shape are being handled.
+  for (const path of ['README.md', 'docs/codex-integration.md', ...PACKED.filter((entry) => entry.startsWith('src/') && entry.endsWith('.js'))]) {
+    const text = readFileSync(join(ROOT, path), 'utf8');
+    for (const literal of new Set(text.match(/\b0\.1\.\d+\b/gu) ?? [])) {
+      const historical = ['0.1.6', '0.1.7'].includes(literal) && HISTORICAL_VERSION_PATHS.has(path);
+      assert.ok(literal === DELIVERABLE_VERSION || historical, `${path} still mentions ${literal} as if it were current`);
+    }
+  }
+});
+
+test('the Codex MCP command resolves a Node.js runtime, never the desktop executable', () => {
+  // The defect this release fixes: in the DSH Desktop (Electron) host, `execPath` is
+  // `DeepSeek Harness.exe`. It must never be written as the MCP `command`, and the
+  // resolution must name the bundled runtime instead. The behavioural cases live in
+  // `tests/codex-integration.test.js`; what is pinned here is that the published
+  // module carries the contract and the documents state it.
+  const installer = readFileSync(join(ROOT, 'src', 'codex', 'installer.js'), 'utf8');
+  assert.ok(PACKED.includes('src/codex/installer.js'), 'the module that implements the resolution must be published');
+  for (const marker of ['MCP_NODE_ENV_VARS', 'packagedNodePath', 'hostRuntimeKind', 'MCP_EXECUTABLE_UNRESOLVED']) {
+    assert.ok(installer.includes(marker), `src/codex/installer.js must define ${marker}`);
+  }
+  // The three overrides and the packaged runtime layout are documented for an
+  // operator who has to fix a host that cannot resolve its own Node.
+  const contract = readFileSync(join(ROOT, 'docs', 'codex-integration.md'), 'utf8');
+  for (const name of ['DSH_NODE_PATH', 'DSH_NODE_EXECUTABLE', 'CODEX_MCP_NODE_PATH']) {
+    assert.ok(contract.includes(name), `the Codex contract must document ${name}`);
+  }
+  assert.match(contract, /runtime\/primary-runtime\/dependencies\/node\/bin/u, 'the bundled Node location is documented');
+  const readme = readFileSync(join(ROOT, 'README.md'), 'utf8');
+  assert.match(readme, /DeepSeek Harness\.exe/u, 'the README must state which executable is never used');
+});
+
 // ---------------------------------------------------------------------------
 // 2. The published archive: required entries present, excluded classes absent
 // ---------------------------------------------------------------------------
@@ -505,9 +653,22 @@ test('the archive carries every install-critical file', () => {
 });
 
 test('the archive publishes the operator-facing contracts, not internal notes', () => {
-  for (const path of ['docs/auth-contract.md', 'docs/contracts-stage-b.md', 'docs/redaction-contract.md', 'docs/workspace-contract.md']) {
+  for (const path of [
+    'docs/auth-contract.md',
+    'docs/codex-integration.md',
+    'docs/conversation-placement.md',
+    'docs/contracts-stage-b.md',
+    'docs/redaction-contract.md',
+    'docs/workspace-contract.md',
+  ]) {
     assert.ok(PACKED.includes(path), `missing doc: ${path}`);
   }
+  // The Codex contract describes the two files the installer owns; a packaged
+  // build must ship it so an operator can check what was written.
+  const contract = readFileSync(join(ROOT, 'docs', 'codex-integration.md'), 'utf8');
+  assert.match(contract, /mcp_servers\.dsh-delegate/u);
+  assert.match(contract, /CODEX_HOME/u);
+  assert.match(contract, /never touch|never overwrite|untouched/u);
   // Build/acceptance scaffolding is for maintainers, not consumers.
   for (const excluded of ['AGENTS.md', 'SPEC.md', 'docs/ACCEPTANCE.md', 'scripts/build-client.mjs', 'package-lock.json']) {
     assert.ok(!PACKED.includes(excluded), `internal file must not be published: ${excluded}`);

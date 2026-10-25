@@ -1,14 +1,39 @@
-# Workspace contract: audit evidence and worktree isolation
+# Workspace contract: preflight, audit evidence and worktree isolation
 
 This document is the contract between the workspace layer
-(`src/workspace/audit.js`, `src/workspace/worktrees.js`) and the job engine
-(`src/jobs/engine.js`). It states what the layer guarantees, what it refuses, and
-the exact shapes that cross the boundary, so the engine can be wired to it
-without either side guessing.
+(`src/workspace/preflight.js`, `src/workspace/audit.js`,
+`src/workspace/worktrees.js`) and the job engine (`src/jobs/engine.js`). It states
+what the layer guarantees, what it refuses, and the exact shapes that cross the
+boundary, so the engine can be wired to it without either side guessing.
 
-Both modules are read-only with respect to the repository they inspect, with one
-deliberate exception: `WorktreeManager` creates and removes its own worktrees
-using `git worktree` only.
+All three modules are read-only with respect to the repository they inspect, with
+one deliberate exception: `WorktreeManager` creates and removes its own worktrees
+using `git worktree` only. `preflight.js` (§3.5) is the strictly read-only one: it
+runs five git reads and nothing else.
+
+### Repository root
+
+A **workspace** in this contract is a repository **root** — the directory
+`git rev-parse --show-toplevel` reports — not merely a directory inside one.
+
+Both the preflight and the worktree manager measure that top level with
+`git rev-parse --show-toplevel` before deciding anything, and both refuse a path
+that is inside a repository without being its root:
+
+- `preflightWorkspace` answers `block` / `PREFLIGHT_NOT_A_REPOSITORY_ROOT` and
+  names the measured root. A subdirectory is **not** a workspace: an isolated
+  tree created "for" it would land inside the user's checkout, which is exactly
+  what isolation is supposed to prevent. It is never recommended `worktree` or
+  `shared`.
+- `WorktreeManager.prepare` refuses with `WORKTREE_NESTED_DESTINATION` when its
+  configured `rootDir` lies anywhere inside the **repository root**, even when the
+  supplied `sourcePath` is a subdirectory that does not contain the root. The
+  containment boundary is the measured top level, never the supplied path.
+
+`git rev-parse --is-inside-work-tree` answers `true` for *any* directory inside a
+work tree, so it is a necessary fact but never a sufficient one. An unmeasurable
+top level is a refusal, never an assumed root: "could not tell" must not read as
+"this is the root".
 
 ---
 
@@ -117,7 +142,8 @@ Every git read either succeeds or throws an `AuditError`. The codes:
 | Code | Meaning |
 |---|---|
 | `AUDIT_GIT_UNAVAILABLE` | git cannot be executed here (missing or denied by the sandbox) |
-| `AUDIT_NOT_A_REPOSITORY` | not a git work tree |
+| `AUDIT_NOT_A_REPOSITORY` | not inside a git work tree |
+| `AUDIT_NOT_A_REPOSITORY_ROOT` | inside a work tree but not its top level; used by the preflight, which maps it to `PREFLIGHT_NOT_A_REPOSITORY_ROOT` |
 | `AUDIT_NO_COMMITS` | repository exists but has no commit |
 | `AUDIT_GIT_FAILED` | a git read failed; `details.step` / `details.exitCode` / bounded `details.stderr` |
 | `AUDIT_BASELINE_INVALID` | the baseline has no pinned `head` |
@@ -191,7 +217,120 @@ records whatever it can measure.
 
 ---
 
-## 4. `WorktreeManager`
+## 3.5 `preflightWorkspace(deps, request)` — the pre-admission check
+
+`src/workspace/preflight.js`. This answers the question the engine used to answer
+*by failing*: what is this workspace, and which isolation does it need? It runs
+with no side effects — no commit, stash, branch, worktree, lock, task, grant or
+settings write — and it is not authorization: it creates nothing, so it cannot
+substitute for the switch or a grant.
+
+```js
+const decision = await preflightWorkspace({ runGit }, { workspacePath, allowShared });
+```
+
+`runGit` is the same argv runner the audit layer uses (`createGitRunner()` when
+omitted), so a test can inject a refusal. `workspacePath` must be absolute and is
+resolved with `realpath` exactly as `resolveWorkspacePath` does for the engine, so
+a `worktree` recommendation can never be rejected later for naming an unusable
+path.
+
+Only these five invocations are ever issued, in this order, and the ordered list
+is asserted by `tests/preflight.test.js`:
+
+```
+git --version
+git rev-parse --is-inside-work-tree
+git rev-parse --show-toplevel
+git rev-parse --verify HEAD
+git status --porcelain=v1 -z --untracked-files=all
+```
+
+`rev-parse --show-toplevel` is the root measurement: its output is compared
+against the resolved workspace path (case-folded on Windows) to decide whether
+the named path *is* the repository root or merely sits inside one. The status read
+is not attempted at all for a path that fails that comparison.
+
+### Answer
+
+```json
+{
+  "ok": true,
+  "readOnly": true,
+  "workspacePath": "<resolved path>",
+  "isolation": "worktree | shared | block",
+  "reason": "PREFLIGHT_…",
+  "sharedExplicit": false,
+  "decisionRequired": false,
+  "facts": {
+    "gitAvailable": true,
+    "repository": true,
+    "hasCommits": true,
+    "clean": false,
+    "head": "5d0f…",
+    "changedFiles": 3,
+    "changedPaths": ["src/a.js", "notes.txt", ".env"],
+    "changedPathsTruncated": false,
+    "sensitivePaths": [".env"]
+  },
+  "guidance": "one sentence naming the next action",
+  "checkedAt": 1792400000000
+}
+```
+
+Every branch returns exactly this key set, so a caller never has to guard a field.
+`facts.clean` is `null` — **unknown**, not "clean" — whenever the state could not
+be measured; `changedFiles` is the true status total and `changedPaths` is the
+bounded list, with `changedPathsTruncated: true` when they differ. Paths are names
+only: content is never read (`git diff` and `git show` are never invoked), and a
+sensitive name appears in `sensitivePaths` by name alone.
+
+### Decision table
+
+| Facts | `isolation` | `reason` | flags |
+|---|---|---|---|
+| not a directory / relative / unresolvable path | `block` | `PREFLIGHT_WORKSPACE_INVALID` or `PREFLIGHT_NOT_A_DIRECTORY` | — |
+| git cannot be executed | `block` | `PREFLIGHT_GIT_UNAVAILABLE` | — |
+| not inside a git work tree | `block` | `PREFLIGHT_NOT_A_REPOSITORY` | — |
+| inside a repository but not its root (a subdirectory) | `block` | `PREFLIGHT_NOT_A_REPOSITORY_ROOT` | — |
+| repository with no commit | `block` | `PREFLIGHT_NO_COMMITS` | — |
+| a read-only git read failed | `block` | `PREFLIGHT_GIT_FAILED` | — |
+| clean repository root | `worktree` | `PREFLIGHT_CLEAN_REPOSITORY` | — |
+| dirty, `allowShared` not passed | `block` | `PREFLIGHT_DIRTY_NEEDS_DECISION` | `decisionRequired: true` |
+| dirty, `allowShared: true` | `shared` | `PREFLIGHT_DIRTY_SHARED_EXPLICIT` | `sharedExplicit: true` |
+
+**There is no automatic downgrade.** A dirty checkout is exactly the state in which
+`WorktreeManager.prepare` refuses with `WORKTREE_SOURCE_DIRTY` (§3.6), which is why
+the same condition is measured here — but the remedy is a decision, not a default.
+`allowShared` is a per-call request, never a stored setting: the plugin does not
+record that shared isolation is "fine" and cannot be made to prefer it silently.
+
+**A subdirectory is not a workspace.** It has its own reason
+(`PREFLIGHT_NOT_A_REPOSITORY_ROOT`) because the honest remedy is different:
+`allowShared` decides *where* a dirty run executes and is not permission to treat a
+subdirectory as a workspace, so the refusal is decided before status is read and
+holds with or without `allowShared`. `facts.repository` is `true` for such a path
+(it really is inside a repository) while `facts.clean` stays `null` (unmeasured),
+and `guidance` names the measured repository root — it never suggests `worktree`
+or `shared`, because neither is safe for a path that is not the root.
+
+### Surfaces
+
+| Surface | Shape |
+|---|---|
+| MCP tool | `delegate_preflight { workspacePath, allowShared? }`, `additionalProperties: false`; `allowShared` must be a real boolean |
+| execution plane | `POST /dsh-delegate/x/workspace/preflight` → `200` with the decision, `400 WORKSPACE_PATH_REQUIRED` for a missing path |
+
+The route is behind the same transport fence and connection identity as every other
+execution-plane route, but it is deliberately **not** gated on the switch or on the
+concurrency cap: it authorizes nothing and consumes nothing, so it stays answerable
+while delegation is off (that is when a coordinator decides whether a dispatch is
+worthwhile) and while every slot is busy. It is the only execution-plane route
+besides `/status` and `/tasks` reads that answers with the switch off.
+
+---
+
+## 3.6 `WorktreeManager`
 
 ```js
 const manager = new WorktreeManager({ runGit }, { rootDir });
@@ -225,18 +364,30 @@ Steps, in order — each can refuse:
 
 1. validate `taskId`, `sourcePath`, signal;
 2. resolve `sourcePath` with `realpath`;
-3. refuse if `rootDir` (declared or resolved) is inside the source repository;
-4. probe the source: git available, a work tree, at least one commit → pin `head`;
-5. require a clean source (`git status -z` reports nothing);
-6. claim a unique destination under the root and refuse if it exists;
-7. `git worktree add --detach <path> <pinned-head>`;
-8. verify `rev-parse --verify HEAD` in the new tree equals the pinned commit;
-9. refuse if the signal aborted at any point.
+3. measure the repository top level with `git rev-parse --show-toplevel` and
+   resolve it with `realpath`; an unmeasurable top level is
+   `WORKTREE_NOT_A_REPOSITORY`;
+4. refuse if `rootDir` (declared or resolved) is anywhere inside that
+   **repository root** — not merely inside `sourcePath`;
+5. probe the source: git available, a work tree, at least one commit → pin `head`;
+6. require a clean source (`git status -z` reports nothing);
+7. claim a unique destination under the root and refuse if it exists, or if it
+   falls inside the repository root;
+8. `git worktree add --detach <path> <pinned-head>`;
+9. verify `rev-parse --verify HEAD` in the new tree equals the pinned commit;
+10. refuse if the signal aborted at any point.
 
-A refusal at steps 1–6 touches nothing. A refusal at step 8 or a cancellation at
-step 9 removes the tree it just made (`git worktree remove --force` + `prune`) and
-drops the registry entry, because the caller never received the path — no
-unreviewed work can exist there.
+Step 4 is the containment decision, and it is deliberately made against the
+measured top level rather than against the supplied path. When `sourcePath` is a
+subdirectory of its repository, a `rootDir` located elsewhere in that same
+repository is outside `sourcePath` but still inside the user's checkout; only the
+top level catches it. Step 7 repeats the check on the final destination.
+
+A refusal at steps 1–7 touches nothing: the top-level read is read-only and
+`rootDir` is not created until the containment check has passed. A refusal at
+step 9 or a cancellation at step 10 removes the tree it just made
+(`git worktree remove --force` + `prune`) and drops the registry entry, because
+the caller never received the path — no unreviewed work can exist there.
 
 **Why a clean source is required.** A worktree is built from a commit. If the
 source has uncommitted edits, those edits are simply absent from the tree, and
@@ -251,12 +402,12 @@ does can move a ref in the user's repository, and no branch is checked out twice
 | Code | Meaning |
 |---|---|
 | `WORKTREE_GIT_UNAVAILABLE` | git cannot be executed here |
-| `WORKTREE_NOT_A_REPOSITORY` | the source is not a git work tree |
+| `WORKTREE_NOT_A_REPOSITORY` | the source is not inside a git work tree, or its top level cannot be measured |
 | `WORKTREE_NO_COMMITS` | the source has no commit; commit first |
 | `WORKTREE_SOURCE_DIRTY` | the source has uncommitted changes (`details.changes`, `details.paths`) |
 | `WORKTREE_ROOT_INVALID` | `rootDir` is not absolute, or `sourcePath` is not absolute |
 | `WORKTREE_PATH_ESCAPE` | the generated destination left the root |
-| `WORKTREE_NESTED_DESTINATION` | the destination would be inside the source |
+| `WORKTREE_NESTED_DESTINATION` | `rootDir` or the destination is inside the **repository root** (`details.sourcePath`, `details.repositoryRoot`) |
 | `WORKTREE_DESTINATION_EXISTS` | the chosen path already exists |
 | `WORKTREE_CANCELLED` | the signal was aborted (`details.phase`: `before-probe`, `before-create`, `after-create`) |
 | `WORKTREE_GIT_FAILED` | a git invocation failed (`details.step`, `details.exitCode`, bounded `stderr`) |

@@ -33,8 +33,13 @@ export type McpConfigErrorCode = 'MCP_CONFIG_INVALID';
  */
 export declare function readConfig(env: Record<string, string | undefined>): McpConfig;
 
-/** Execution-plane route names the MCP tools dispatch to. */
-export type ExecutionRoute = 'submit' | 'status' | 'result' | 'cancel';
+/**
+ * Execution-plane route names the MCP tools dispatch to.
+ *
+ * `preflight` is the read-only workspace inspection behind `delegate_preflight`:
+ * it maps to `POST /dsh-delegate/x/workspace/preflight` and creates nothing.
+ */
+export type ExecutionRoute = 'submit' | 'status' | 'result' | 'cancel' | 'preflight';
 
 /**
  * Build the HTTP call the MCP tools use.

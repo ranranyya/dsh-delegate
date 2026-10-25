@@ -555,6 +555,9 @@ function effectiveView(value) {
       model: label(review.model),
       reasoningEffort: label(review.reasoningEffort),
     },
+    // The conversation mode this task was frozen with, so a historical record
+    // states whether the run continued a conversation. No session id is stored.
+    conversation: conversationView(value.conversation),
     provenance: {
       projectPath: path(provenance.projectPath),
       projectKey: path(provenance.projectKey),
@@ -656,7 +659,11 @@ function diffView(value, ctx) {
 
 /**
  * @returns {object | null} bounded execution record. Native agent and session ids
- *   are dropped: this module stores outcomes, never a way back into a run.
+ *   are dropped: this module stores outcomes, never a way back into a run. The
+ *   `conversation` block is the exception and is deliberately narrow — it carries
+ *   the mode that was frozen for the task, whether a conversation was continued,
+ *   and the Workspace id the run was grouped in. It never carries the session id,
+ *   so a restart cannot resume a conversation from this file.
  */
 function executionView(value, ctx) {
   if (!isPlainObject(value)) return null;
@@ -668,10 +675,27 @@ function executionView(value, ctx) {
     textTruncated: value.textTruncated === true,
     usage: usageView(value.usage),
     turnEnd: isPlainObject(value.turnEnd) ? { reason: label(value.turnEnd.reason) } : null,
+    conversation: conversationView(value.conversation),
     cancelCause: label(value.cancelCause),
     error: typeof value.error === 'string'
       ? text(value.error, ctx, 'execution.error', MAX_MESSAGE_CHARS)
       : errorView(value.error, ctx),
+  };
+}
+
+/**
+ * @returns {object | null} bounded conversation placement. `sessionId` and every
+ *   other resumable handle is absent on purpose.
+ */
+function conversationView(value) {
+  if (!isPlainObject(value)) return null;
+  return {
+    mode: knownValue(value.mode, ['new', 'reuse']),
+    reused: value.reused === true,
+    workspaceId: label(value.workspaceId),
+    workspacePath: path(value.workspacePath),
+    workspaceCreated: value.workspaceCreated === true,
+    sessionCreated: value.sessionCreated === true,
   };
 }
 

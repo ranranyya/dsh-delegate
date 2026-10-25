@@ -25,6 +25,8 @@ import {
   cleanup,
   fakeAgents,
   fakeLlm,
+  fakeSessionController,
+  fakeWorkspaceController,
   llmTable,
   makeTempDir,
   validSettings,
@@ -159,6 +161,21 @@ async function harness(options = {}) {
   const agents = options.agents ?? fakeAgents({ respond: { text: 'implemented the change' } });
   const providerRegistry = options.providerRegistry ?? fakeProviderRegistry();
   const presets = options.agentPresets ?? enginePresets();
+  // Placement, wired the way `src/index.js` wires it: the Workspace controller
+  // and the SESSION controller are two distinct services, and the native
+  // `sessions` service above is neither of them. Every worker run the engine
+  // executes is grouped into a Workspace keyed by its ACTUAL execution directory,
+  // so a harness without these two controllers would (correctly) refuse every
+  // task with `JOB_CONVERSATION_UNAVAILABLE`.
+  // A controller handed in by a test may bring its own Workspace registry (a busy
+  // or scripted resolve needs one it can populate); otherwise both are fresh.
+  const workspaces = options.workspaces ?? options.sessionController?.boundWorkspaces ?? fakeWorkspaceController();
+  const sessionController = options.sessionController ?? fakeSessionController({
+    workspaces,
+    // The same scripted turn the agent fake would produce, because a placed run
+    // drives the Agent the controller resolves rather than one it creates.
+    ...(agents.respondPlan === undefined ? {} : { respond: agents.respondPlan }),
+  });
   const deps = {
     agents,
     agentPresets: presets,
@@ -167,6 +184,8 @@ async function harness(options = {}) {
     // (see `reviewComposer`); routing and the worker run are unaffected.
     reviewPresets: options.reviewPresets ?? reviewComposer(presets),
     sessions: { async flush() {} },
+    workspaces,
+    sessionController,
     // The native route is not the profile id; the model table is keyed by the
     // route the harness will be asked to resolve.
     llm: fakeLlm({ providers: { 'relay-native': llmTable().relay } }),
@@ -180,6 +199,7 @@ async function harness(options = {}) {
     ...(options.ensureRoutes === undefined ? {} : { ensureRoutes: options.ensureRoutes }),
     ...(options.worktrees === undefined ? {} : { worktrees: options.worktrees }),
     ...(options.preflightTimeoutMs === undefined ? {} : { preflightTimeoutMs: options.preflightTimeoutMs }),
+    ...(options.sessionStore === undefined ? {} : { sessionStore: options.sessionStore }),
     authorizationMode: options.authorizationMode ?? 'grants',
     delegationEnabled: options.delegationEnabled === true,
     logger: { info() {}, warn() {} },
@@ -212,6 +232,22 @@ async function harness(options = {}) {
     agents,
     deps,
     providerRegistry,
+    workspaces,
+    sessionController,
+    /**
+     * The Agent a settled task actually drove.
+     *
+     * A placed run never calls `agents.create`, so `agents.created` stays empty by
+     * design; the conversation it drove is the one `sessionController` resolved
+     * for its Session. Engine assertions follow the run, not the old creation
+     * path, so they keep proving "the selected triple reached the agent".
+     * @param {object} task - settled task view.
+     * @returns {object} the resolved agent.
+     */
+    drivenAgent(task) {
+      const sessionId = task?.execution?.conversation?.sessionId ?? task?.execution?.sessionId;
+      return sessionController.agents.get(sessionId);
+    },
     authorize,
     async close() {
       await engine.dispose();
@@ -265,13 +301,21 @@ test('an authorized task runs and ends awaiting host review, never approved', as
       prompt: 'implement the change',
     });
 
-    assert.equal(h.agents.created.length, 1);
     const settled = await settle(h.engine, started.taskId);
     assert.equal(settled.state, TASK_STATES.awaitingHostReview);
     assert.equal(settled.selfApproved, false);
     assert.equal(settled.hostAcceptance, null, 'the plugin must not record acceptance');
     assert.equal(settled.execution.outcome, 'completed');
     assert.match(settled.execution.text, /implemented the change/);
+    // The run was grouped into a real Workspace keyed by its execution directory,
+    // and started a fresh conversation there (the default mode).
+    const conversation = settled.execution.conversation;
+    assert.ok(conversation !== null && conversation !== undefined, 'a worker run must report where it was placed');
+    assert.equal(conversation.mode, 'new');
+    assert.equal(conversation.reused, false, 'the default mode starts a new conversation');
+    assert.equal(h.workspaces.workspaces.get(conversation.workspaceId)?.path, h.workspace,
+      'the Workspace is keyed by the actual execution directory');
+    assert.equal(h.agents.created.length, 0, 'a placed run must not create a second agent');
     // Evidence was measured, not reported.
     assert.equal(settled.diff.fileCount, 1);
     assert.equal(settled.diff.files[0].path, 'src/a.js');
@@ -294,9 +338,15 @@ test('the effective configuration is captured immutably on the task', async () =
     assert.equal(settled.effective.worker.model, 'deepseek-chat');
     assert.equal(settled.effective.worker.reasoningEffort, 'medium');
     assert.equal(settled.route.providerId, 'relay');
-    // The agent received the same triple the task records.
-    assert.equal(h.agents.created[0].options.model, 'deepseek-chat');
-    assert.equal(h.agents.created[0].options.reasoningEffort, 'medium');
+    // The run reports the triple it actually installed on the agent it drove, and
+    // that agent really received it. A placed run never goes through
+    // `agents.create`, so the fact is read from the run and from the agent.
+    assert.equal(settled.execution.selection.model, 'deepseek-chat');
+    assert.equal(settled.execution.selection.reasoningEffort, 'medium');
+    assert.equal(settled.execution.selection.provider, settled.route.providerRoute);
+    const driven = h.drivenAgent(settled);
+    assert.ok(driven !== undefined, 'the task\'s conversation must expose the agent it drove');
+    assert.equal(driven.followups.length, 1, 'exactly one prompt reached that agent');
   } finally {
     await h.close();
   }
@@ -323,7 +373,8 @@ test('replaying a spent task grant cannot start a second task', async () => {
       }),
       (error) => error.code === 'GRANT_CONSUMED' || error.code === JOB_CODES.notAuthorized,
     );
-    assert.equal(h.agents.created.length, 1, 'only one agent may ever exist for one grant');
+    assert.equal(h.agents.created.length, 0, 'a placed run creates no agent through the registry');
+    assert.equal(h.sessionController.creates.length, 1, 'exactly one conversation may exist for one grant');
   } finally {
     await h.close();
   }
@@ -503,17 +554,13 @@ test('a nonexistent workspace is refused', async () => {
 });
 
 test('two concurrent jobs in one workspace are refused', async () => {
-  const agents = fakeAgents({
-    script: async ({ record }) => {
-      record.agent.followup = (message) => {
-        record.followups.push(message);
-        record.idle = false;
-      };
-    },
-  });
   // Raise the parallelism limit above one so the refusal under test is the
-  // workspace lock, not the concurrency cap.
-  const h = await harness({ agents, settings: validSettings({ worker: { maxParallelism: 2 } }) });
+  // workspace lock, not the concurrency cap. The first job must still be RUNNING
+  // when the second is submitted, which is what the busy conversation models.
+  const h = await harness({
+    sessionController: busySessionController(),
+    settings: validSettings({ worker: { maxParallelism: 2 } }),
+  });
   try {
     const first = h.authorize();
     const second = h.authorize();
@@ -539,15 +586,9 @@ test('two concurrent jobs in one workspace are refused', async () => {
 });
 
 test('the parallelism cap refuses a second concurrent job', async () => {
-  const agents = fakeAgents({
-    script: async ({ record }) => {
-      record.agent.followup = (message) => {
-        record.followups.push(message);
-        record.idle = false;
-      };
-    },
-  });
-  const h = await harness({ agents });
+  // The busy conversation keeps the first job running, so the second is refused
+  // by the cap rather than admitted behind a finished task.
+  const h = await harness({ sessionController: busySessionController() });
   try {
     const first = h.authorize();
     const second = h.authorize();
@@ -594,7 +635,14 @@ test('a session grant starts repeated tasks', async () => {
       prompt: 'second',
     });
     assert.notEqual(one.taskId, two.taskId);
-    assert.equal(h.agents.created.length, 2);
+    await settle(h.engine, two.taskId);
+    // `new` is the default mode, so the second task starts its own conversation in
+    // the SAME Workspace group rather than continuing the first.
+    const firstRun = h.engine.get(one.taskId).execution;
+    const secondRun = h.engine.get(two.taskId).execution;
+    assert.notEqual(firstRun.conversation.sessionId, secondRun.conversation.sessionId, 'two tasks, two conversations');
+    assert.equal(firstRun.conversation.workspaceId, secondRun.conversation.workspaceId, 'in one Workspace group');
+    assert.equal(h.sessionController.creates.length, 2);
   } finally {
     await h.close();
   }
@@ -721,16 +769,41 @@ test('finalize is idempotent when several terminal paths race', async () => {
   }
 });
 
+/**
+ * A session controller whose resolved agents absorb their prompt and stay busy.
+ *
+ * A placed run never creates an agent through `agents.create`, so "a run that is
+ * still working" has to be modelled on the conversation the run actually drives.
+ * Only the runner's own cancel (or timeout) can end such a run, which is what a
+ * cancellation test needs to observe.
+ * @returns {object} fake session controller bound to the harness's Workspace controller.
+ */
+function busySessionController() {
+  const workspaces = fakeWorkspaceController();
+  const controller = fakeSessionController({ workspaces });
+  const resolveOriginal = controller.resolveAgent.bind(controller);
+  controller.resolveAgent = async (sessionId) => {
+    const found = await resolveOriginal(sessionId);
+    const agent = found.agent;
+    if (agent !== undefined) {
+      agent.followup = (message) => { agent.followups.push(message); };
+      // Never idle: nothing but `cancel` (or the runner's timeout) can settle this.
+      agent.whenIdle = async () => { await new Promise(() => {}); };
+    }
+    return found;
+  };
+  // The harness wires its own Workspace controller, so hand this one over instead.
+  controller.boundWorkspaces = workspaces;
+  return controller;
+}
+
 test('cancelling a running task reaches the agent and states why', async () => {
-  const agents = fakeAgents({
-    script: async ({ record }) => {
-      record.agent.followup = (message) => {
-        record.followups.push(message);
-        record.idle = false;
-      };
-    },
+  // A placed run drives a RESOLVED agent, so the busy turn is modelled on the
+  // session controller's side: prompt delivery absorbs the turn and the agent
+  // never becomes idle, which leaves the operator's cancel as the only ending.
+  const h = await harness({
+    sessionController: busySessionController(),
   });
-  const h = await harness({ agents });
   try {
     const { connectionId, grant } = h.authorize();
     const started = await h.engine.start({
@@ -745,7 +818,9 @@ test('cancelling a running task reaches the agent and states why', async () => {
     assert.equal(cancelled.state, TASK_STATES.cancelled);
     assert.equal(cancelled.cancelledBy, 'operator');
     // The native agent received a cancel, and the workspace lock was released.
-    assert.ok(h.agents.created[0].cancels.length >= 1, 'the agent must be cancelled');
+    const driven = h.drivenAgent(cancelled);
+    assert.ok(driven !== undefined, 'the task\'s conversation must expose the agent it drove');
+    assert.ok(driven.cancels.length >= 1, 'the agent must be cancelled');
     assert.equal(h.engine.locks.isLocked(h.workspace), false);
   } finally {
     await h.close();
@@ -753,22 +828,15 @@ test('cancelling a running task reaches the agent and states why', async () => {
 });
 
 test('the master switch blocks new work while off and cancels live work when disabled', async () => {
-  const agents = fakeAgents({
-    script: async ({ record }) => {
-      record.agent.followup = (message) => {
-        record.followups.push(message);
-        record.idle = false;
-      };
-    },
-  });
-  const h = await harness({ agents, authorizationMode: 'switch', delegationEnabled: false });
+  const sessionController = busySessionController();
+  const h = await harness({ authorizationMode: 'switch', delegationEnabled: false, sessionController });
   try {
     assert.deepEqual(h.engine.posture(), { authorized: false, reason: 'delegation is disabled', mode: 'switch' });
     await assert.rejects(
       () => h.engine.start({ workspacePath: h.workspace, prompt: 'must stay blocked' }),
       (error) => error.code === JOB_CODES.notAuthorized,
     );
-    assert.equal(agents.created.length, 0, 'a disabled switch must not create an agent');
+    assert.equal(sessionController.creates.length, 0, 'a disabled switch must not create a conversation');
 
     h.engine.setDelegationEnabled(true);
     const started = await h.engine.start({ workspacePath: h.workspace, prompt: 'long job' });
@@ -778,7 +846,7 @@ test('the master switch blocks new work while off and cancels live work when dis
 
     assert.equal(cancelled.state, TASK_STATES.cancelled);
     assert.equal(cancelled.cancelledBy, 'delegation-disabled');
-    assert.ok(agents.created[0].cancels.length >= 1, 'disabling must reach the native agent');
+    assert.ok(h.drivenAgent(cancelled).cancels.length >= 1, 'disabling must reach the native agent');
     assert.equal(h.engine.posture().authorized, false);
     await assert.rejects(
       () => h.engine.start({ workspacePath: h.workspace, prompt: 'must stay blocked' }),
@@ -846,9 +914,20 @@ test('review runs only when enabled and uses its own selection', async () => {
     assert.equal(settled.review.selection.model, 'deepseek-reasoner');
     assert.equal(settled.state, TASK_STATES.awaitingHostReview);
 
-    // Two distinct agents: worker and reviewer, with different models.
-    const models = agents.created.map((record) => record.options.model);
-    assert.deepEqual(models, ['deepseek-chat', 'deepseek-reasoner']);
+    // Two distinct conversations, each on its own model:
+    //  * the WORKER is placed, so its model comes from the run that drove the
+    //    resolved agent in the Workspace — recorded on the task, not on a
+    //    `agents.create` call it never made;
+    //  * the REVIEWER is unplaced (it must not join the operator's history), so
+    //    it is the one agent created through the registry.
+    assert.equal(settled.execution.selection.model, 'deepseek-chat');
+    const reviewModels = agents.created.map((record) => record.options.model);
+    assert.deepEqual(reviewModels, ['deepseek-reasoner'], 'only the reviewer goes through agents.create');
+    assert.notEqual(
+      settled.execution.conversation.sessionId,
+      agents.created[0].sessionId,
+      'the review must not share the worker conversation',
+    );
   } finally {
     await h.close();
   }
@@ -878,11 +957,18 @@ test('both installed requests — worker and reviewer — carry a practical outp
     assert.equal(settled.review.state, REVIEW_STATES.completed);
 
     const budgets = agents.created.map((record) => record.options.maxTokens);
-    assert.equal(budgets.length, 2, 'one worker request and one reviewer request');
+    assert.equal(budgets.length, 1, 'one reviewer request goes through agents.create');
     for (const [index, budget] of budgets.entries()) {
       assert.equal(budget, DEFAULT_MAX_TOKENS, `request ${index} must carry the default allowance`);
       assert.ok(budget >= 32768, `request ${index} must reserve at least 32768 output tokens, got ${budget}`);
     }
+    // The worker's budget is asserted from the run itself: it drove a resolved
+    // agent, so there is no create call to inspect. (`execution.maxTokens` is
+    // redacted in the public view — a field named "token" is masked — so the
+    // budget is read from the task record's raw execution instead.)
+    const task = h.engine.tasks.get(started.taskId);
+    assert.equal(task.execution.maxTokens, DEFAULT_MAX_TOKENS, 'the worker request must carry the same allowance');
+    assert.ok(task.execution.maxTokens >= 32768);
   } finally {
     await h.close();
   }
@@ -901,7 +987,10 @@ test('review is skipped when disabled, without recording a verdict', async () =>
     const settled = await settle(h.engine, started.taskId);
     assert.equal(settled.review.state, REVIEW_STATES.disabled);
     assert.equal(settled.review.verdict, null);
-    assert.equal(h.agents.created.length, 1, 'no reviewer agent may be created when review is off');
+    // A placed worker creates no agent through the registry, so an empty
+    // `agents.created` is exactly the evidence that no reviewer ran.
+    assert.equal(h.agents.created.length, 0, 'no reviewer agent may be created when review is off');
+    assert.equal(h.sessionController.creates.length, 1, 'and the worker still got its one conversation');
   } finally {
     await h.close();
   }
@@ -1107,15 +1196,8 @@ test('listing tasks filters by connection', async () => {
 });
 
 test('dispose cancels live tasks and marks the plugin unusable', async () => {
-  const agents = fakeAgents({
-    script: async ({ record }) => {
-      record.agent.followup = (message) => {
-        record.followups.push(message);
-        record.idle = false;
-      };
-    },
-  });
-  const h = await harness({ agents });
+  // A live (never-idle) placed run, so dispose has something to stop.
+  const h = await harness({ sessionController: busySessionController() });
   try {
     const { connectionId, grant } = h.authorize();
     await h.engine.start({

@@ -37,7 +37,12 @@ const ALLOWED_GIT = [/^--version$/, /^rev-parse --/, /^status --/, /^worktree (a
  * enough for the manager's contract: the directory appears and the tree reports
  * the commit it was created from. Everything the fake cannot model (a dirty
  * index, a broken repository) is scripted by the test.
- * @param {object} [options] - `status`, `head`, `failAdd`, `treeHead`, `onAdd`.
+ *
+ * `rev-parse --show-toplevel` answers the canonical repository root. By default
+ * that is the directory git is asked from, i.e. the source *is* the root, which
+ * is the ordinary case; `topLevel` makes it answer a different directory, which
+ * is how a nested source path (a path inside its repository) is modelled.
+ * @param {object} [options] - `status`, `head`, `failAdd`, `treeHead`, `onAdd`, `topLevel`.
  * @returns {object} runner with `calls` history.
  */
 function fakeWorktreeGit(options = {}) {
@@ -52,6 +57,10 @@ function fakeWorktreeGit(options = {}) {
     );
     if (joined === '--version') return { stdout: 'git version 2.54.0\n', stderr: '', code: 0 };
     if (joined === 'rev-parse --is-inside-work-tree') return { stdout: 'true\n', stderr: '', code: 0 };
+    if (joined === 'rev-parse --show-toplevel') {
+      if (options.topLevel === false) return { stdout: '', stderr: 'fatal: not a git repository', code: 128 };
+      return { stdout: `${options.topLevel ?? cwd}\n`, stderr: '', code: 0 };
+    }
     if (joined === 'rev-parse --verify HEAD') {
       // Inside a tree the manager created, the pinned commit is what it asked for.
       const inside = calls.some((call) => call.args[0] === 'worktree' && call.args[1] === 'add' && resolve(call.args[3]) === resolve(cwd));
@@ -81,15 +90,47 @@ function fakeWorktreeGit(options = {}) {
 
 /**
  * Build a manager over a fresh temporary source repository and worktree root.
- * @param {object} [options] - forwarded to {@link fakeWorktreeGit}, plus `rootInsideSource`.
+ *
+ * Shapes the containment regressions need are named rather than positional:
+ *  - `rootInsideSource` puts the root under the supplied source path;
+ *  - `rootElsewhereInRepository` makes the supplied source path a subdirectory of
+ *    the repository and puts the root elsewhere in that same repository — but
+ *    outside the subdirectory — which is the case a containment check that only
+ *    compares against the supplied path misses;
+ *  - `nestedSource` makes the supplied source path a subdirectory of a repository
+ *    whose top level is the harness base, with the root outside it.
+ * @param {object} [options] - forwarded to {@link fakeWorktreeGit}, plus the shapes above.
  * @returns {Promise<object>} harness.
  */
 async function harness(options = {}) {
   const base = await makeTempDir();
   const sourcePath = join(base, 'source');
-  const rootDir = options.rootInsideSource === true ? join(sourcePath, 'trees') : join(base, 'trees');
+  if (options.nestedSource === true || options.rootElsewhereInRepository === true) {
+    // The supplied path is a directory inside the repository, not its root.
+    const nestedPath = join(sourcePath, 'packages', 'app');
+    await mkdir(nestedPath, { recursive: true });
+    return buildHarness(base, nestedPath, options, { topLevel: sourcePath });
+  }
   await mkdir(sourcePath, { recursive: true });
-  const runGit = options.runGit ?? fakeWorktreeGit(options);
+  return buildHarness(base, sourcePath, options, {});
+}
+
+/**
+ * Finish a harness once the source directory exists.
+ * @param {string} base - temporary base directory.
+ * @param {string} sourcePath - supplied source path.
+ * @param {object} options - harness options.
+ * @param {object} fakeOptions - `topLevel` override for the fake git.
+ * @returns {object} harness.
+ */
+function buildHarness(base, sourcePath, options, fakeOptions) {
+  const rootDir = options.rootInsideSource === true
+    ? join(sourcePath, 'trees')
+    : options.rootElsewhereInRepository === true
+      // Inside the repository top level, but not inside the supplied subdirectory.
+      ? join(base, 'source', 'trees')
+      : join(base, 'trees');
+  const runGit = options.runGit ?? fakeWorktreeGit({ ...options, ...fakeOptions });
   const manager = new WorktreeManager({ runGit }, { rootDir, randomId: () => options.suffix ?? 'test0001' });
   return {
     base,
@@ -173,8 +214,10 @@ test('prepare creates a real detached tree under the plugin root', async () => {
 test('prepare refuses a source that is not a git work tree', async () => {
   const h = await harness({
     runGit: async (cwd, args) => {
-      if (args.join(' ') === '--version') return { stdout: 'git version 2.54.0\n', stderr: '', code: 0 };
-      if (args.join(' ') === 'rev-parse --is-inside-work-tree') return { stdout: 'false\n', stderr: '', code: 128 };
+      const joined = args.join(' ');
+      if (joined === '--version') return { stdout: 'git version 2.54.0\n', stderr: '', code: 0 };
+      if (joined === 'rev-parse --is-inside-work-tree') return { stdout: 'false\n', stderr: '', code: 128 };
+      if (joined === 'rev-parse --show-toplevel') return { stdout: '', stderr: 'fatal: not a git repository', code: 128 };
       return { stdout: '', stderr: '', code: 0 };
     },
   });
@@ -189,12 +232,29 @@ test('prepare refuses a source that is not a git work tree', async () => {
   }
 });
 
+test('prepare refuses a source whose repository root cannot be measured', async () => {
+  // `--is-inside-work-tree` said yes but the top level could not be read. The
+  // manager must refuse rather than fall back to comparing against the supplied
+  // path, which is the very comparison the root exists to replace.
+  const h = await harness({ topLevel: false });
+  try {
+    await assert.rejects(
+      () => h.manager.prepare({ taskId: 'task-1', sourcePath: h.sourcePath }),
+      (error) => error.code === WORKTREE_CODES.notRepository,
+    );
+    assert.equal(h.runGit.calls.some((call) => call.args[0] === 'worktree'), false);
+  } finally {
+    await h.close();
+  }
+});
+
 test('prepare refuses a repository with no commit', async () => {
   const h = await harness({
     runGit: async (cwd, args) => {
       const joined = args.join(' ');
       if (joined === '--version') return { stdout: 'git version 2.54.0\n', stderr: '', code: 0 };
       if (joined === 'rev-parse --is-inside-work-tree') return { stdout: 'true\n', stderr: '', code: 0 };
+      if (joined === 'rev-parse --show-toplevel') return { stdout: `${cwd}\n`, stderr: '', code: 0 };
       if (joined === 'rev-parse --verify HEAD') return { stdout: '', stderr: '', code: 128 };
       return { stdout: '', stderr: '', code: 0 };
     },
@@ -259,6 +319,76 @@ test('prepare refuses a root inside the source repository', async () => {
       (error) => error.code === WORKTREE_CODES.nestedDestination,
     );
     assert.deepEqual(h.runGit.calls.filter((call) => call.args[0] === 'worktree'), []);
+  } finally {
+    await h.close();
+  }
+});
+
+test('a root elsewhere in the repository is refused even when the source path is nested', async () => {
+  // The finding: a configured root that sits inside the *repository* but outside
+  // the supplied subdirectory used to pass, because containment was checked
+  // against the supplied path. The tree would then be created inside the user's
+  // checkout. Containment must be measured against the repository's top level.
+  const h = await harness({ nestedSource: true, rootElsewhereInRepository: true });
+  try {
+    // Precondition: the two paths are genuinely outside one another, so only the
+    // repository root can connect them.
+    assert.equal(resolve(h.rootDir).startsWith(`${resolve(h.sourcePath)}\\`), false);
+    assert.equal(resolve(h.rootDir).startsWith(`${resolve(h.sourcePath)}/`), false);
+    assert.equal(resolve(h.rootDir).startsWith(resolve(h.base, 'source')), true);
+
+    await assert.rejects(
+      () => h.manager.prepare({ taskId: 'task-1', sourcePath: h.sourcePath }),
+      (error) => {
+        assert.equal(error.code, WORKTREE_CODES.nestedDestination);
+        // The refusal names the real boundary it measured, not the supplied path.
+        assert.equal(resolve(error.details.repositoryRoot), resolve(h.base, 'source'));
+        assert.equal(resolve(error.details.sourcePath), resolve(h.sourcePath));
+        return true;
+      },
+    );
+    // Nothing was created, and nothing that could create was even attempted.
+    assert.deepEqual(h.runGit.calls.filter((call) => call.args[0] === 'worktree'), []);
+    assert.deepEqual(h.manager.list(), []);
+    const { access } = await import('node:fs/promises');
+    await assert.rejects(() => access(h.rootDir), (error) => error.code === 'ENOENT');
+  } finally {
+    await h.close();
+  }
+});
+
+test('a root outside the repository is accepted when the source path is nested', async () => {
+  // The complement of the refusal: measuring the top level must not make every
+  // nested source path unusable, only the ones whose root is inside that
+  // repository. Here the root is a sibling of the repository.
+  const h = await harness({ nestedSource: true });
+  try {
+    const prepared = await h.manager.prepare({ taskId: 'task-1', sourcePath: h.sourcePath });
+    assert.equal(prepared.isolated, true);
+    // The tree is outside the whole repository, not merely outside the nested path.
+    assert.equal(resolve(prepared.workspacePath).startsWith(resolve(h.base, 'source')), false);
+    assert.equal((await stat(prepared.workspacePath)).isDirectory(), true);
+  } finally {
+    await h.close();
+  }
+});
+
+test('a normal root workspace is still accepted and its tree is outside the checkout', async () => {
+  // The ordinary case must not regress: the supplied path is the repository root,
+  // the root directory is a sibling, and the tree is created as before.
+  const h = await harness();
+  try {
+    const prepared = await h.manager.prepare({ taskId: 'task-1', sourcePath: h.sourcePath });
+    assert.equal(prepared.baseHead, HEAD);
+    assert.equal(prepared.detached, true);
+    assert.equal(resolve(prepared.workspacePath).startsWith(resolve(h.rootDir)), true);
+    assert.equal(resolve(prepared.workspacePath).startsWith(resolve(h.sourcePath)), false);
+    // The top level was measured read-only, before `worktree add` was issued.
+    const order = h.runGit.calls.map((call) => call.joined);
+    const topLevelAt = order.indexOf('rev-parse --show-toplevel');
+    const addAt = order.findIndex((joined) => joined.startsWith('worktree add --detach'));
+    assert.ok(topLevelAt >= 0, 'the repository root must be measured');
+    assert.ok(addAt > topLevelAt, 'containment must be decided before anything is created');
   } finally {
     await h.close();
   }

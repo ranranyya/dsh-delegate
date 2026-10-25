@@ -2,13 +2,20 @@
 //
 // Design rule taken from SPEC §10–11: an external MCP client may *exercise* an
 // authorization the operator already created, and may do nothing else. So this
-// server exposes exactly four tools and maps each one onto one execution-plane
-// route:
+// server exposes five tools and maps each one onto one execution-plane route:
 //
-//   delegate_status  → GET  /dsh-delegate/x/status
-//   delegate_submit  → POST /dsh-delegate/x/tasks
-//   delegate_result  → POST /dsh-delegate/x/tasks/get
-//   delegate_cancel  → POST /dsh-delegate/x/tasks/cancel
+//   delegate_status    → GET  /dsh-delegate/x/status
+//   delegate_submit    → POST /dsh-delegate/x/tasks
+//   delegate_result    → POST /dsh-delegate/x/tasks/get
+//   delegate_cancel    → POST /dsh-delegate/x/tasks/cancel
+//   delegate_preflight → POST /dsh-delegate/x/workspace/preflight
+//
+// `delegate_preflight` is the one addition that is not an authorization at all: it
+// is a read-only measurement of a workspace, and it exists so a dispatcher can
+// learn before submitting that a checkout is dirty, is not a repository, or would
+// need an isolation decision — instead of learning it from a failed job. It still
+// cannot authorize, configure or write anything, and the execution plane does not
+// gate it on the switch, so an answer is available while delegation is off.
 //
 // There is no tool that issues a connection, issues or widens a grant, changes
 // settings, or touches a credential. That is not an omission to be filled in
@@ -48,7 +55,7 @@ export const SUPPORTED_PROTOCOL_VERSIONS = Object.freeze([
 export const LATEST_PROTOCOL_VERSION = SUPPORTED_PROTOCOL_VERSIONS[0];
 
 /** Identifies this server in the handshake. */
-export const SERVER_INFO = Object.freeze({ name: 'dsh-delegate', version: '0.1.5' });
+export const SERVER_INFO = Object.freeze({ name: 'dsh-delegate', version: '0.1.8' });
 
 /** Bound on a tool result's text. A task view can be large; a model's context cannot. */
 export const MAX_TOOL_TEXT_CHARS = 20_000;
@@ -150,6 +157,28 @@ export const TOOLS = Object.freeze([
       additionalProperties: false,
     }),
   }),
+  Object.freeze({
+    name: 'delegate_preflight',
+    title: 'Inspect workspace before dispatch',
+    description: 'Read-only preflight of one absolute workspace path: whether it is a git repository with a commit, '
+      + 'whether it is clean, how many files are changed (with a bounded path list), and the isolation to request '
+      + '(worktree / shared / block) with a stable reason code. '
+      + 'It creates no commit, stash, worktree or task and changes no setting; '
+      + 'passing allowShared acknowledges a dirty workspace but does not dispatch anything.',
+    inputSchema: Object.freeze({
+      type: 'object',
+      properties: {
+        workspacePath: { type: 'string', description: 'Absolute path of the workspace to inspect.' },
+        allowShared: {
+          type: 'boolean',
+          description: 'Set only after deciding explicitly that a dirty workspace may run in place (shared isolation). '
+            + 'Omit it to be told that a decision is required instead.',
+        },
+      },
+      required: ['workspacePath'],
+      additionalProperties: false,
+    }),
+  }),
 ]);
 
 /** Tool name → the execution-plane call it makes. */
@@ -158,6 +187,7 @@ const TOOL_ROUTES = Object.freeze({
   delegate_submit: 'submit',
   delegate_result: 'result',
   delegate_cancel: 'cancel',
+  delegate_preflight: 'preflight',
 });
 
 /**
@@ -197,6 +227,11 @@ function validateArgs(tool, args) {
     const field = value[key];
     if (declared.type === 'string') {
       if (typeof field !== 'string') throw new McpError('MCP_ARGUMENT_TYPE', `${tool.name}.${key} must be a string`);
+      out[key] = field;
+    } else if (declared.type === 'boolean') {
+      // Strict: a model that sends the string "true" gets a refusal naming the
+      // field instead of a silently truthy value reaching the plane.
+      if (typeof field !== 'boolean') throw new McpError('MCP_ARGUMENT_TYPE', `${tool.name}.${key} must be a boolean`);
       out[key] = field;
     } else if (declared.type === 'object') {
       if (field === null || typeof field !== 'object' || Array.isArray(field)) {

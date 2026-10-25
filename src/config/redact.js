@@ -11,6 +11,20 @@ const SECRET_KEY_PATTERN = /(api[_-]?key|apikey|secret|token|password|passwd|cre
 const BEARER_PATTERN = /\bBearer\s+[A-Za-z0-9._~+/=-]{12,}/gi;
 const KEYLIKE_PATTERN = /\b(sk|pk|ak)-[A-Za-z0-9_-]{16,}\b/g;
 const ASSIGNMENT_PATTERN = /\b([A-Za-z0-9_]*(?:API_?KEY|SECRET|TOKEN|PASSWORD)[A-Za-z0-9_]*)\s*=\s*("[^"]*"|'[^']*'|\S+)/gi;
+/**
+ * A profile key embedded in a *directory* name, the shape this repository's own
+ * workspace has (`…/Local/Temp/dsh-SoexNz/…`, which held the local user id). It is
+ * masked because it identifies an account; only a path-shaped key is matched, so
+ * an ordinary hyphenated word in prose is untouched.
+ *
+ * The preceding separator is captured and re-emitted so a Windows path keeps its
+ * backslash. A single combined character class would normalise `\` to `/` and
+ * change a path an operator is trying to recognise.
+ */
+const PATH_KEY_PATTERN = /([\\/])(?:dsh|profile)-[A-Za-z0-9]{6,}(?=[\\/]|$)/g;
+
+/** What {@link PATH_KEY_PATTERN} replaces the identifying segment with. */
+const PATH_KEY_SEGMENT = 'masks-user-profile-segment';
 
 /**
  * Exact names of model usage counters. These keys contain the substring `token`,
@@ -85,7 +99,11 @@ export function redactText(text) {
   return text
     .replace(BEARER_PATTERN, `Bearer ${MASK}`)
     .replace(KEYLIKE_PATTERN, MASK)
-    .replace(ASSIGNMENT_PATTERN, (_match, name) => `${name}=${MASK}`);
+    .replace(ASSIGNMENT_PATTERN, (_match, name) => `${name}=${MASK}`)
+    // Last, and path-anchored: a workspace path reported by a preflight is shown
+    // so an operator can recognise the repository, but the per-profile segment of
+    // the platform temp path is not theirs to see.
+    .replace(PATH_KEY_PATTERN, (_match, separator) => `${separator}${PATH_KEY_SEGMENT}`);
 }
 
 /**

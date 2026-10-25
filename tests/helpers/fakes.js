@@ -218,6 +218,13 @@ export function fakeAgents(options = {}) {
     listeners,
     order,
     /**
+     * The turn plan this fake was scripted with, so a test helper can give the
+     * same plan to the session controller that supplies a PLACED run's Agent. A
+     * placed run never calls `create` here, so without this mirror the reply a
+     * test scripted would never be produced by the conversation it asserts on.
+     */
+    respondPlan: options.respond,
+    /**
      * Whether an identity is live in this registry, as `AgentRegistry.get` is
      * used by the runner's pre-create admission check.
      * @param {string} id - session/agent identity.
@@ -561,6 +568,249 @@ export function fakeToolRegistry(options = {}) {
 }
 
 /**
+ * Fake native Workspace controller (`ctx.workspaceController`).
+ *
+ * Mirrors the two facts a caller depends on: `create({ path })` is create-or-reuse
+ * over an existing directory and answers `{ workspace, created }`, and a Workspace
+ * carries a stable `workspaceId` plus its own (canonical) path. The reuse rule is
+ * modelled by path equality, so two spellings of one directory are one Workspace —
+ * which is exactly what an isolated worktree must NOT share with its source.
+ * @param {object} [options] - `fail`: error to reject `create` with; `shapeless`:
+ *   answer without a `workspace.workspaceId` to model a controller that reports
+ *   nothing usable.
+ * @returns {object} fake controller with `workspaces` and `creates` history.
+ */
+export function fakeWorkspaceController(options = {}) {
+  const workspaces = new Map();
+  const creates = [];
+  return {
+    workspaces,
+    creates,
+    async create(request) {
+      creates.push(request);
+      if (options.fail !== undefined) throw options.fail;
+      if (typeof request?.path !== 'string' || request.path !== request.path.trim() || request.path === '') {
+        // The native RemoteError: the requested path cannot back a Workspace.
+        throw Object.assign(new Error('workspace/invalid-path'), { code: 'workspace/invalid-path' });
+      }
+      // Path equality, not string equality, is what one Workspace means: the
+      // registry canonicalizes at create time.
+      const key = pathKeyOf(request.path);
+      const existing = [...workspaces.values()].find((entry) => pathKeyOf(entry.path) === key);
+      if (existing !== undefined) {
+        return options.shapeless === true
+          ? { workspace: { path: existing.path } }
+          : { workspace: { ...existing, sessionIds: [...existing.sessionIds] }, created: false };
+      }
+      const workspace = {
+        workspaceId: `ws-${workspaces.size + 1}`,
+        path: request.path,
+        title: request.path.split(/[\\/]/).pop() || request.path,
+        sessionIds: [],
+      };
+      workspaces.set(workspace.workspaceId, workspace);
+      return options.shapeless === true
+        ? { workspace: { path: workspace.path } }
+        : { workspace: { ...workspace, sessionIds: [] }, created: true };
+    },
+  };
+}
+
+/**
+ * Fake native session controller (`ctx.sessionController`).
+ *
+ * `create({ workspaceId })` mints a session inside that Workspace and records its
+ * directory from the Workspace itself, which is the same canonical path membership
+ * is validated against. `resolveAgent(sessionId)` behaves like the real one:
+ * `{ agent }` for a known conversation, `{ error: { code: 'session/not-found' } }`
+ * for an unknown or disposed one. A `resumeAgent` hook may substitute a scripted
+ * answer so a test can model a controller that refuses.
+ *
+ * `resolveAgent` is memoized per Session, as the real controller's resume is: a
+ * second resolve of one conversation returns the SAME live Agent, which is how a
+ * test tells "the conversation was continued" from "another conversation was
+ * created beside it".
+ * @param {object} [options] - `workspaces`: controller to resolve `workspaceId`
+ *   against; `failCreate`: error to reject `create` with; `resumeAgent`: override
+ *   for `resolveAgent(sessionId)`; `respond`: turn plan for every resolved Agent.
+ * @returns {object} fake controller with `sessions`, `creates` and `resolves`.
+ */
+export function fakeSessionController(options = {}) {
+  const sessions = new Map();
+  const creates = [];
+  const resolves = [];
+  const agents = new Map();
+  const controller = {
+    sessions,
+    creates,
+    resolves,
+    agents,
+    async create(request) {
+      creates.push(request);
+      if (options.failCreate !== undefined) throw options.failCreate;
+      if (typeof request?.workspaceId !== 'string' || request.workspaceId === '') {
+        // `create({ workspaceId })` is the only placement this feature uses; an
+        // ungrouped create is refused by the fake, never quietly accepted.
+        throw Object.assign(new Error('a workspaceId is required'), { code: 'gateway/bad-request' });
+      }
+      const workspace = options.workspaces?.workspaces?.get(request.workspaceId);
+      if (workspace === undefined) {
+        throw Object.assign(new Error('workspace/not-found'), { code: 'workspace/not-found' });
+      }
+      const sessionId = `session-${sessions.size + 1}`;
+      sessions.set(sessionId, {
+        sessionId,
+        workspaceId: request.workspaceId,
+        cwd: workspace.path,
+        preset: request.agentPreset,
+        disposed: false,
+      });
+      workspace.sessionIds.unshift(sessionId);
+      return { sessionId };
+    },
+    async resolveAgent(sessionId) {
+      resolves.push(sessionId);
+      if (typeof options.resumeAgent === 'function') return await options.resumeAgent(sessionId);
+      const record = sessions.get(sessionId);
+      if (record === undefined || record.disposed === true) {
+        return { error: { code: 'session/not-found', message: `session "${sessionId}" not found` } };
+      }
+      if (options.failResolve !== undefined) throw options.failResolve;
+      const existing = agents.get(sessionId);
+      if (existing !== undefined) return { agent: existing };
+      const agent = resolvedAgentFor(record, options.respond === undefined ? {} : { respond: options.respond });
+      agents.set(sessionId, agent);
+      return { agent };
+    },
+  };
+  return controller;
+}
+
+/**
+ * One drivable agent for a placed conversation, shaped like the native Agent the
+ * session controller hands back.
+ *
+ * The real `Agent` interface (see `@deepseek-ai/dsh-agent` `runtime-types`) has
+ * `id`, `session`, a live `ctx: Context` whose `on()` subscribes to
+ * `session/event` and `agent/error`, and the calls the runner drives
+ * (`followup`, `cancel`, `whenIdle`). A fake that omitted `ctx` would model an
+ * Agent the runner CANNOT observe, which is a real refusal the runner states; it
+ * is therefore modelled properly rather than narrowed, so a unit test can drive a
+ * resolved Agent exactly the way a placed worker run does.
+ *
+ * The turn is emitted on prompt delivery (`respond`), mirroring the native loop:
+ * deltas first, then the completed `assistant/message`, then `turn/end`. The reply
+ * source is a shared array, so a `reuse` run visibly continues the SAME
+ * conversation object — the property this whole feature exists for.
+ * @param {object} record - session record from {@link fakeSessionController}.
+ * @param {object} [options] - `respond` plan (see {@link fakeAgents}).
+ * @returns {object} agent with `listeners`, `followups`, `cancels` and `turns`.
+ */
+export function resolvedAgentFor(record, options = {}) {
+  const listeners = [];
+  const agent = {
+    id: record.sessionId,
+    session: { id: record.sessionId, header: { id: record.sessionId, cwd: record.cwd } },
+    listeners,
+    ctx: {
+      on(event, listener) {
+        listeners.push({ event, listener });
+        return () => {
+          const index = listeners.findIndex((entry) => entry.listener === listener);
+          if (index >= 0) listeners.splice(index, 1);
+        };
+      },
+    },
+    followups: [],
+    cancels: [],
+    turns: [],
+    idle: true,
+    idleWaiters: [],
+    followup(message) {
+      agent.followups.push(message);
+      const plan = options.respond;
+      if (plan === undefined) return;
+      agent.turns.push(message);
+      agent.idle = false;
+      emitResolvedTurn(listeners, agent, plan);
+      agent.idle = true;
+      for (const waiter of agent.idleWaiters.splice(0)) waiter();
+    },
+    cancel(cause, cancelOptions) {
+      agent.cancels.push({ cause, options: cancelOptions });
+      agent.idle = true;
+      for (const waiter of agent.idleWaiters.splice(0)) waiter();
+    },
+    async whenIdle() {
+      if (agent.idle) return;
+      await new Promise((resolvePromise) => { agent.idleWaiters.push(resolvePromise); });
+    },
+  };
+  record.agent = agent;
+  return agent;
+}
+
+/**
+ * Emit one scripted turn to a resolved agent's own listeners.
+ *
+ * The event shapes are the native ones: `(session, event)` dispatch for
+ * `session/event`, and `{ error }` for `agent/error`.
+ * @param {object[]} listeners - listeners registered through `agent.ctx.on`.
+ * @param {object} agent - the resolved agent.
+ * @param {object} plan - the `respond` plan.
+ * @returns {void}
+ */
+function emitResolvedTurn(listeners, agent, plan) {
+  const emit = (event) => {
+    for (const entry of listeners) {
+      if (entry.event !== 'session/event') continue;
+      entry.listener({ id: agent.session.id }, event);
+    }
+  };
+  if (plan.reasoning !== undefined) emit({ type: 'reasoning-delta', index: 0, text: plan.reasoning });
+  if (plan.error !== undefined) {
+    for (const entry of listeners) {
+      if (entry.event !== 'agent/error') continue;
+      entry.listener({ error: plan.error });
+    }
+  }
+  if (plan.deltas !== undefined) {
+    for (const [index, text] of plan.deltas.entries()) emit({ type: 'text-delta', index, text });
+  }
+  if (plan.text !== undefined) {
+    emit({
+      type: 'assistant/message',
+      data: {
+        message: { content: [{ type: 'text', text: plan.text }] },
+        ...(plan.usage === undefined ? {} : { usage: plan.usage }),
+      },
+    });
+  }
+  if (plan.reasoningBlock !== undefined) {
+    emit({
+      type: 'assistant/message',
+      data: {
+        message: { content: [{ type: 'reasoning', text: plan.reasoningBlock }] },
+        ...(plan.usage === undefined ? {} : { usage: plan.usage }),
+      },
+    });
+  }
+  if (plan.extraDeltas !== undefined) {
+    for (const [index, text] of plan.extraDeltas.entries()) emit({ type: 'text-delta', index, text });
+  }
+  emit({
+    type: 'turn/end',
+    data: { reason: { kind: plan.reason ?? (plan.error === undefined ? 'completed' : 'error') } },
+  });
+}
+
+/** @param {string} value - path @returns {string} case-folded identity of a directory. */
+function pathKeyOf(value) {
+  const stripped = value.replace(/[\\/]+$/, '');
+  return process.platform === 'win32' ? stripped.toLowerCase() : stripped;
+}
+
+/**
  * A representative valid settings document for tests.
  * @param {object} [overrides] - shallow merges for the worker/review blocks.
  * @returns {object} settings document.
@@ -597,6 +847,10 @@ export function validSettings(overrides = {}) {
     },
     authorization: { taskGrantTtlSeconds: 900, sessionGrantTtlSeconds: 3600 },
     projectOverrides: overrides.projectOverrides ?? {},
+    // Omitted unless a test asks for it, so the "document written before this
+    // field existed" case is what a plain fixture models — and validation has to
+    // fill in the default.
+    ...(overrides.conversation === undefined ? {} : { conversation: overrides.conversation }),
   };
 }
 

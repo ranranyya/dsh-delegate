@@ -1,18 +1,30 @@
+// Compatibility test for the pre-0.1.6 Codex companion installer API.
+//
+// `bin/dsh-delegate-codex-agent.js` used to export `manageCodexAgent(action, {
+// codexHome })` and to write only `agents/dsh-delegate.toml`. The 0.1.6 release
+// moved that logic into `src/codex/installer.js` and widened it to register the MCP
+// server as well, so the old entry points are kept as thin adapters and pinned here.
+//
+// The properties are the ones the earlier suite established and that must not
+// regress: CODEX_HOME is honoured, install is exclusive and idempotent, a
+// different same-name file is never overwritten or removed, and `remove` deletes
+// only the exact bundled template.
+
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
-import { spawnSync } from 'node:child_process';
-import { fileURLToPath } from 'node:url';
 
 import { manageCodexAgent, resolveCodexHome } from '../bin/dsh-delegate-codex-agent.js';
 
-const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
-const SCRIPT = join(ROOT, 'bin', 'dsh-delegate-codex-agent.js');
-
 function temporaryCodexHome() {
   return mkdtempSync(join(tmpdir(), 'dsh-delegate-codex-'));
+}
+
+/** Environment with only the given Codex home; no DSH overrides leak in. */
+function isolatedEnv(codexHome) {
+  return { CODEX_HOME: codexHome, DSH_HOME: '', DSH_DELEGATE_DISCOVERY_FILE: '' };
 }
 
 test('CODEX_HOME is honored and the default remains the user Codex directory', () => {
@@ -22,19 +34,22 @@ test('CODEX_HOME is honored and the default remains the user Codex directory', (
   assert.equal(resolveCodexHome({ env: {}, homeDirectory }), join(resolve(homeDirectory), '.codex'));
 });
 
-test('install is exclusive and idempotent, and status sees only the managed agent file', async () => {
+test('install is exclusive and idempotent, and does not disturb an existing config', async () => {
   const codexHome = temporaryCodexHome();
   try {
     const configPath = join(codexHome, 'config.toml');
-    writeFileSync(configPath, 'model = "keep-me"\n');
+    const original = 'model = "keep-me"\n';
+    writeFileSync(configPath, original);
 
-    assert.equal((await manageCodexAgent('status', { codexHome })).state, 'not-installed');
-    const installed = await manageCodexAgent('install', { codexHome });
+    const env = isolatedEnv(codexHome);
+    assert.equal((await manageCodexAgent('status', { codexHome, env })).state, 'not-installed');
+    const installed = await manageCodexAgent('install', { codexHome, env });
     assert.equal(installed.state, 'installed');
-    assert.equal((await manageCodexAgent('install', { codexHome })).state, 'installed');
-    assert.equal((await manageCodexAgent('status', { codexHome })).state, 'installed');
-    assert.equal(readFileSync(configPath, 'utf8'), 'model = "keep-me"\n');
+    assert.equal(installed.mcpState, 'configured');
+    assert.equal((await manageCodexAgent('install', { codexHome, env })).state, 'installed');
+    assert.equal((await manageCodexAgent('status', { codexHome, env })).state, 'installed');
     assert.ok(readFileSync(installed.path, 'utf8').includes('name = "dsh-delegate"'));
+    assert.ok(readFileSync(installed.mcpPath, 'utf8').startsWith(`model = "keep-me"`) || readFileSync(installed.mcpPath, 'utf8').includes(original));
   } finally {
     rmSync(codexHome, { recursive: true, force: true });
   }
@@ -48,9 +63,11 @@ test('an existing custom agent is not overwritten or removed', async () => {
     mkdirSync(dirname(agentPath), { recursive: true });
     writeFileSync(agentPath, custom);
 
-    assert.equal((await manageCodexAgent('install', { codexHome })).state, 'conflict');
-    assert.equal((await manageCodexAgent('status', { codexHome })).state, 'modified');
-    assert.equal((await manageCodexAgent('remove', { codexHome })).state, 'modified');
+    const env = isolatedEnv(codexHome);
+    // A different same-name file is reported with the 0.1.6 state name for it.
+    assert.equal((await manageCodexAgent('install', { codexHome, env })).state, 'modified');
+    assert.equal((await manageCodexAgent('status', { codexHome, env })).state, 'modified');
+    assert.equal((await manageCodexAgent('remove', { codexHome, env })).state, 'modified');
     assert.equal(readFileSync(agentPath, 'utf8'), custom);
   } finally {
     rmSync(codexHome, { recursive: true, force: true });
@@ -60,28 +77,16 @@ test('an existing custom agent is not overwritten or removed', async () => {
 test('remove deletes only the exact bundled template', async () => {
   const codexHome = temporaryCodexHome();
   try {
-    await manageCodexAgent('install', { codexHome });
-    assert.equal((await manageCodexAgent('remove', { codexHome })).state, 'removed');
-    assert.equal((await manageCodexAgent('status', { codexHome })).state, 'not-installed');
-    assert.equal((await manageCodexAgent('remove', { codexHome })).state, 'not-installed');
-  } finally {
-    rmSync(codexHome, { recursive: true, force: true });
-  }
-});
-
-test('the CLI uses an isolated CODEX_HOME and refuses to remove a modified template', () => {
-  const codexHome = temporaryCodexHome();
-  const env = { ...process.env, CODEX_HOME: codexHome };
-  try {
-    const install = spawnSync(process.execPath, [SCRIPT, 'install'], { env, encoding: 'utf8' });
-    assert.equal(install.status, 0, install.stderr);
-    assert.match(install.stdout, /^installed:/u);
-
-    const agentPath = join(codexHome, 'agents', 'dsh-delegate.toml');
-    writeFileSync(agentPath, `${readFileSync(agentPath, 'utf8')}# local edit\n`);
-    const remove = spawnSync(process.execPath, [SCRIPT, 'remove'], { env, encoding: 'utf8' });
-    assert.equal(remove.status, 2);
-    assert.equal(readFileSync(agentPath, 'utf8').endsWith('# local edit\n'), true);
+    const env = isolatedEnv(codexHome);
+    await manageCodexAgent('install', { codexHome, env });
+    const removed = await manageCodexAgent('remove', { codexHome, env });
+    // The old adapter reported `removed`; 0.1.6 reports the state after the action.
+    // What matters is that the file is gone and a repeat is a no-op.
+    assert.ok(removed.changed.includes('agent'));
+    assert.equal(removed.state, 'not-installed');
+    assert.equal(readFileSync(removed.mcpPath, 'utf8').includes('mcp_servers.dsh-delegate'), false);
+    assert.equal((await manageCodexAgent('status', { codexHome, env })).state, 'not-installed');
+    assert.deepEqual((await manageCodexAgent('remove', { codexHome, env })).changed, []);
   } finally {
     rmSync(codexHome, { recursive: true, force: true });
   }

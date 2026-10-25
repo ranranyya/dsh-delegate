@@ -23,7 +23,7 @@ import { randomUUID } from 'node:crypto';
 import { lstat, mkdir, realpath } from 'node:fs/promises';
 import { isAbsolute, join, resolve } from 'node:path';
 
-import { AUDIT_CODES, AUDIT_LIMITS, AuditError, probeRepository, readStatus } from './audit.js';
+import { AUDIT_CODES, AUDIT_LIMITS, AuditError, probeRepository, readRepositoryTopLevel, readStatus } from './audit.js';
 import { isInside } from './locks.js';
 
 /** Worktree refusal codes. Each is a refusal, never a silent fallback. */
@@ -200,24 +200,30 @@ export class WorktreeManager {
         cause: error?.code ?? null,
       });
     });
+    // Containment is decided against the repository's canonical top level, not
+    // against the supplied path. A supplied path may be a directory *inside* the
+    // repository, and a tree root that sits elsewhere in that same repository is
+    // exactly as unsafe as one under the subdirectory: either way the agent's
+    // checkout would land inside the user's repository.
+    const repositoryRoot = await this.resolveRepositoryRoot(sourcePath, taskId);
     const declaredRoot = this.rootDir;
     // A tree inside the source checkout would put agent writes back into the
     // user's working directory and make `git status` ambiguous. Both the
     // declared root and its resolved path are checked, because the root may be
     // reached through a symlink that only applies after it exists.
-    if (isInside(sourcePath, declaredRoot)) {
+    if (isInside(repositoryRoot, declaredRoot)) {
       throw new WorktreeError(
         WORKTREE_CODES.nestedDestination,
         'the worktree root is inside the source repository; choose a root outside it',
-        { rootDir: declaredRoot, sourcePath },
+        { rootDir: declaredRoot, sourcePath, repositoryRoot },
       );
     }
     const root = await this.ensureRoot();
-    if (isInside(sourcePath, root)) {
+    if (isInside(repositoryRoot, root)) {
       throw new WorktreeError(
         WORKTREE_CODES.nestedDestination,
         'the worktree root is inside the source repository; choose a root outside it',
-        { rootDir: root, sourcePath },
+        { rootDir: root, sourcePath, repositoryRoot },
       );
     }
 
@@ -225,7 +231,7 @@ export class WorktreeManager {
     const dirty = await this.assertClean(sourcePath, taskId);
     this.throwIfAborted(signal, { taskId, phase: 'before-create' });
 
-    const workspacePath = await this.claimDestination(root, segment, taskId, sourcePath);
+    const workspacePath = await this.claimDestination(root, segment, taskId, sourcePath, repositoryRoot);
     this.throwIfAborted(signal, { taskId, phase: 'before-create' });
 
     // `--detach` binds the tree to a commit, not a branch: nothing the run does
@@ -275,6 +281,41 @@ export class WorktreeManager {
     }
 
     return this.view(record);
+  }
+
+  /**
+   * Measure the canonical top level of the source repository.
+   *
+   * This runs before anything is created, and it is the value every containment
+   * check below compares against: the supplied `sourcePath` may be a directory
+   * inside the repository, so using it as the boundary would let a root located
+   * elsewhere in the same repository pass as "outside the source".
+   * @param {string} sourcePath - resolved source path.
+   * @param {string} taskId - task id, for details.
+   * @returns {Promise<string>} resolved top-level directory.
+   */
+  async resolveRepositoryRoot(sourcePath, taskId) {
+    let topLevel;
+    try {
+      topLevel = await readRepositoryTopLevel(this.deps.runGit, sourcePath);
+    } catch (error) {
+      if (error instanceof AuditError && error.code === AUDIT_CODES.gitUnavailable) {
+        throw new WorktreeError(WORKTREE_CODES.gitUnavailable, 'worktree isolation requires git in this environment', {
+          taskId,
+          cause: error?.details?.cause ?? null,
+        });
+      }
+      throw error;
+    }
+    if (typeof topLevel !== 'string' || topLevel.trim() === '') {
+      throw new WorktreeError(WORKTREE_CODES.notRepository, 'worktree isolation requires a git work tree', { taskId });
+    }
+    return await realpath(topLevel).catch((error) => {
+      throw new WorktreeError(WORKTREE_CODES.notRepository, 'the repository root could not be resolved', {
+        taskId,
+        cause: error?.code ?? null,
+      });
+    });
   }
 
   /**
@@ -346,10 +387,11 @@ export class WorktreeManager {
    * @param {string} root - resolved root directory.
    * @param {string} segment - safe task segment.
    * @param {string} taskId - task id, for details.
-   * @param {string} sourcePath - resolved source repository.
+   * @param {string} sourcePath - resolved source path named by the caller.
+   * @param {string} repositoryRoot - resolved top level of the source repository.
    * @returns {Promise<string>} unused absolute destination path.
    */
-  async claimDestination(root, segment, taskId, sourcePath) {
+  async claimDestination(root, segment, taskId, sourcePath, repositoryRoot) {
     const suffix = String(this.randomId() ?? '').replace(/[^A-Za-z0-9]/g, '').slice(0, 12) || randomUUID().slice(0, 8);
     const workspacePath = join(root, `${segment}-${suffix}`);
     // The generated name must remain inside the root; a task id that survives
@@ -357,11 +399,15 @@ export class WorktreeManager {
     if (!isInside(root, workspacePath)) {
       throw new WorktreeError(WORKTREE_CODES.pathEscape, 'the worktree path escaped the plugin root', { taskId });
     }
-    if (isInside(sourcePath, workspacePath) || workspacePath === sourcePath) {
+    // Containment is against the repository root, not only the supplied path: a
+    // destination elsewhere in the same repository is just as much inside the
+    // user's checkout as one under a supplied subdirectory.
+    const boundary = typeof repositoryRoot === 'string' && repositoryRoot !== '' ? repositoryRoot : sourcePath;
+    if (isInside(boundary, workspacePath) || isInside(sourcePath, workspacePath) || workspacePath === sourcePath) {
       throw new WorktreeError(
         WORKTREE_CODES.nestedDestination,
         'the worktree destination would be inside the source repository',
-        { taskId, workspacePath, sourcePath },
+        { taskId, workspacePath, sourcePath, repositoryRoot: boundary },
       );
     }
     if (await pathExists(workspacePath)) {

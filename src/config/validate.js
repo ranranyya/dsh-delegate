@@ -9,6 +9,8 @@
 import { posix, win32 } from 'node:path';
 
 import {
+  CONVERSATION_MODES,
+  DEFAULT_CONVERSATION_MODE,
   DEFAULT_ISOLATION,
   EFFORT_ORDER,
   ISOLATION_MODES,
@@ -512,6 +514,38 @@ export function validateProjectOverride(value, providers) {
 }
 
 /**
+ * Validate the conversation block.
+ *
+ * The mode is a closed vocabulary with one documented default. An absent block
+ * (every document written before this field existed) resolves to `new`; an
+ * unrecognized value is refused rather than mapped onto a default, because
+ * "resume the previous conversation" is exactly the kind of behaviour an
+ * operator must not get by accident.
+ * @param {unknown} value - candidate conversation block.
+ * @returns {{ mode: string }} normalized block.
+ */
+export function validateConversationSettings(value) {
+  const source = value ?? {};
+  if (typeof source !== 'object' || Array.isArray(source)) {
+    throw new ConfigError('CONVERSATION_INVALID', 'conversation settings must be an object', {});
+  }
+  const mode = requireString(
+    source.mode ?? DEFAULT_CONVERSATION_MODE,
+    'CONVERSATION_MODE_UNSUPPORTED',
+    'conversation.mode',
+    { max: 16 },
+  );
+  if (!CONVERSATION_MODES.includes(mode)) {
+    throw new ConfigError('CONVERSATION_MODE_UNSUPPORTED', `conversation mode ${mode} is not supported`, {
+      field: 'conversation.mode',
+      mode,
+      supported: [...CONVERSATION_MODES],
+    });
+  }
+  return { mode };
+}
+
+/**
  * Validate the project-override map, canonicalizing every key.
  *
  * Two spellings of one project (`C:/work/p` and `c:\WORK\p`) would otherwise be
@@ -647,5 +681,6 @@ export function validateSettings(value, options = {}) {
     authorization: validateAuthorizationSettings(value.authorization),
     projectOverrides: validateProjectOverrides(value.projectOverrides, providers),
     presets: validatePresets(value.presets, providers),
+    conversation: validateConversationSettings(value.conversation),
   };
 }

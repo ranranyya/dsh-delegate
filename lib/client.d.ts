@@ -71,6 +71,42 @@ export declare const documentFromDraft: (...args: unknown[]) => unknown;
 export declare const describeError: (...args: unknown[]) => string;
 export declare const exportDocument: (...args: unknown[]) => unknown;
 
+/**
+ * Actions the Codex panel may send. `status` is absent on purpose: the page reads
+ * that state through a `GET`, so only a real change is ever a `POST`.
+ */
+export declare const CODEX_ACTIONS: readonly ['install', 'repair', 'remove'];
+
+/** The user-plane path the Codex panel uses (`GET` diagnoses, `POST` acts). */
+export declare const ROUTES: Readonly<Record<string, string>> & { codex: '/api/dsh-delegate/codex' };
+
+/**
+ * One target's presentation state: agent file, MCP entry or DSH switch.
+ *
+ * The three are reported separately because they are independent: an installed
+ * agent does not imply a configured MCP entry, and neither implies that the DSH
+ * local-call switch is on.
+ */
+export interface DelegateCodexTargetView {
+  key: 'agent' | 'mcp' | 'switch';
+  label: string;
+  state: string;
+  tone: 'on' | 'off' | 'warn';
+  detail: string;
+  path?: string;
+  paths?: string[];
+}
+
+/** Map a served Codex status document onto one target's presentation state. */
+export declare function codexTargetView(
+  codex: unknown,
+  switchState: unknown,
+  target: 'agent' | 'mcp' | 'switch',
+): DelegateCodexTargetView;
+
+/** Chinese one-line summary of an action outcome (`changed` / `refused`). */
+export declare function describeCodexOutcome(outcome: unknown): string;
+
 /** Shape the registration factory returns as `module.exports`. */
 export interface DelegateClientModule {
   PLUGIN_CONFIG_SLOT: typeof PLUGIN_CONFIG_SLOT;

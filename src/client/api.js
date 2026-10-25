@@ -57,6 +57,8 @@ export const ROUTES = Object.freeze({
   credentialsSet: `${USER_PLANE_PREFIX}/credentials/set`,
   credentialsUnset: `${USER_PLANE_PREFIX}/credentials/unset`,
   connectivity: `${USER_PLANE_PREFIX}/connectivity`,
+  // One path, two methods: `GET` diagnoses, `POST` performs one explicit action.
+  codex: `${USER_PLANE_PREFIX}/codex`,
 });
 
 /** A refusal or transport failure carrying the contract's stable code. */
@@ -301,6 +303,24 @@ export function createApi(options = {}) {
     async checkConnectivity(body) {
       return await request('POST', ROUTES.connectivity, body);
     },
+    /**
+     * Diagnose the Codex integration. Read-only on the host.
+     * @returns {Promise<object>} `{ codex, switch }`.
+     */
+    async getCodexStatus() {
+      return await request('GET', ROUTES.codex);
+    },
+    /**
+     * Perform one explicit Codex action.
+     *
+     * Only an operator click reaches this: there is no load-time or save-time
+     * caller, so visiting the page never writes into the Codex home.
+     * @param {'install'|'repair'|'remove'} action - the action to perform.
+     * @returns {Promise<object>} `{ action, changed, refused, codex, switch }`.
+     */
+    async runCodexAction(action) {
+      return await request('POST', ROUTES.codex, { action });
+    },
   };
 }
 
@@ -339,6 +359,46 @@ export const ISOLATION_LABELS = Object.freeze({
   worktree: '独立工作树（临时 git worktree，不碰当前检出）',
   shared: '共享工作区（直接修改所选目录）',
 });
+
+/**
+ * Conversation modes, mirroring the host's `CONVERSATION_MODES`.
+ *
+ * `new` is first because it is the default and the safe one: every task gets its
+ * own DSH conversation in the Workspace for its execution directory. `reuse` is
+ * an explicit opt-in that continues the most recent recorded conversation for
+ * that SAME directory — never across directories, so two isolated worktrees stay
+ * two conversations even when they were forked from one repository.
+ */
+export const CONVERSATION_MODES = Object.freeze(['new', 'reuse']);
+
+/** Chinese labels for conversation modes. */
+export const CONVERSATION_LABELS = Object.freeze({
+  new: '每个任务新开对话（默认）',
+  reuse: '复用同一执行目录最近的对话',
+});
+
+/**
+ * The conversation block a draft/request should carry.
+ *
+ * The page must round-trip this value on save: it is what makes "reuse" persist
+ * instead of silently reverting to the default on the next reload. An absent or
+ * unknown mode resolves to the default rather than being invented.
+ * @param {object} [draft] - editable document.
+ * @returns {{ mode: string }} conversation block.
+ */
+export function conversationOf(draft) {
+  const requested = draft?.conversation?.mode;
+  return { mode: CONVERSATION_MODES.includes(requested) ? requested : CONVERSATION_MODES[0] };
+}
+
+/**
+ * Chinese label for one conversation mode.
+ * @param {string} mode - mode id.
+ * @returns {string} label, falling back to the raw id.
+ */
+export function conversationModeLabel(mode) {
+  return CONVERSATION_LABELS[mode] ?? String(mode ?? '未设置');
+}
 
 /** Grant scopes. */
 export const GRANT_KINDS = Object.freeze(['task', 'session']);
@@ -402,6 +462,110 @@ export const LIMITS = Object.freeze({
   providers: 32,
 });
 
+/**
+ * Actions the Codex panel may send.
+ *
+ * `status` is deliberately absent: it is a `GET`, so a page that only renders the
+ * panel can never be mistaken for one that changes files.
+ */
+export const CODEX_ACTIONS = Object.freeze(['install', 'repair', 'remove']);
+
+/**
+ * The three states the panel reports separately.
+ *
+ * They are independent on purpose: an agent can be installed while MCP is not
+ * configured, and both can be ready while the local-call switch is still off.
+ */
+export const CODEX_TARGETS = Object.freeze([
+  { key: 'agent', label: 'Codex 子智能体文件' },
+  { key: 'mcp', label: 'Codex MCP 条目' },
+  { key: 'switch', label: 'DSH 本机调用开关' },
+]);
+
+/** Chinese labels for the managed-file states the host reports. */
+export const CODEX_STATE_LABELS = Object.freeze({
+  'not-installed': '未安装',
+  installed: '已安装',
+  outdated: '旧版本，可更新',
+  modified: '已被你修改（插件不会改动）',
+  conflict: '存在冲突（插件不会改动）',
+  'not-configured': '未配置',
+  configured: '已配置',
+  unreadable: '无法读取（不会写入）',
+});
+
+/**
+ * Read one target's status out of a served Codex document, in the panel's terms.
+ *
+ * Kept as a pure function so the UI and its tests agree on exactly one mapping,
+ * and so an older/newer host that omits a block yields "未知" instead of a crash.
+ * @param {object | null} codex - served `codex` document.
+ * @param {object | null} switchState - served `switch` block, when present.
+ * @param {'agent'|'mcp'|'switch'} target - which state to describe.
+ * @returns {{ key: string, label: string, state: string, tone: string, detail: string }} description.
+ */
+export function codexTargetView(codex, switchState, target) {
+  const label = CODEX_TARGETS.find((entry) => entry.key === target)?.label ?? target;
+  if (target === 'switch') {
+    const authorized = switchState?.authorized === true;
+    return {
+      key: 'switch',
+      label,
+      state: authorized ? 'on' : 'off',
+      tone: authorized ? 'on' : 'off',
+      detail: authorized
+        ? '已开启：Codex 可以通过 MCP 提交任务。'
+        : '已关闭：Codex 可以查询状态，但新任务会被拒绝；本页不会替你打开它。',
+    };
+  }
+  const block = target === 'agent' ? codex?.agent : codex?.mcp;
+  if (block === null || block === undefined || typeof block !== 'object') {
+    return { key: target, label, state: 'unknown', tone: 'off', detail: '宿主尚未回报该状态。' };
+  }
+  const state = String(block.state ?? 'unknown');
+  const done = target === 'agent' ? block.installed === true : block.configured === true;
+  const detailParts = [];
+  if (typeof block.path === 'string' && block.path !== '') detailParts.push(block.path);
+  if (target === 'mcp' && typeof block.script === 'string' && block.script !== '') {
+    detailParts.push(`入口：${block.script}`);
+  }
+  // The executable Codex will launch. `node === null` means this host could not prove
+  // one — a desktop application executable is never used and a bare `node` is never
+  // written — so the row states the missing fact instead of showing a blank.
+  if (target === 'mcp') {
+    if (typeof block.node === 'string' && block.node !== '') detailParts.push(`Node：${block.node}`);
+    else if (block.nodeResolved === false) detailParts.push('Node：未确定（不会写入桌面应用自身的 exe）');
+  }
+  return {
+    key: target,
+    label,
+    state,
+    tone: done ? 'on' : (state === 'conflict' || state === 'unreadable' || state === 'modified') ? 'warn' : 'off',
+    detail: CODEX_STATE_LABELS[state] ?? state,
+    path: typeof block.path === 'string' ? block.path : '',
+    paths: detailParts,
+  };
+}
+
+/**
+ * One-line summary of an action outcome, for the notice strip.
+ * @param {object | null} outcome - `{ action, changed, refused }` from the host.
+ * @returns {string} Chinese summary; empty when there was no action.
+ */
+export function describeCodexOutcome(outcome) {
+  if (outcome === null || outcome === undefined) return '';
+  const names = { agent: '子智能体文件', mcp: 'MCP 条目' };
+  const changed = Array.isArray(outcome.changed) ? outcome.changed.map((key) => names[key] ?? key) : [];
+  const refused = Array.isArray(outcome.refused) ? outcome.refused : [];
+  const parts = [];
+  if (changed.length > 0) parts.push(`已写入：${changed.join('、')}`);
+  if (refused.length > 0) parts.push(`未改动：${refused.map((entry) => names[entry?.target] ?? entry?.target ?? '未知').join('、')}`);
+  if (parts.length === 0) {
+    return outcome.action === 'remove' ? '没有需要移除的插件托管文件。' : '已是最新，没有需要写入的内容。';
+  }
+  return parts.join('；') + '。';
+}
+
 /** Provider protocols this stage supports. */
 export const SUPPORTED_PROTOCOLS = Object.freeze(['openai-chat']);
 
@@ -435,6 +599,10 @@ export function defaultDraft() {
     authorization: { taskGrantTtlSeconds: 900, sessionGrantTtlSeconds: 14400 },
     projectOverrides: {},
     presets: [],
+    // What a run does with its DSH conversation. `new` is the default, and it is
+    // present in the draft so the control round-trips instead of being dropped on
+    // save and silently reverting on the next load.
+    conversation: { mode: CONVERSATION_MODES[0] },
   };
 }
 
@@ -480,6 +648,10 @@ export function draftFromSettings(document) {
         review: preset.review === null || preset.review === undefined ? null : { ...preset.review },
       }))
       : [],
+    // Read back through the same resolver the save path uses, so a document with
+    // an absent block (every document written before this field existed) opens as
+    // the default and a document with `reuse` opens as `reuse`.
+    conversation: conversationOf(source),
   };
 }
 
@@ -518,6 +690,10 @@ export function documentFromDraft(draft) {
       ...(preset.worker === null ? {} : { worker: { ...preset.worker } }),
       ...(preset.review === null ? {} : { review: { ...preset.review } }),
     })),
+    // Sent explicitly on every save. The host defaults an absent block to `new`,
+    // so omitting it would be safe but would also silently discard an operator's
+    // choice of `reuse` on the next write.
+    conversation: conversationOf(source),
   };
 }
 
@@ -903,6 +1079,12 @@ export function createStore(options = {}) {
     tokenConnectionId: null,
     credentials: {},
     connectivity: {},
+    // Codex integration. `codex` holds the last served status document,
+    // `codexError` its last refusal, `codexOutcome` the last action's result. None
+    // of them is a credential: the status document is a file/config diagnosis.
+    codex: null,
+    codexError: null,
+    codexOutcome: null,
   };
   /** @type {Set<() => void>} */
   const listeners = new Set();
@@ -1468,6 +1650,66 @@ export function createStore(options = {}) {
       });
     },
 
+    /**
+     * Read the Codex integration status. Read-only: this is what `init()` calls,
+     * so opening the page never writes to the Codex home.
+     */
+    async refreshCodexStatus() {
+      return await track('codexStatus', async () => {
+        try {
+          const body = await api.getCodexStatus();
+          patch({ codex: body.codex ?? null, codexError: null });
+          return { ok: true, codex: body.codex ?? null, switch: body.switch ?? null };
+        } catch (error) {
+          // A host that predates this route answers 404: that is "not served
+          // here", not "Codex is not installed", so it is shown as unavailable.
+          const unavailable = error?.code === 'HTTP_404' || error?.code === 'USER_PLANE_UNKNOWN_ROUTE';
+          patch({
+            codex: null,
+            codexError: unavailable
+              ? '当前宿主未提供 Codex 集成接口（插件版本可能较旧）。'
+              : describeError(error),
+          });
+          return { ok: false, error };
+        }
+      });
+    },
+
+    /**
+     * Perform one explicit Codex action and keep its outcome.
+     *
+     * This is only reachable from a button click: nothing calls it from `init()`,
+     * from `saveSettings()` or from a render pass. Installed files are therefore
+     * always the result of an operator decision.
+     * @param {'install'|'repair'|'remove'} action - action to perform.
+     */
+    async runCodexAction(action) {
+      if (!CODEX_ACTIONS.includes(action)) {
+        notify('error', `未知的 Codex 操作：${String(action)}`);
+        return { ok: false };
+      }
+      return await track('codexAction', async () => {
+        try {
+          const body = await api.runCodexAction(action);
+          const outcome = {
+            action: body.action ?? action,
+            changed: Array.isArray(body.changed) ? body.changed : [],
+            refused: Array.isArray(body.refused) ? body.refused : [],
+          };
+          const codex = body.codex ?? state.codex;
+          patch({ codex, codexError: null, codexOutcome: outcome });
+          const summary = describeCodexOutcome(outcome);
+          const failed = outcome.refused.length > 0;
+          notify(failed ? 'error' : 'success', summary === '' ? '操作完成。' : summary);
+          return { ok: !failed, outcome, codex };
+        } catch (error) {
+          patch({ codexOutcome: null });
+          notify('error', describeError(error));
+          return { ok: false, error };
+        }
+      });
+    },
+
     /** Read the task list. */
     async loadTasks() {
       return await track('tasks', async () => {
@@ -1523,6 +1765,9 @@ export function createStore(options = {}) {
     /** Load everything the page needs; the catalog is loaded but not awaited. */
     async init() {
       await Promise.all([store.refreshStatus(), store.loadSettings(), store.loadNativeProviders(), store.loadTasks()]);
+      // Diagnostic read only. `init` must never perform a Codex write: installing
+      // files is an explicit operator action, not a side effect of opening a page.
+      void store.refreshCodexStatus();
       void store.loadCatalog();
     },
 

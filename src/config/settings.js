@@ -28,6 +28,7 @@ import { JsonDocument, deepFreeze } from './store.js';
 import {
   ConfigError,
   canonicalProjectKey,
+  validateConversationSettings,
   validateJobOverrides,
   validateProjectOverride,
   validateProviderProfile,
@@ -150,6 +151,10 @@ export function resolveEffectiveConfig(settings, { projectPath = null, overrides
       reasoningEffort: effectiveReview.reasoningEffort ?? null,
       providerRoute: effectiveReview.providerId ?? null,
     },
+    // What this task does with its DSH conversation. Frozen here with the rest of
+    // the snapshot, so a settings edit mid-run cannot change whether a task
+    // continues a previous conversation.
+    conversation: { ...validateConversationSettings(settings.conversation) },
     provenance: {
       // Canonical, not the caller's spelling: a recorded snapshot must compare
       // equal to the key its override is stored under.
@@ -217,6 +222,10 @@ export function publicSettings(settings) {
     authorization: { ...settings.authorization },
     projectOverrides: structuredClone(settings.projectOverrides ?? {}),
     presets: presets.map(publicPreset),
+    // Whether a run starts a fresh DSH conversation or resumes the last one for
+    // its execution directory. Nonsecret, and part of the export for the same
+    // reason: a restored configuration should keep the operator's choice.
+    conversation: { ...validateConversationSettings(settings.conversation) },
   });
 }
 
@@ -399,6 +408,23 @@ export class SettingsService {
       const previous = await this.snapshot();
       const worker = validateWorkerSettings(candidate, previous.providers);
       return await this.persistWithinQueue({ ...previous, worker }, previous);
+    });
+  }
+
+  /**
+   * Replace the conversation block (what a run does with its DSH session).
+   *
+   * Queued like every other mutation, and validated through the shared
+   * conversation validator so a value this build does not implement is refused
+   * instead of being stored and interpreted later.
+   * @param {unknown} candidate - candidate conversation block, e.g. `{ mode: 'reuse' }`.
+   * @returns {Promise<object>} committed settings.
+   */
+  async setConversation(candidate) {
+    const conversation = validateConversationSettings(candidate);
+    return await this.serialize(async () => {
+      const previous = await this.snapshot();
+      return await this.persistWithinQueue({ ...previous, conversation }, previous);
     });
   }
 

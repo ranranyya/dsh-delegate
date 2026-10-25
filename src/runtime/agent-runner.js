@@ -31,11 +31,18 @@ import { createUserMessage } from '@deepseek-ai/dsh-llm';
 import { installModelSelection } from '@deepseek-ai/dsh-agent';
 import { diagnostic, redactText } from '../config/redact.js';
 import { LIMITS } from '../config/defaults.js';
+import { placeSession, SessionPlacementError as SessionPlacementRefusal } from './session-placement.js';
 
 // Re-exported for the callers that already reach it through this module. The
 // implementation lives in `config/redact.js` so a harness-independent consumer
 // (the stdio MCP executable) can use it without importing the DSH peers above.
 export { diagnostic };
+
+/**
+ * Pass-through re-export so the engine can map every placement refusal without
+ * importing the placement module as well.
+ */
+export { SessionPlacementRefusal };
 
 /** Execution outcome kinds. A job never reports "approved"; that is the host's call. */
 export const RUN_OUTCOMES = Object.freeze({
@@ -154,12 +161,112 @@ export function userMessage(text) {
 /**
  * Drive one native agent to completion under a timeout and a cancellation latch.
  *
- * @param {object} deps - `agents` (native agent registry) and optional `sessions` and `logger`.
- * @param {object} request - `prompt`, `sessionId`, `cwd`, `selection`, `timeoutMs`, `signal`,
- *   `onEvent`, and the optional preset selection (`presetId`, `presetOwnership`).
- * @returns {Promise<object>} run result with text, usage facts and lifecycle evidence.
+ * Two ways a run can obtain its agent, and both produce the same evidence:
+ *
+ *  * a Workspace PLACEMENT (`request.placement`, or one resolved from the native
+ *    controllers when the caller did not supply it): the DSH Session already exists
+ *    in its Workspace, so the run drives the live Agent resolved for it. A reused
+ *    conversation arrives this way, and so does a freshly created Session —
+ *    resolving it is what attaches the native Agent to the Workspace the Session
+ *    was created in.
+ *  * no placement: the historical path, which creates a Session (and Agent) through
+ *    `agents.create` under a caller-supplied or generated identity. Retained for a
+ *    caller that owns its own conversation identity — the additional review, which
+ *    composes its own preset and must not join the operator's history.
+ *
+ * The runner never disposes an agent it resolved. Disposal is what makes a Session
+ * non-resumable for the next `reuse` run, so {@link driveAgent} accepts an
+ * inherited `disposeOwned` and this entry point sets it only for agents it created.
+ *
+ * Cancellation is decided before anything is created: a run whose signal is
+ * already aborted takes the unplaced path and returns `cancelled` without creating
+ * a Workspace, a Session or an Agent, so an operator never finds an empty group
+ * left behind by a run that never started.
+ * @param {object} deps - `agents` (native agent registry), `agentPresets`, optional
+ *   `workspaces`/`sessionController` for workspace-grouped placement, the native
+ *   `sessions` persistence service (flush only), and `logger`.
+ * @param {object} request - `prompt`, `cwd`, `selection`, `timeoutMs`, `signal`,
+ *   `onEvent`, the optional preset selection (`presetId`, `presetOwnership`), and the
+ *   optional `placement` / `conversationMode` / `allowUnplaced`.
+ * @returns {Promise<object>} run result with text, usage facts, the `conversation`
+ *   placement fact and lifecycle evidence.
  */
 export async function runAgent(deps, request) {
+  const agents = deps?.agents;
+  if (agents === undefined || agents === null || typeof agents.create !== 'function') {
+    throw new RunError(RUN_CODES.agentsUnavailable, 'the native agent registry is not available', {});
+  }
+  // A run whose cancellation is already known must not place anything: creating a
+  // Workspace (and then a Session inside it) for a run that will never deliver a
+  // prompt leaves the operator an empty group and an empty conversation. The
+  // latch below re-checks at the exact step that creates anything; this check
+  // exists so the placement call is never even entered.
+  if (request?.signal?.aborted === true) {
+    return await driveAgent(deps, {
+      ...request,
+      placement: request?.placement ?? null,
+      // Nothing was created by this run, so there is nothing to dispose — and even
+      // a later-arriving resolved Agent is not ours to end.
+      disposeOwned: false,
+    });
+  }
+  // A caller that brings its own conversation identity decides its own placement.
+  // One that does not is placed through the native controllers, and an unavailable
+  // controller is a refusal — never an ungrouped run.
+  const placement = request?.placement !== undefined
+    ? request.placement
+    : await resolvePlacement(deps, request);
+  const owned = request?.placement !== undefined || request?.allowUnplaced === true;
+  return await driveAgent(deps, {
+    ...request,
+    placement,
+    // Only an Agent this run created is owned by it. Both conversation modes now
+    // drive a RESOLVED Agent (a new Session is resolved to its Agent too), and a
+    // resolved Agent belongs to its Session: disposing it would end the
+    // conversation and make the next `reuse` run unable to resume.
+    disposeOwned: owned ? (placement === null || placement.reused !== true) : false,
+  });
+}
+
+/**
+ * Resolve the Workspace and Session one run drives, or `null` for the
+ * unnamed-session path.
+ *
+ * `null` (the value `placeSession` never returns) happens only when the caller
+ * explicitly asked for an unnamed conversation, which the review does: it must not
+ * appear in the operator's Workspace history. Every worker run gets a placement
+ * or a refusal; there is no third outcome.
+ * @param {object} deps - dependency object.
+ * @param {object} request - run request.
+ * @returns {Promise<object | null>} placement fact, or null.
+ * @throws {SessionPlacementError} when the harness cannot place the run.
+ */
+async function resolvePlacement(deps, request) {
+  // `allowUnplaced: true` is the review's own composition, which creates its
+  // agent under a caller-owned preset and identity and is not a conversation the
+  // operator navigates. It is never reachable from a job submission.
+  if (request?.allowUnplaced === true) return null;
+  // A caller-owned identity means the caller owns placement too. This is the
+  // review's session id and the historical unplaced path a lifecycle test drives;
+  // it is not reachable from `JobEngine.execute`, which never supplies one.
+  if (request?.sessionId !== undefined && request?.sessionId !== null) return null;
+  const placement = await placeSession(deps, {
+    path: request?.cwd,
+    mode: request?.conversationMode,
+    presetId: request?.placementPresetId,
+  });
+  return placement;
+}
+
+/**
+ * Drive one native agent to completion under a timeout and a cancellation latch.
+ *
+ * @param {object} deps - `agents`, optional `sessions` (flush) and `logger`.
+ * @param {object} request - `prompt`, `cwd`, `selection`, `timeoutMs`, `signal`,
+ *   `onEvent`, `presetId`, `placement`, `disposeOwned`.
+ * @returns {Promise<object>} run result with text, usage facts and lifecycle evidence.
+ */
+export async function driveAgent(deps, request) {
   const agents = deps?.agents;
   if (agents === undefined || agents === null || typeof agents.create !== 'function') {
     throw new RunError(RUN_CODES.agentsUnavailable, 'the native agent registry is not available', {});
@@ -184,6 +291,18 @@ export async function runAgent(deps, request) {
   }
   const selection = request.selection ?? {};
   const timeoutMs = Number.isInteger(request.timeoutMs) && request.timeoutMs > 0 ? request.timeoutMs : null;
+  const placement = request?.placement ?? null;
+  const resolvedAgent = placement?.agent ?? null;
+  // A resolved agent carries its own session and preset composition; the run must
+  // not mount a second composition onto it. An agent created here still does.
+  //
+  // This holds in BOTH conversation modes: a `new` Session is also driven through
+  // the Agent the session controller resolved for it, because the Session already
+  // exists in the Workspace and `agents.create` would create a second one. The
+  // preset is installed by whoever created that Agent (the session controller's
+  // own composition, or — on the unplaced review path — this run's setup).
+  const mountsPreset = resolvedAgent === null;
+  const disposeOwned = request?.disposeOwned !== false;
 
   // Preset selection. `undefined` means "whatever the registry configures as its
   // default", which is what every worker run asks for. A named id is only
@@ -192,7 +311,7 @@ export async function runAgent(deps, request) {
   // user preset with a shell), and the run would silently lose the tool surface
   // the caller intended to restrict.
   const presetId = request.presetId;
-  if (presetId !== undefined && presetId !== null) {
+  if (mountsPreset && presetId !== undefined && presetId !== null) {
     const ownership = request.presetOwnership;
     const owned = typeof ownership?.owns === 'function' && ownership.owns(presetId) === true;
     if (!owned) {
@@ -210,11 +329,15 @@ export async function runAgent(deps, request) {
   // refuses an agent whose `id` does not equal its session's — which is exactly
   // how a call that omitted the id used to fail. So an absent identity is
   // generated here, once per run, and travels on the create call.
-  const sessionId = resolveSessionIdentity(request?.sessionId);
+  //
+  // A placed run does not mint anything: its identity is the Session the
+  // Workspace controller created or the one a previous run recorded.
+  const sessionId = resolveSessionIdentity(placement?.sessionId ?? request?.sessionId);
   // A caller-supplied identity that the native registry would reject (blank, not
   // a string, or already live in this process) is refused before an agent
-  // exists, instead of surfacing later as an opaque creation failure.
-  if (sessionId.generated === false) {
+  // exists, instead of surfacing later as an opaque creation failure. A resolved
+  // agent is already live under exactly this identity, so the check is skipped.
+  if (sessionId.generated === false && resolvedAgent === null) {
     const unusable = sessionIdUnusable(agents, sessionId.value);
     if (unusable !== null) {
       throw new RunError(RUN_CODES.sessionIdUnusable, 'the requested session identity cannot be created', {
@@ -231,6 +354,15 @@ export async function runAgent(deps, request) {
     abortCause: null,
     handle: null,
     handleDisposed: false,
+    // A resolved Agent is driven through the same handle shape a created one
+    // arrives in, so every step below (idle wait, prompt delivery, flush,
+    // cancellation) has exactly one implementation.
+    //
+    // `createdOwnAgent` is the lifecycle fact that decides disposal: only an Agent
+    // this run created may be disposed by it. Disposing a resolved Agent would end
+    // the Session it belongs to and make the next `reuse` run unable to resume.
+    createdOwnAgent: resolvedAgent === null,
+    disposeOwned,
     // Bounded and deduplicating: the native loop streams `text-delta` events and
     // then emits the finished assistant message carrying the same text, so a
     // naive append would report every answer twice and hold an unbounded string.
@@ -243,6 +375,11 @@ export async function runAgent(deps, request) {
     turnEnd: null,
     error: null,
     agentId: null,
+    // The model selection this run actually installed on the Agent it drove, and
+    // the request budget it asked for. Reported so a placed run — which never goes
+    // through `agents.create` — can still be audited for "ran on the selected
+    // provider/model/effort with a usable budget".
+    selection: null,
     // The identity this run will own, known before creation settles so a run
     // that never produces a handle still reports the id it asked for instead of
     // `null`.
@@ -302,70 +439,62 @@ export async function runAgent(deps, request) {
       return finish(state, state.abortCause === 'timeout' ? RUN_OUTCOMES.timedOut : RUN_OUTCOMES.cancelled);
     }
 
-    const createPromise = agents.create({
-      // Always a string: the native contract requires it, and the factory mints
-      // both the session and (through `enter()`) the agent id from it.
-      sessionId: state.sessionId,
-      meta: { cwd: request.cwd },
-      agentOptions: {
-        provider: selection.providerRoute,
-        model: selection.model,
-        ...(selection.reasoningEffort === null || selection.reasoningEffort === undefined
-          ? {}
-          : { reasoningEffort: selection.reasoningEffort }),
-        // An explicit budget: large enough that a reasoning model is not starved
-        // into an apparent timeout, bounded so one request cannot ask for more
-        // than a model serves. An absent budget is the practical default; a
-        // supplied one was validated above and is forwarded unchanged.
-        maxTokens: requestBudget,
-      },
-      setup: async (agentCtx, agent) => {
-        // Join the default native preset *before* the model selection is
-        // installed. The preset is what mounts the Agent's tool composition and
-        // its scoped services; a run that skipped it would report a model the
-        // agent cannot actually exercise because it has no tools at all. Failing
-        // here fails the run closed, inside `agents.create`, which the caller
-        // already observes as a refusal.
-        try {
-          await (presetId === undefined || presetId === null
-            ? presets.mount(agentCtx)
-            : presets.mount(agentCtx, presetId));
-        } catch (error) {
-          throw new RunError(RUN_CODES.presetMountFailed, 'the native agent preset could not be mounted', {
-            cause: diagnostic(error?.message ?? error),
+    const handlePromise = resolvedAgent === null
+      ? agents.create({
+        // Always a string: the native contract requires it, and the factory mints
+        // both the session and (through `enter()`) the agent id from it.
+        sessionId: state.sessionId,
+        meta: { cwd: request.cwd },
+        agentOptions: agentOptionsFor(selection, requestBudget),
+        setup: async (agentCtx, agent) => {
+          // Join the default native preset *before* the model selection is
+          // installed. The preset is what mounts the Agent's tool composition and
+          // its scoped services; a run that skipped it would report a model the
+          // agent cannot actually exercise because it has no tools at all. Failing
+          // here fails the run closed, inside `agents.create`, which the caller
+          // already observes as a refusal.
+          try {
+            await (presetId === undefined || presetId === null
+              ? presets.mount(agentCtx)
+              : presets.mount(agentCtx, presetId));
+          } catch (error) {
+            throw new RunError(RUN_CODES.presetMountFailed, 'the native agent preset could not be mounted', {
+              cause: diagnostic(error?.message ?? error),
+            });
+          }
+          // Optional caller policy, installed after the composition exists (so the
+          // inventory it may inspect is the real one) and before the prompt is
+          // delivered (so no turn can run without it). A hook that throws fails
+          // creation closed, which is what a caller that needs a tool restriction
+          // wants: a refused restriction must never degrade into an unrestricted
+          // run. The agent is passed as the second argument because an agent's
+          // tools live on its own scope plane, and `tools.schemas()`/`restrict()`
+          // are scoped calls.
+          if (typeof request.setup === 'function') {
+            await request.setup(agentCtx, agent);
+          }
+          applySelection(agentCtx, selection);
+          // The same applied-selection fact the resolved path records, so a
+          // caller can compare the two paths on one field instead of on
+          // `agentOptions` in one case and a context mutation in the other.
+          state.selection = {
+            provider: selection.providerRoute ?? null,
+            model: selection.model ?? null,
+            reasoningEffort: selection.reasoningEffort ?? null,
+            applied: true,
+          };
+          agentCtx.on('session/event', onEvent);
+          agentCtx.on('agent/error', (payload) => {
+            state.error = errorText(payload?.error);
           });
-        }
-        // Optional caller policy, installed after the composition exists (so the
-        // inventory it may inspect is the real one) and before the prompt is
-        // delivered (so no turn can run without it). A hook that throws fails
-        // creation closed, which is what a caller that needs a tool restriction
-        // wants: a refused restriction must never degrade into an unrestricted
-        // run. The agent is passed as the second argument because an agent's
-        // tools live on its own scope plane, and `tools.schemas()`/`restrict()`
-        // are scoped calls.
-        if (typeof request.setup === 'function') {
-          await request.setup(agentCtx, agent);
-        }
-        // The selection is agent-scoped state, not merely an `agentOptions`
-        // hint: prompt assembly and request routing read it through this
-        // coupling, so an options-only selection would be reported without
-        // being applied to the conversation.
-        installModelSelection(agentCtx, {
-          current: {
-            provider: selection.providerRoute,
-            model: selection.model,
-            // An unsupported/omitted effort must stay absent rather than
-            // travel as `null`; the native ref types it as optional.
-            reasoningEffort: selection.reasoningEffort ?? undefined,
-          },
-          assembled: undefined,
-        });
-        agentCtx.on('session/event', onEvent);
-        agentCtx.on('agent/error', (payload) => {
-          state.error = errorText(payload?.error);
-        });
-      },
-    });
+        },
+      })
+      // A resolved Agent already carries its session, its preset composition and
+      // its listeners. What it must still receive is THIS run's model selection:
+      // the operator's provider/model/effort is per task, while the conversation
+      // it continues is shared, so re-applying the selection here is the whole
+      // point of driving the resolved agent instead of its logged header.
+      : adoptResolvedAgent(resolvedAgent, request, selection);
 
     if (timeoutMs !== null) {
       timer = setTimeout(() => latch('timeout'), timeoutMs);
@@ -373,7 +502,7 @@ export async function runAgent(deps, request) {
     }
 
     const raced = await Promise.race([
-      createPromise.then((handle) => ({ kind: 'handle', handle })),
+      handlePromise.then((handle) => ({ kind: 'handle', handle })),
       aborted.then((cause) => ({ kind: 'aborted', cause })),
     ]);
 
@@ -381,8 +510,8 @@ export async function runAgent(deps, request) {
       // The handle may still arrive after the latch. Disposing it as soon as it
       // does is the only way no agent outlives a run that is already terminal;
       // the prompt is never delivered on this path.
-      createPromise.then(
-        (handle) => { void disposeQuietly(handle); },
+      handlePromise.then(
+        (handle) => { void releaseHandle(state, handle); },
         () => {},
       );
       return finish(state, raced.cause === 'timeout' ? RUN_OUTCOMES.timedOut : RUN_OUTCOMES.cancelled);
@@ -399,7 +528,7 @@ export async function runAgent(deps, request) {
     state.sessionId = handle?.agent?.session?.id ?? state.sessionId;
 
     if (state.abortRequested) {
-      await disposeHandle(state);
+      await releaseHandle(state, handle);
       return finish(state, state.abortCause === 'timeout' ? RUN_OUTCOMES.timedOut : RUN_OUTCOMES.cancelled);
     }
 
@@ -407,7 +536,7 @@ export async function runAgent(deps, request) {
     // prompt is not queued behind setup work that is still composing.
     await Promise.race([handle.agent.whenIdle(), aborted]);
     if (state.abortRequested) {
-      await disposeHandle(state);
+      await releaseHandle(state, handle);
       return finish(state, state.abortCause === 'timeout' ? RUN_OUTCOMES.timedOut : RUN_OUTCOMES.cancelled);
     }
 
@@ -427,10 +556,10 @@ export async function runAgent(deps, request) {
       }
     }
 
-    await disposeHandle(state);
+    await releaseHandle(state, handle);
     return finish(state, outcome);
   } catch (error) {
-    if (state.handle !== null) await disposeHandle(state);
+    if (state.handle !== null) await releaseHandle(state, state.handle);
     if (error instanceof RunError) throw error;
     throw new RunError(RUN_CODES.createFailed, 'the delegated agent could not be created or driven', {
       cause: diagnostic(error?.message ?? error),
@@ -440,6 +569,76 @@ export async function runAgent(deps, request) {
     if (request.signal !== undefined && request.signal !== null) {
       request.signal.removeEventListener?.('abort', onAbortSignal);
     }
+  }
+
+  /**
+   * Attach one resolved Agent to this run: listeners, this run's model selection,
+   * and the handle shape the drive path expects.
+   *
+   * The selection is installed on the agent's own context — the same coupling
+   * `agents.create`'s setup callback uses — so a continued conversation still runs
+   * on the provider/model/effort the operator selected for THIS task instead of
+   * whatever the previous turn happened to use. A failure here is a create
+   * failure like any other, and it happens before the prompt is delivered.
+   * @param {object} agent - live native Agent returned by the session controller.
+   * @param {object} runRequest - the run request (for the optional setup hook).
+   * @param {object} runSelection - provider route, model and effort for this run.
+   * @returns {Promise<object>} handle for the drive path.
+   */
+  async function adoptResolvedAgent(agent, runRequest, runSelection) {
+    const agentCtx = agent?.ctx ?? null;
+    if (agentCtx === null || typeof agentCtx?.on !== 'function') {
+      throw new RunError(
+        RUN_CODES.createFailed,
+        'the resolved session exposes no agent context, so its events cannot be observed',
+        { cause: 'SESSION_AGENT_CONTEXT_UNAVAILABLE' },
+      );
+    }
+    if (typeof runRequest.setup === 'function') {
+      await runRequest.setup(agentCtx, agent);
+    }
+    applySelection(agentCtx, runSelection);
+    // Recorded as a fact of the run, not inferred from the request: an operator
+    // asking "which model did this continued conversation actually run on" gets
+    // the applied triple back. `maxTokens` is not part of the selection — the
+    // native selection carries only the provider route, model and effort.
+    state.selection = {
+      provider: runSelection?.providerRoute ?? null,
+      model: runSelection?.model ?? null,
+      reasoningEffort: runSelection?.reasoningEffort ?? null,
+      applied: true,
+    };
+    agentCtx.on('session/event', onEvent);
+    agentCtx.on('agent/error', (payload) => {
+      state.error = errorText(payload?.error);
+    });
+    return {
+      agent,
+      // Stated, not inferred: this handle owns nothing a dispose could legally end.
+      owned: false,
+      async dispose() {},
+    };
+  }
+
+  /**
+   * Release one handle at the end of a run.
+   *
+   * Disposal is skipped for an Agent this run did not create, and for any handle
+   * the caller marked as not owned. A Session that is disposed cannot be resumed,
+   * so disposing a resolved Agent would silently break the next `reuse` run —
+   * exactly the failure this feature must not have.
+   * @param {object} target - run state.
+   * @param {object} handle - handle to release.
+   * @returns {Promise<void>} resolves after the attempt.
+   */
+  async function releaseHandle(target, handle) {
+    if (handle === null || handle === undefined) return;
+    if (target.handle === handle) {
+      if (target.handleDisposed) return;
+      target.handleDisposed = true;
+    }
+    if (target.createdOwnAgent !== true || target.disposeOwned !== true) return;
+    await disposeQuietly(handle);
   }
 
   // Native session events carry their payload under `data`, e.g.
@@ -520,6 +719,23 @@ export async function runAgent(deps, request) {
       turnEnd: target.turnEnd,
       agentId,
       sessionId: target.sessionId,
+      // The provider/model/effort actually installed on the Agent this run drove,
+      // and the output budget it requested. Present on both the created and the
+      // resolved path; `applied: false` is never emitted, so a value here is a
+      // statement that the selection reached the agent's own context.
+      selection: target.selection,
+      maxTokens: target.maxTokens?.value ?? null,
+      // Where this run's conversation landed, or `null` for the unplaced path
+      // (the review). Stated as its own fact so a caller can report the Workspace
+      // group and whether the conversation was continued without re-deriving it
+      // from the ids.
+      conversation: placement === null ? null : {
+        mode: placement.mode ?? null,
+        reused: placement.reused === true,
+        workspaceId: placement.workspaceId ?? null,
+        workspacePath: placement.workspacePath ?? null,
+        sessionId: target.sessionId ?? placement.sessionId ?? null,
+      },
       cancelCause: target.abortCause,
       error: target.error,
       aborted: target.abortRequested,
@@ -560,12 +776,57 @@ export async function runAgent(deps, request) {
     target.error = reason === 'max-tokens' ? RUN_ERRORS.budgetExhausted : RUN_ERRORS.emptyOutput;
     return RUN_OUTCOMES.failed;
   }
+}
 
-  async function disposeHandle(target) {
-    if (target.handle === null || target.handleDisposed) return;
-    target.handleDisposed = true;
-    await disposeQuietly(target.handle);
-  }
+/**
+ * Build the native agent options for one run's model request.
+ *
+ * `maxTokens` is always explicit: large enough that a reasoning model is not
+ * starved into an apparent timeout, bounded so one request cannot ask for more
+ * than a model serves. The caller's budget was validated before this point and is
+ * forwarded unchanged.
+ * @param {object} selection - provider route, model, optional effort.
+ * @param {number} budget - validated output-token budget.
+ * @returns {object} agent options for `agents.create`.
+ */
+function agentOptionsFor(selection, budget) {
+  return {
+    provider: selection.providerRoute,
+    model: selection.model,
+    ...(selection.reasoningEffort === null || selection.reasoningEffort === undefined
+      ? {}
+      : { reasoningEffort: selection.reasoningEffort }),
+    maxTokens: budget,
+  };
+}
+
+/**
+ * Install one run's model selection on an agent's own context.
+ *
+ * The selection is agent-scoped state, not merely an `agentOptions` hint: prompt
+ * assembly and request routing read it through this coupling, so an options-only
+ * selection would be reported without being applied to the conversation. Both
+ * paths — a freshly created agent and a resolved one — therefore call this.
+ *
+ * The call is made unconditionally: it is what makes a per-task provider/model/
+ * effort travel onto a conversation that outlives the task, and skipping it for a
+ * resolved Agent would silently run the continued conversation on the previous
+ * turn's model.
+ * @param {object} agentCtx - the agent's scoped context.
+ * @param {object} selection - provider route, model, optional effort.
+ * @returns {void}
+ */
+function applySelection(agentCtx, selection) {
+  installModelSelection(agentCtx, {
+    current: {
+      provider: selection.providerRoute,
+      model: selection.model,
+      // An unsupported/omitted effort must stay absent rather than travel as
+      // `null`; the native ref types it as optional.
+      reasoningEffort: selection.reasoningEffort ?? undefined,
+    },
+    assembled: undefined,
+  });
 }
 
 function numeric(value) {

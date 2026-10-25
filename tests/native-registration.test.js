@@ -34,7 +34,7 @@ import { createOpenAiAdapter } from '../src/model/openai-adapter.js';
 import { createProviderRegistry } from '../src/model/providers.js';
 import { describeCatalog, resolveRoute } from '../src/model/routing.js';
 import { WorkspaceLocks } from '../src/workspace/locks.js';
-import { cleanup, fakeAgents, makeTempDir, validSettings } from './helpers/fakes.js';
+import { cleanup, fakeAgents, fakeSessionController, fakeWorkspaceController, makeTempDir, validSettings } from './helpers/fakes.js';
 
 /**
  * A Cordis-shaped context good enough to construct a real `LlmRuntime`.
@@ -548,11 +548,22 @@ async function engineWire() {
   const auth = new AuthorizationRegistry();
   const locks = new WorkspaceLocks();
   const agents = fakeAgents({ respond: { text: 'done' } });
+  // Placement, wired the way `src/index.js` wires it. A worker run must land in a
+  // real DSH Workspace keyed by its execution directory, so a harness without
+  // these two services refuses every dispatch with
+  // `JOB_CONVERSATION_UNAVAILABLE` — which is the fail-closed behaviour these
+  // tests would otherwise be measuring instead of native route registration.
+  const workspaces = fakeWorkspaceController();
+  const sessionController = fakeSessionController({ workspaces, respond: { text: 'done' } });
   const deps = {
     agents,
     agentPresets: { async mount() { return { id: 'default' }; } },
     reviewPresets: reviewComposer(),
+    // The native persistence service (`ctx.sessions`) — NOT the session
+    // controller. Placement never reads this one.
     sessions: { async flush() {} },
+    workspaces,
+    sessionController,
     llm: wired.llm,
     settings,
     auth,
@@ -643,9 +654,12 @@ test('the first dispatch from an empty snapshot resolves the configured model na
 
     const settled = await settleEngineTask(h.engine, started.taskId);
     assert.equal(settled.state, TASK_STATES.awaitingHostReview, `the task must run, not fail: ${JSON.stringify(settled.error)}`);
-    assert.equal(h.agents.created.length, 1);
-    assert.equal(h.agents.created[0].options.model, 'deepseek-v4.1-flash');
-    assert.equal(h.agents.created[0].options.provider, 'dsh-delegate:workbuddy');
+    // A placed worker run drives a resolved Agent, so the model it used is the one
+    // installed on that Agent and reported back on the run — not an
+    // `agents.create` option it never passed.
+    assert.equal(settled.execution.selection.model, 'deepseek-v4.1-flash');
+    assert.equal(settled.execution.selection.provider, 'dsh-delegate:workbuddy');
+    assert.equal(h.agents.created.length, 0, 'a placed run creates no agent through the registry');
   } finally {
     await h.close();
   }
@@ -706,7 +720,10 @@ test('a settings change reaches the next dispatch rather than being served from 
 
     const settledTwo = await settleEngineTask(h.engine, two.taskId);
     assert.equal(settledTwo.state, TASK_STATES.awaitingHostReview, `the second task must run: ${JSON.stringify(settledTwo.error)}`);
-    assert.equal(h.agents.created.at(-1).options.model, 'deepseek-v4.1-flash-x');
+    // The dispatch after the settings change must run on the NEW model, and the
+    // evidence is the selection installed on the Agent of that second run.
+    assert.equal(settledTwo.execution.selection.model, 'deepseek-v4.1-flash-x');
+    assert.equal(settledTwo.execution.selection.reasoningEffort, 'high');
   } finally {
     await h.close();
   }

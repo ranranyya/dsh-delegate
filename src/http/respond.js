@@ -162,6 +162,11 @@ function statusForCode(code) {
   if (code === 'CREDENTIAL_OPERATION_FAILED' || code === 'CREDENTIAL_READ_ONLY') return 502;
   if (code === 'CREDENTIAL_VALUE_REQUIRED' || code === 'CREDENTIAL_VALUE_TOO_LARGE' || code === 'CREDENTIAL_REF_INVALID') return 400;
   if (code.startsWith('CREDENTIAL_')) return 409;
+  // Codex integration: the operator's own Codex home/config is the subject, so a
+  // refusal to touch it is a state conflict, and a malformed request a 400.
+  if (code === 'CODEX_INTEGRATION_UNAVAILABLE') return 503;
+  if (code === 'CODEX_HOME_INVALID' || code === 'CODEX_ACTION_INVALID') return 400;
+  if (code.startsWith('CODEX_') || code.startsWith('MCP_') || code.startsWith('AGENT_')) return 409;
   if (code === 'BODY_TOO_LARGE') return 413;
   if (code === 'BODY_INVALID_JSON' || code === 'BODY_NOT_OBJECT') return 400;
   return 400;
