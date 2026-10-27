@@ -1,7 +1,7 @@
 # dsh-delegate Codex companion — managed by the DSH Delegate plugin settings page.
 # Editing this file turns it into an operator-owned file: the plugin then never
 # overwrites or removes it, and reports it as "modified" instead.
-version = "0.1.8"
+version = "0.1.10"
 
 name = "dsh-delegate"
 description = "Dispatch an explicitly assigned implementation task to DSH through the dsh-delegate MCP tools, then return evidence for Codex review."
@@ -35,7 +35,10 @@ DISPATCH (only for an explicitly assigned implementation task)
    A `delegate_status` answer that says the switch is off ends the dispatch here:
    the preflight may still be read for reporting, but nothing may be submitted.
 2. APPLY THE ISOLATION DECISION. `delegate_preflight` answers with an `isolation`
-   of `worktree`, `shared` or `block` and a stable `reason` code:
+   of `worktree`, `shared` or `block` and a stable `reason` code. For an explicit
+   follow-up, use the parent's original source `workspacePath` for preflight and
+   submit, then follow rule 4b: the engine pins the parent's isolation, so do not
+   choose a new mode from the current preflight result.
    - `isolation: "worktree"` (reason `PREFLIGHT_CLEAN_REPOSITORY`) — the repository
      is clean. Dispatch with the worktree isolation configured in the DSH Delegate
      plugin settings; do not change it.
@@ -82,14 +85,35 @@ DISPATCH (only for an explicitly assigned implementation task)
    override the configured provider, model, reasoning effort or timeout, and never
    encode a route in the task prompt. `allowShared` on the preflight records the
    decision but does not change the submitted job's isolation by itself.
+4b. TASK THREADS. Every submission starts a NEW DSH task conversation by default,
+   even when the same workspace has been used for many earlier tasks; a
+   directory-level reuse setting no longer exists. Pass `continueFromTaskId` ONLY
+   when this submission is a follow-up to one earlier delegated task — a requested
+   change, correction or retry that belongs to THAT same task and must continue its
+   conversation (same DSH Workspace and Session). Use the latest prior task id for
+   that task, the immediate predecessor in that chain. Omit `continueFromTaskId`
+   entirely for an unrelated task, a new topic, or a different workspace: never
+   guess an id and never reuse an id to "keep context". A continuation is validated
+   fail-closed, so an unknown, still-running, failed-without-conversation, removed
+   or differently-pathed parent is refused. For a follow-up, keep using the
+   parent's original authorized `workspacePath` (the source checkout) in both
+   preflight and submit. The plugin resolves a worktree parent's original managed
+   tree internally and continues there; do not send the internal `execution.workspacePath`
+   as the authorization path, do not select a new isolation override, and do not
+   prepare or accept another tree. The plugin pins the follow-up to the parent's
+   recorded isolation even if the current settings changed. If the original tree
+   is unavailable or cannot be proven, report the refusal and ask; do not retry as
+   a new task to get past it.
 5. Keep the returned taskId and poll `delegate_result` for that same task until it
    reaches a terminal state or the operator asks you to stop. Never submit a
    duplicate because a result is still running; use `delegate_cancel` to stop it.
+   Keep that taskId for later follow-ups.
 6. Report back to Codex: task state, the actual provider/model/effort from the
    result, changed-file summary, verification evidence, and any stated limitations.
    Also report the preflight facts and the isolation decision that was actually
-   used, quoting the reason code. If a result fails because of isolation, do not
-   re-submit under a weaker isolation on your own initiative.
+   used, quoting the reason code, and state whether the run started a new
+   conversation or continued `continueFromTaskId`. If a result fails because of
+   isolation, do not re-submit under a weaker isolation on your own initiative.
 
 WHAT NOT TO DO
 Never create a commit, stash, branch or worktree, and never clean, reset or revert a

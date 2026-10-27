@@ -51,10 +51,11 @@ const SUPPORTED_DSH_RANGE = SUPPORTED_DSH_VERSIONS.join(' || ');
  * The package version this build must declare everywhere a human writes it.
  *
  * Pinned rather than derived: `MANIFEST.version` is one of the places checked below,
- * so asserting it against itself would pass for any value. `0.1.8` adds DSH
- * Workspace placement and conversation reuse on top of the Codex MCP executable fix.
+ * so asserting it against itself would pass for any value. `0.1.10` fixes the
+ * known-template migration for Codex agent files and refreshes them at plugin
+ * startup, following the late-bound controller fix in 0.1.9.
  */
-const DELIVERABLE_VERSION = '0.1.8';
+const DELIVERABLE_VERSION = '0.1.10';
 
 // Published prior builds are retained only where the migration/ownership contract
 // names them. Other operator-facing and shipped code must not carry stale versions.
@@ -550,19 +551,19 @@ test('the release metadata is one version everywhere it is written by hand', () 
   }
 });
 
-test('the release is 0.1.8, one semver step above the shipped 0.1.7 baseline', () => {
-  // Pinned, not derived: Workspace placement is a new release, and a manifest that
-  // still advertises 0.1.7 would let an operator install the previous build as if it
-  // were the same one. `package.json`, the lockfile (both fields), the agent template
-  // and the two documents an operator reads must agree.
+test('the release is 0.1.10, one semver step above the shipped 0.1.9 baseline', () => {
+  // Pinned, not derived: the late-bound controller fix is a new release, and a
+  // manifest that still advertises 0.1.9 would label the previous build as current.
+  // `package.json`, the lockfile (both fields), the agent template and the two
+  // documents an operator reads must agree.
   assert.match(MANIFEST.version, SEMVER);
   assert.equal(MANIFEST.version, DELIVERABLE_VERSION, 'package.json must declare the released version');
 
-  const previous = semverParts('0.1.7');
+  const previous = semverParts('0.1.9');
   const current = semverParts(MANIFEST.version);
   assert.equal(current.major, previous.major, 'a defect fix is a patch release: the major version may not move');
   assert.equal(current.minor, previous.minor, 'a defect fix is a patch release: the minor version may not move');
-  assert.equal(current.patch, previous.patch + 1, 'the release must be exactly one patch above 0.1.6');
+  assert.equal(current.patch, previous.patch + 1, 'the release must be exactly one patch above 0.1.9');
 
   const lock = JSON.parse(readFileSync(join(ROOT, 'package-lock.json'), 'utf8'));
   assert.equal(lock.version, DELIVERABLE_VERSION, 'package-lock.json#version must match package.json');
@@ -584,7 +585,7 @@ test('the release is 0.1.8, one semver step above the shipped 0.1.7 baseline', (
   for (const path of ['README.md', 'docs/codex-integration.md', ...PACKED.filter((entry) => entry.startsWith('src/') && entry.endsWith('.js'))]) {
     const text = readFileSync(join(ROOT, path), 'utf8');
     for (const literal of new Set(text.match(/\b0\.1\.\d+\b/gu) ?? [])) {
-      const historical = ['0.1.6', '0.1.7'].includes(literal) && HISTORICAL_VERSION_PATHS.has(path);
+      const historical = ['0.1.6', '0.1.7', '0.1.8', '0.1.9'].includes(literal) && HISTORICAL_VERSION_PATHS.has(path);
       assert.ok(literal === DELIVERABLE_VERSION || historical, `${path} still mentions ${literal} as if it were current`);
     }
   }

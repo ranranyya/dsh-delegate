@@ -51,8 +51,7 @@ import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore
 
 import {
   CONNECTIVITY_LAYERS,
-  CONVERSATION_LABELS,
-  CONVERSATION_MODES,
+  CONVERSATION_POLICY_LABEL,
   EFFORT_LABELS,
   EFFORT_UNSET,
   GRANT_KIND_LABELS,
@@ -68,8 +67,6 @@ import {
   changedFiles,
   clone,
   codexTargetView,
-  conversationModeLabel,
-  conversationOf,
   createApi,
   createStore,
   describeCodexOutcome,
@@ -1110,8 +1107,8 @@ function EffectiveSummary({ label, effective, note }) {
         <dd>{worker.maxParallelism ?? '—'}</dd>
         <dt>工作区隔离</dt>
         <dd>{ISOLATION_LABELS[worker.isolation] ?? worker.isolation ?? '—'}</dd>
-        <dt>对话模式</dt>
-        <dd>{conversationModeLabel(conversationOf(effective ?? {}).mode)}</dd>
+        <dt>对话</dt>
+        <dd>{CONVERSATION_POLICY_LABEL}</dd>
         <dt>附加审查</dt>
         <dd>
           {review.enabled === true
@@ -1419,9 +1416,9 @@ function ExecutionPanel({ store, snapshot }) {
   const draft = snapshot.draft;
   const providers = draft?.providers ?? [];
   const worker = draft?.worker ?? {};
-  // The conversation block, resolved through the same helper the save path uses,
-  // so an absent block shows the default and a stored `reuse` shows `reuse`.
-  const conversation = conversationOf(draft ?? {});
+  // There is no conversation-mode control any more: the policy is per submission
+  // (new by default, continue only the task named by `continueFromTaskId`), so the
+  // panel states it instead of offering a setting that no longer exists.
   // Global preview only: which project a task will run in is decided at submit
   // time, so previewing against an arbitrary override key would be a guess.
   const preview = draft === null ? null : previewEffective(draft, null);
@@ -1478,34 +1475,23 @@ function ExecutionPanel({ store, snapshot }) {
           </select>
         </Field>
         <Field
-          label="对话模式"
-          htmlFor="dshdg-conversation-mode"
-          hint="默认每个任务在它实际执行目录的 Workspace 里新开一条对话。复用只在同一个执行目录内生效，绝不跨目录。"
+          label="对话"
+          htmlFor="dshdg-conversation-policy"
+          hint="固定的按任务策略：每个新提交在执行目录对应的 Workspace 里新开一条会话；只有显式带 continueFromTaskId 的跟进任务才续接那一条会话。"
         >
-          <select
-            id="dshdg-conversation-mode"
-            aria-label="对话模式"
-            value={conversation.mode}
-            onChange={(event) => {
-              const next = event.target.value;
-              store.editDraft((current) => { current.conversation = { mode: next }; });
-            }}
-          >
-            {CONVERSATION_MODES.map((mode) => (
-              <option key={mode} value={mode}>{CONVERSATION_LABELS[mode]}</option>
-            ))}
-          </select>
+          <p id="dshdg-conversation-policy" className="dshdg-hint">
+            {CONVERSATION_POLICY_LABEL}
+          </p>
         </Field>
       </div>
       <p className="dshdg-hint">
         不会自动回退到别的模型，也不会隐式使用 Harness 默认模型：选中的组合不可路由时任务直接拒绝。
       </p>
-      {conversation.mode === 'reuse' ? (
-        <p className="dshdg-hint">
-          复用模式会继续<strong>同一执行目录</strong>最近一条 DSH 对话；换了目录（包括每个独立工作树）就是另一条对话。
-          记录的那条对话如果已不存在或无法恢复，任务会直接拒绝，而不是悄悄新开一条。
-        </p>
-      ) : null}
+      <p className="dshdg-hint">
+        目录级的「复用上一对话」设置已移除：它曾经让同目录的第二个任务自动接续上一次会话，现在不会发生。
+        需要续接时由派工方在 <code>delegate_submit</code> 里带上 <code>continueFromTaskId</code>，
+        指向要继续的那条任务历史；隔离工作树的跟进任务必须回到同一棵工作树，否则会被拒绝。
+      </p>
       {preview === null ? null : (
         <EffectiveSummary
           label="保存后生效（当前草稿预览）"
@@ -1648,10 +1634,13 @@ function TaskDetail({ store, task }) {
         <dd>{ISOLATION_LABELS[task.isolation ?? worker.isolation] ?? task.isolation ?? worker.isolation ?? '—'}</dd>
         <dt>对话</dt>
         <dd>
-          {conversationModeLabel(conversationOf(task.effective ?? {}).mode)}
           {execution?.conversation === null || execution?.conversation === undefined
-            ? ''
-            : ` · ${execution.conversation.reused === true ? '已接续' : '新开'} · 工作区 ${execution.conversation.workspaceId ?? '—'}`}
+            ? (task.continueFromTaskId === null || task.continueFromTaskId === undefined
+              ? '（未放置对话）'
+              : `（未放置对话；本任务声明续接 ${task.continueFromTaskId}）`)
+            : (execution.conversation.reused === true
+              ? `续接 ${execution.conversation.continuedFromTaskId ?? '上一任务'} · 工作区 ${execution.conversation.workspaceId ?? '—'}`
+              : `新开 · 工作区 ${execution.conversation.workspaceId ?? '—'}`)}
         </dd>
         <dt>创建</dt>
         <dd>{formatTime(task.createdAt)}</dd>

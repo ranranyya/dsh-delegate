@@ -12,11 +12,16 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 import { manageCodexAgent, resolveCodexHome } from '../bin/dsh-delegate-codex-agent.js';
+import { useDirectoryClassifier } from '../src/codex/installer.js';
+
+/** Repository root, so the shipped agent template can be read and compared. */
+const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 
 function temporaryCodexHome() {
   return mkdtempSync(join(tmpdir(), 'dsh-delegate-codex-'));
@@ -26,6 +31,29 @@ function temporaryCodexHome() {
 function isolatedEnv(codexHome) {
   return { CODEX_HOME: codexHome, DSH_HOME: '', DSH_DELEGATE_DISCOVERY_FILE: '' };
 }
+
+// The installer proves `$CODEX_HOME` and `$CODEX_HOME/agents` are real directories.
+// On Windows that answer comes from a `powershell.exe` child, and this suite has to run
+// where a child cannot be spawned at all, so the suite answers through the documented
+// classifier hook. `lstat` still does the work; only the platform verdict is supplied.
+// Without it every temp home below would be reported `conflict`/`boundary-unverified`,
+// which is the honest answer to "I cannot see whether this is a junction".
+useDirectoryClassifier(async (paths) => {
+  const kinds = new Map();
+  for (const path of paths) {
+    let info = null;
+    try {
+      info = lstatSync(path);
+    } catch {
+      info = null;
+    }
+    if (info === null) kinds.set(path, 'missing');
+    else if (info.isSymbolicLink()) kinds.set(path, 'link');
+    else if (info.isDirectory()) kinds.set(path, 'directory');
+    else kinds.set(path, 'other');
+  }
+  return kinds;
+});
 
 test('CODEX_HOME is honored and the default remains the user Codex directory', () => {
   const configured = join(tmpdir(), 'dsh-codex-home');
@@ -87,6 +115,55 @@ test('remove deletes only the exact bundled template', async () => {
     assert.equal(readFileSync(removed.mcpPath, 'utf8').includes('mcp_servers.dsh-delegate'), false);
     assert.equal((await manageCodexAgent('status', { codexHome, env })).state, 'not-installed');
     assert.deepEqual((await manageCodexAgent('remove', { codexHome, env })).changed, []);
+  } finally {
+    rmSync(codexHome, { recursive: true, force: true });
+  }
+});
+
+// --- The shipped dispatcher rules --------------------------------------------
+//
+// The task-thread rule has to reach the host as an INSTRUCTION, not only as a
+// schema: a model that never reads `continueFromTaskId` will keep omitting it (and
+// so never continue anything), or will reuse an id "to keep context" (and so join
+// the wrong thread). These assertions pin the sentence, not only the field.
+
+test('the shipped dispatcher tells the host when to pass continueFromTaskId', () => {
+  const template = readFileSync(join(ROOT, 'codex', 'dsh-delegate.toml'), 'utf8');
+  const raw = /developer_instructions = """([\s\S]*?)"""/u.exec(template)?.[1] ?? '';
+  // The instruction block is TOML prose: its line wrapping is not part of the rule,
+  // so the assertions run on unwrapped text.
+  const instructions = raw.replace(/\s+/gu, ' ');
+  assert.ok(instructions.length > 0, 'the shipped agent must carry developer instructions');
+
+  // The rule, in both halves: follow-ups continue, unrelated tasks do not.
+  assert.match(instructions, /continueFromTaskId/u);
+  assert.match(instructions, /NEW DSH task conversation/u);
+  assert.match(instructions, /ONLY when this submission is a follow-up/u);
+  assert.match(instructions, /latest prior task id/u);
+  assert.match(instructions, /Omit `continueFromTaskId` entirely for an unrelated task/u);
+
+  // It must also say what to do with a worktree parent, because "reuse the tree" is
+  // the one case where the right path is not the source checkout.
+  assert.match(instructions, /original managed tree/u);
+  // And that a refusal is reported, not worked around.
+  assert.match(instructions, /do not retry as a new task/u);
+  // The retired setting must not be described as available.
+  assert.doesNotMatch(instructions, /conversation mode is `reuse`/u);
+});
+
+test('the shipped dispatcher rules are what install actually writes', async () => {
+  const codexHome = temporaryCodexHome();
+  try {
+    const env = isolatedEnv(codexHome);
+    const installed = await manageCodexAgent('install', { codexHome, env });
+    const written = readFileSync(installed.path, 'utf8');
+    const version = /^version = "(.*)"$/mu.exec(written)?.[1] ?? '';
+    const shipped = readFileSync(join(ROOT, 'codex', 'dsh-delegate.toml'), 'utf8');
+    assert.match(written, /continueFromTaskId/u, 'the installed file must carry the continuation rule');
+    // The only difference between the shipped template and the installed copy is
+    // the version line the installer renders, so the rules a host reads are the
+    // rules this repository reviews.
+    assert.equal(written, shipped.replace(/^version = ".*"$/mu, `version = "${version}"`));
   } finally {
     rmSync(codexHome, { recursive: true, force: true });
   }

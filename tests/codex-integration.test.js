@@ -8,7 +8,8 @@
 // The properties pinned down are the ones a reviewer would otherwise have to take
 // on trust:
 //
-//   * an explicit click is the only writer — plugin load and `init()` never write;
+//   * plugin startup only refreshes a byte-exact known agent template; all other
+//     Codex writes remain explicit settings-page actions;
 //   * a same-name file or MCP entry that is not ours is refused, never replaced;
 //   * repeating an install is idempotent;
 //   * unrelated Codex settings, comments and table order survive;
@@ -57,8 +58,9 @@ import { USER_PLANE_PREFIX, wrapUserPlaneRoutes } from '../src/http/user-plane.j
 import { PREFLIGHT_ISOLATIONS, PREFLIGHT_REASONS } from '../src/workspace/preflight.js';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
-const DELIVERABLE_VERSION = '0.1.8';
+const DELIVERABLE_VERSION = '0.1.10';
 const AGENT_0_1_6_FIXTURE = join(ROOT, 'tests', 'fixtures', 'codex-agent-0.1.6.toml');
+const AGENT_0_1_7_LEGACY_FIXTURE = join(ROOT, 'tests', 'fixtures', 'codex-agent-0.1.7.toml');
 
 // The boundary check asks the platform whether `$CODEX_HOME` and `$CODEX_HOME/agents`
 // are real directories. On Windows that answer comes from a `powershell.exe` child, and
@@ -712,7 +714,7 @@ test('a byte-exact known prior build is refreshed, a user-edited one is not', as
   }
 });
 
-test('the published 0.1.6 agent is refreshed by 0.1.8, while its bytes remain the ownership proof', async () => {
+test('the published 0.1.6 agent is refreshed by 0.1.10, while its bytes remain the ownership proof', async () => {
   const fixture = codexHomeFixture();
   const prior = readFileSync(AGENT_0_1_6_FIXTURE, 'utf8');
   try {
@@ -727,29 +729,104 @@ test('the published 0.1.6 agent is refreshed by 0.1.8, while its bytes remain th
     const installed = await runCodexAction('install', { codexHome: fixture.home, env: isolatedEnv(fixture.home) });
     assert.ok(installed.changed.includes('agent'));
     const current = readFileSync(fixture.agentPath, 'utf8');
-    assert.match(current, /^version = "0\.1\.8"$/mu);
+    assert.match(current, /^version = "0\.1\.10"$/mu);
     assert.notEqual(current, prior);
   } finally {
     fixture.cleanup();
   }
 });
 
-test('the published 0.1.7 agent is refreshed by 0.1.8 only when its bytes match', async () => {
+test('the rebuilt 0.1.7 agent is refreshed by 0.1.10 only when its bytes match', async () => {
+  // A file that is byte-identical to an enumerated published rebuild is refreshable;
+  // the version line is NOT the proof, the bytes are. These rebuilds are enumerated
+  // in `KNOWN_AGENT_TEMPLATES` because the current template's instructions changed
+  // (the per-task conversation policy), which changes the bytes of every rebuild.
   const fixture = codexHomeFixture();
   const prior = readFileSync(join(ROOT, 'codex', 'dsh-delegate.toml'), 'utf8')
-    .replace(/^version = "0\.1\.8"$/mu, 'version = "0.1.7"');
+    .replace(/^version = "0\.1\.10"$/mu, 'version = "0.1.7"');
   try {
     mkdirSync(dirname(fixture.agentPath), { recursive: true });
     writeFileSync(fixture.agentPath, prior);
-    assert.equal(digest(prior), '75ec5f97452754ba22747680598583b8ab457f64a0a3d487b96d73b3a3cc35c7');
-    assert.ok(KNOWN_AGENT_TEMPLATES.some((entry) => entry.version === '0.1.7' && entry.sha256 === digest(prior)));
+    assert.equal(digest(prior), 'e3689492ee0f24d2defd2a9254b653e7bc54c258dd38fb0c2fc70ce5b386f2b3');
+    assert.ok(
+      KNOWN_AGENT_TEMPLATES.some((entry) => entry.version === '0.1.7' && entry.sha256 === digest(prior)),
+      'a rebuild of the shipped template is an enumerable known build',
+    );
 
     const before = await runCodexAction('status', { codexHome: fixture.home, env: isolatedEnv(fixture.home) });
     assert.equal(before.status.agent.state, 'outdated');
 
     const installed = await runCodexAction('install', { codexHome: fixture.home, env: isolatedEnv(fixture.home) });
     assert.ok(installed.changed.includes('agent'));
-    assert.match(readFileSync(fixture.agentPath, 'utf8'), /^version = "0\.1\.8"$/mu);
+    assert.match(readFileSync(fixture.agentPath, 'utf8'), /^version = "0\.1\.10"$/mu);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test('the original published 0.1.7 agent is recognized and refreshed on startup', async () => {
+  const fixture = codexHomeFixture();
+  const prior = readFileSync(AGENT_0_1_7_LEGACY_FIXTURE, 'utf8').replace(/\r?\n/gu, '\r\n');
+  try {
+    mkdirSync(dirname(fixture.agentPath), { recursive: true });
+    writeFileSync(fixture.agentPath, prior);
+    assert.equal(digest(prior), '3b5a58df0f989e87ae160a2952b7699cd5e2978e43a0f9a86c4eceb155d7af92');
+
+    const seam = createCodexSeam({ codexHome: fixture.home, env: isolatedEnv(fixture.home), version: DELIVERABLE_VERSION });
+    const refreshed = await seam.refreshKnownAgent();
+    assert.deepEqual(refreshed.changed, ['agent']);
+    assert.deepEqual(refreshed.refused, []);
+    assert.equal(refreshed.status.agent.state, 'installed');
+    assert.match(readFileSync(fixture.agentPath, 'utf8'), /^version = "0\.1\.10"$/mu);
+    assert.equal(existsSync(fixture.configPath), false, 'startup migration must not write config.toml');
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test('the published 0.1.8 agent is refreshed by 0.1.10 only when its bytes match', async () => {
+  const fixture = codexHomeFixture();
+  const template = readFileSync(join(ROOT, 'codex', 'dsh-delegate.toml'), 'utf8');
+  const prior = template.replace(/^version = "0\.1\.10"$/mu, 'version = "0.1.8"');
+  try {
+    mkdirSync(dirname(fixture.agentPath), { recursive: true });
+    writeFileSync(fixture.agentPath, prior);
+    assert.equal(digest(prior), '5cd02783d0fd5b1ffe5375e5d0e1b009931163e6f4fa87de9ea3c9c399fcd40e');
+    assert.ok(
+      KNOWN_AGENT_TEMPLATES.some((entry) => entry.version === '0.1.8' && entry.sha256 === digest(prior)),
+      'the rebuild of the shipped template is an enumerable known build',
+    );
+
+    const before = await runCodexAction('status', { codexHome: fixture.home, env: isolatedEnv(fixture.home) });
+    assert.equal(before.status.agent.state, 'outdated');
+
+    const installed = await runCodexAction('install', { codexHome: fixture.home, env: isolatedEnv(fixture.home) });
+    assert.ok(installed.changed.includes('agent'));
+    assert.match(readFileSync(fixture.agentPath, 'utf8'), /^version = "0\.1\.10"$/mu);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test('the published 0.1.9 agent is refreshed by 0.1.10 only when its bytes match', async () => {
+  const fixture = codexHomeFixture();
+  const template = readFileSync(join(ROOT, 'codex', 'dsh-delegate.toml'), 'utf8');
+  const prior = template.replace(/^version = "0\.1\.10"$/mu, 'version = "0.1.9"');
+  try {
+    mkdirSync(dirname(fixture.agentPath), { recursive: true });
+    writeFileSync(fixture.agentPath, prior);
+    assert.equal(digest(prior), 'b5db667d114baf881f59c9367a80137379960b1fccb524c883ab0edcf9f0d516');
+    assert.ok(
+      KNOWN_AGENT_TEMPLATES.some((entry) => entry.version === '0.1.9' && entry.sha256 === digest(prior)),
+      'the rebuild of the shipped template is an enumerable known build',
+    );
+
+    const before = await runCodexAction('status', { codexHome: fixture.home, env: isolatedEnv(fixture.home) });
+    assert.equal(before.status.agent.state, 'outdated');
+
+    const installed = await runCodexAction('install', { codexHome: fixture.home, env: isolatedEnv(fixture.home) });
+    assert.ok(installed.changed.includes('agent'));
+    assert.match(readFileSync(fixture.agentPath, 'utf8'), /^version = "0\.1\.10"$/mu);
   } finally {
     fixture.cleanup();
   }

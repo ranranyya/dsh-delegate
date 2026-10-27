@@ -4,7 +4,7 @@ import { CODEX_ACTIONS, ROUTES, defaultDraft, documentFromDraft, draftFromSettin
 import {
   CONVERSATION_LABELS,
   CONVERSATION_MODES,
-  conversationModeLabel,
+  CONVERSATION_POLICY_LABEL,
   conversationOf,
 } from '../src/client/api.js';
 
@@ -76,26 +76,27 @@ test('the Codex integration uses one route and offers no "status" action to the 
   assert.equal(JSON.stringify(defaultDraft()).includes('codex'), false);
 });
 
-// --- Conversation mode in the settings surface ------------------------------
-//
-// The control only works if the value survives the whole page round trip: draft
-// -> save -> reload -> public projection. A mode that is displayed but dropped on
-// save would silently revert to the default, which is exactly the bug this
-// grouping feature cannot have.
 
-test('the default draft carries the new-conversation default', () => {
-  assert.deepEqual(defaultDraft().conversation, { mode: 'new' });
-  assert.equal(CONVERSATION_MODES[0], 'new', 'new is the default the UI opens on');
+// --- The retired conversation control ----------------------------------------
+//
+// There is no mode control on the page any more. What remains is a compatibility
+// concern with one property: a save must not rewrite an operator's stored document
+// into a state they did not choose, and the value must never influence a run.
+
+test('the page has no conversation-mode choice left to offer', () => {
+  assert.deepEqual([...CONVERSATION_MODES], ['new', 'reuse'], 'the ids still exist so a stored document renders');
+  assert.match(CONVERSATION_LABELS.reuse, /已移除/, 'the label states that the capability is gone');
+  assert.equal(typeof CONVERSATION_POLICY_LABEL, 'string');
+  assert.match(CONVERSATION_POLICY_LABEL, /continueFromTaskId/);
 });
 
-test('a stored reuse mode opens as reuse and is written back on save', () => {
+test('a stored legacy reuse value is preserved verbatim, not silently rewritten', () => {
   const draft = draftFromSettings({ schemaVersion: 1, conversation: { mode: 'reuse' } });
-  assert.deepEqual(draft.conversation, { mode: 'reuse' }, 'the page must reopen on the stored mode');
-  assert.deepEqual(documentFromDraft(draft).conversation, { mode: 'reuse' }, 'and it must be saved back');
+  assert.deepEqual(draft.conversation, { mode: 'reuse' }, 'the page must reopen on what the document says');
+  assert.deepEqual(documentFromDraft(draft).conversation, { mode: 'reuse' }, 'and it must be saved back unchanged');
 });
 
 test('a document with no conversation block opens as the default, and saving states it', () => {
-  // Every document written before this field existed, and every fresh install.
   const draft = draftFromSettings({ schemaVersion: 1 });
   assert.deepEqual(draft.conversation, { mode: 'new' });
   assert.deepEqual(documentFromDraft(draft).conversation, { mode: 'new' });
@@ -108,19 +109,23 @@ test('an unknown stored mode falls back to the default instead of being echoed',
   assert.deepEqual(documentFromDraft(draft).conversation, { mode: 'new' });
 });
 
-test('the conversation mode label is Chinese and covers both modes', () => {
-  for (const mode of CONVERSATION_MODES) {
-    assert.equal(typeof CONVERSATION_LABELS[mode], 'string');
-    assert.ok(CONVERSATION_LABELS[mode].length > 0);
-    assert.equal(conversationModeLabel(mode), CONVERSATION_LABELS[mode]);
-  }
-  assert.equal(conversationModeLabel('bogus'), 'bogus');
-});
-
 test('conversationOf resolves an absent or malformed block without inventing a mode', () => {
   assert.deepEqual(conversationOf(undefined), { mode: 'new' });
   assert.deepEqual(conversationOf(null), { mode: 'new' });
   assert.deepEqual(conversationOf({}), { mode: 'new' });
   assert.deepEqual(conversationOf({ conversation: { mode: 'reuse' } }), { mode: 'reuse' });
   assert.deepEqual(conversationOf({ conversation: true }), { mode: 'new' });
+});
+
+
+test('the built page no longer offers a conversation-mode control, and states the rule', async () => {
+  // A control that is hidden in the source but present in the built bundle would
+  // still reach an operator, so the assertion is on `lib/client.js`.
+  const { readFileSync } = await import('node:fs');
+  const { join } = await import('node:path');
+  const built = readFileSync(join(process.cwd(), 'lib', 'client.js'), 'utf8');
+  assert.equal(/dshdg-conversation-mode/u.test(built), false, 'the retired mode select must be gone from the bundle');
+  assert.match(built, /dshdg-conversation-policy/u, 'the panel must state the per-task rule instead');
+  assert.match(built, /continueFromTaskId/u, 'and name the only way to continue a thread');
+  assert.match(built, /已移除/u, 'and say that the reuse setting was removed');
 });

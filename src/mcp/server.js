@@ -55,7 +55,7 @@ export const SUPPORTED_PROTOCOL_VERSIONS = Object.freeze([
 export const LATEST_PROTOCOL_VERSION = SUPPORTED_PROTOCOL_VERSIONS[0];
 
 /** Identifies this server in the handshake. */
-export const SERVER_INFO = Object.freeze({ name: 'dsh-delegate', version: '0.1.8' });
+export const SERVER_INFO = Object.freeze({ name: 'dsh-delegate', version: '0.1.10' });
 
 /** Bound on a tool result's text. A task view can be large; a model's context cannot. */
 export const MAX_TOOL_TEXT_CHARS = 20_000;
@@ -113,7 +113,11 @@ export const TOOLS = Object.freeze([
     title: 'Submit delegated task',
     description: 'Submit one prompt to run as a delegated task while the DSH delegation switch is enabled. '
       + 'Returns the task identity and state; '
-      + 'it does not wait for the work to finish and it is not host approval.',
+      + 'it does not wait for the work to finish and it is not host approval. '
+      + 'Omit continueFromTaskId to start a NEW task conversation (always a fresh DSH session, even in a '
+      + 'directory used before). Set it to the task id of the earlier delegated task this submission is a '
+      + 'follow-up to, to continue exactly that task thread (same DSH Workspace and Session); an unknown, '
+      + 'unfinished, removed or differently-pathed parent is refused rather than started as a new conversation.',
     inputSchema: Object.freeze({
       type: 'object',
       properties: {
@@ -123,6 +127,13 @@ export const TOOLS = Object.freeze([
           type: 'object',
           description: 'Optional per-task overrides (model/effort/timeout). Validated by the harness.',
           additionalProperties: true,
+        },
+        continueFromTaskId: {
+          type: 'string',
+          description: 'Task id of the earlier delegated task this submission continues. '
+            + 'Use it only for a follow-up change or retry that belongs to that same task; '
+            + 'omit it for an unrelated task. The follow-up must run in that task\'s own execution path '
+            + '(its worktree when it was isolated, its checkout when it was shared).',
         },
       },
       required: ['workspacePath', 'prompt'],
@@ -855,7 +866,10 @@ export function createMcpServer(options) {
             capabilities: { tools: { listChanged: false } },
             serverInfo: SERVER_INFO,
             instructions: 'Delegated coding on the DSH host. Submission is allowed only while the operator '
-              + 'has enabled the delegation switch in the authenticated DSH settings page.',
+              + 'has enabled the delegation switch in the authenticated DSH settings page. '
+              + 'Every submission starts a new task conversation unless it passes continueFromTaskId naming the '
+              + 'earlier delegated task it is a follow-up to; that explicit id is the only way to continue an '
+              + 'existing task thread.',
           });
         }
         case 'notifications/initialized':

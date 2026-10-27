@@ -656,6 +656,23 @@ test('a root workspace whose supplied path differs only by case or trailing sepa
   }
 });
 
+test('a Windows root matches Git forward slashes against realpath backslashes', {
+  skip: process.platform !== 'win32',
+}, async () => {
+  const { directory, dispose } = await tempWorkspace();
+  try {
+    const realRoot = await realpathOf(directory);
+    const gitRoot = realRoot.replace(/\\/gu, '/');
+    const runGit = runner({ topLevel: gitRoot });
+    const result = await preflightWorkspace({ runGit }, { workspacePath: directory, allowShared: true });
+
+    assert.equal(result.isolation, 'worktree');
+    assert.equal(result.reason, PREFLIGHT_REASONS.cleanRepository);
+  } finally {
+    await dispose();
+  }
+});
+
 test('the nested-path regression does not depend on the real filesystem being a repository', async () => {
   // Belt and braces: the decision comes from the measured top level, so a nested
   // path whose reported top level is a *sibling* is not a root either.

@@ -151,12 +151,20 @@ async function status({ res, connection, deps }) {
 
 async function submitTask({ req, res, connection, deps }) {
   const body = await readJsonBody(req);
+  // The continuation identity, or `undefined` for a new task conversation. It is
+  // passed through as a value, never inferred from the workspace or from earlier
+  // submissions: only the caller knows whether this is a follow-up, and the engine
+  // validates it fail-closed.
+  const continueFromTaskId = body.continueFromTaskId === undefined || body.continueFromTaskId === null
+    ? undefined
+    : body.continueFromTaskId;
   if (deps.engine.authorizationMode === 'switch') {
     const task = await deps.engine.start({
       connectionId: connection.connectionId,
       workspacePath: body.workspacePath,
       prompt: body.prompt,
       overrides: body.overrides,
+      ...(continueFromTaskId === undefined ? {} : { continueFromTaskId }),
     });
     sendJson(res, 202, { ok: true, task });
     return;
@@ -173,6 +181,7 @@ async function submitTask({ req, res, connection, deps }) {
     workspacePath: body.workspacePath,
     prompt: body.prompt,
     overrides: body.overrides,
+    ...(continueFromTaskId === undefined ? {} : { continueFromTaskId }),
   });
   sendJson(res, 202, { ok: true, task });
 }

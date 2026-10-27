@@ -1,6 +1,6 @@
 # Codex integration contract
 
-Status: implemented in 0.1.8. Scope: Codex only. Claude Code and other hosts are
+Status: implemented in 0.1.10. Scope: Codex only. Claude Code and other hosts are
 out of scope and no surface for them is provided.
 
 This document is the contract between the plugin's settings page (browser half),
@@ -14,7 +14,7 @@ README.
 
 | Path | Owner | The plugin may | The plugin may never |
 | --- | --- | --- | --- |
-| `$CODEX_HOME/agents/dsh-delegate.toml` | managed copy of `codex/dsh-delegate.toml` | create it **exclusively** when absent; refresh it when it is **byte-identical to a known shipped build** (enumerated digests, `KNOWN_AGENT_TEMPLATES`); delete it on `remove` only after re-reading it and finding the same bytes it classified | overwrite or delete a file that is not that exact build — including a file with an old version line whose body was edited, and including a file that changed in the window between the status read and the removal |
+| `$CODEX_HOME/agents/dsh-delegate.toml` | managed copy of `codex/dsh-delegate.toml` | create it **exclusively** on explicit install when absent; refresh a byte-exact known build during plugin startup or explicit install; delete it on `remove` only after re-reading it and finding the same bytes it classified | overwrite or delete a file that is not that exact build — including a file with an old version line whose body was edited, and including a file that changed in the window between the status read and the write/removal |
 | `$CODEX_HOME/config.toml`, table `mcp_servers.dsh-delegate` | operator, with one managed entry | add the entry when absent; update `command`/`args`/its own `env.DSH_DELEGATE_DISCOVERY_FILE` when the entry carries **the plugin marker** *and* is the exact shape this plugin writes | touch any other key, table, comment or ordering; adopt, update or delete an unmarked same-name entry, even one whose values coincide |
 | `$CODEX_HOME` and `$CODEX_HOME/agents` | Codex | read them (lstat **and** the Windows file attributes); create `agents` (`0700`) when both are real directories | create them relative to the process working directory; **follow a link at either level** (POSIX symlink, Windows junction/reparse point) for any read-through, write or delete |
 | DSH local-call switch | operator | report it | change it |
@@ -262,11 +262,20 @@ scope. Concretely, `repair`:
 * does not create `$CODEX_HOME/agents` when it is missing;
 * still refuses a `conflict` MCP entry with `MCP_ENTRY_CONFLICT`, exactly like `install`.
 
-Updating a stale agent is therefore always an explicit `install`.
+Updating a stale agent is an explicit `install`, or the byte-exact startup refresh
+described below.
 
-**No write happens on plugin load, on package install, or when the settings page
-opens.** The page's `init()` issues a `GET`; the three buttons are the only
-callers of the `POST`.
+**No action runs when the settings page opens, and package install writes nothing.**
+The page's `init()` issues a `GET`; the three buttons are the only callers of the
+`POST`.
+
+**The single write at plugin load is the agent refresh.** `apply()` calls the seam's
+`refreshKnownAgent()` once, which refreshes `agents/dsh-delegate.toml` only when its
+complete bytes equal one of the enumerated `KNOWN_AGENT_TEMPLATES` digests (section 5).
+It never creates a missing agent, never creates `agents/`, never edits `config.toml`
+and never touches a `modified`/`conflict` file: everything else stays an explicit
+`install`. A refusal or failure is logged and startup continues, so a Codex problem
+cannot stop the plugin from loading.
 
 ---
 
@@ -294,7 +303,7 @@ successful diagnosis.
 ```jsonc
 {
   "codexHome": "…",
-  "packageVersion": "0.1.8",
+  "packageVersion": "0.1.10",
   "boundary": { "blocked": false, "link": null, "unknown": false, "home": "directory", "agents": "directory" },
   "agent": {
     "path": "…", "state": "installed", "installed": true, "managed": true,
@@ -380,7 +389,7 @@ remain those selected in the plugin settings.
 ## 5. The agent file
 
 ```toml
-version = "0.1.8"   # stamped from package.json when written
+version = "0.1.10"   # stamped from package.json when written
 name = "dsh-delegate"
 description = "…"
 developer_instructions = """…"""
@@ -394,9 +403,14 @@ session's MCP tools, and a second definition would start a second server.
 
 * `installed` — byte-identical to the file this build would write;
 * `outdated` — byte-identical to one of the enumerated `KNOWN_AGENT_TEMPLATES`
-  digests (published builds only: `0.1.6` and `0.1.7` today, and any later build listed when it
-  is packed and verified);
+  digests (published builds only: `0.1.6`, both `0.1.7` builds, `0.1.8` and
+  `0.1.9` today, plus any later build listed when it is packed and verified);
 * `modified`/`conflict` — everything else.
+
+At plugin startup, an `outdated` agent is refreshed automatically only when its
+bytes still match a known shipped build. This does not create a missing agent or
+edit `config.toml`. A file with any other content is preserved, even when its
+version line names an older release.
 
 The version line is *never* the proof. A file that still starts with the managed
 header, still contains the dispatch rules, but has an old or invented version line
@@ -469,6 +483,18 @@ one fails the build:
     existing edits' ownership or risk is unclear.
 12. **No secrets.** Never read, request, store or relay provider credentials or
     connection tokens.
+13. **Task threads are explicit.** A submission starts a NEW DSH task conversation
+    by default; a directory-level reuse setting no longer exists. `continueFromTaskId`
+    is passed **only** for a follow-up change, correction or retry that belongs to one
+    earlier delegated task, and its value is the latest prior task id of that chain.
+    An unrelated task, a new topic or a different workspace omits the field entirely:
+    an id is never reused "to keep context" and never guessed. A follow-up to a
+    `worktree` task keeps its original source `workspacePath` for preflight and
+    submit; the plugin resolves the same internal tree and continues its earlier
+    uncommitted changes there. Never send the tree's internal execution path as the
+    authorization path or choose a new isolation override. A refusal naming an
+    unavailable or mismatched tree is reported and escalated, never worked around
+    by re-submitting as a new task. The run's report states which of the two happened.
 
 ### 5.2 What the file cannot guarantee: `@` selection
 
@@ -530,3 +556,10 @@ session (or a restart) is required to load the new file and the new MCP entry.
 | the workspace path is relative, missing or a file | `block` / `PREFLIGHT_WORKSPACE_INVALID` or `PREFLIGHT_NOT_A_DIRECTORY`; nothing is resolved against the process cwd |
 | `delegate_preflight` is called while the switch is off | answered normally: it authorizes nothing, and that is when a coordinator needs it most |
 | `delegate_preflight` is sent `allowShared: "true"` | `MCP_ARGUMENT_TYPE`; the plane is not called |
+| `delegate_submit` is called twice for one directory | two Sessions in one Workspace: a new submission never continues a previous one |
+| `delegate_submit` sends `continueFromTaskId` for an unknown, pruned or live parent | the run fails with `JOB_CONTINUATION_REFUSED` and `error.details.session` = `SESSION_CONTINUATION_UNKNOWN` / `SESSION_CONTINUATION_STATE`; no conversation is started |
+| a follow-up names a parent that ran elsewhere (another directory, another worktree, another repository) | `JOB_CONTINUATION_REFUSED` with `SESSION_CONTINUATION_PATH_MISMATCH` / `SESSION_CONTINUATION_WORKSPACE_MISMATCH`; nothing runs |
+| a follow-up to a `worktree` task is submitted with the source checkout | accepted: the source path remains the authorization/preflight path, and the engine restores the parent's exact managed tree internally |
+| a follow-up's recorded tree was removed or belongs to another run | `SESSION_CONTINUATION_UNAVAILABLE` with the stated reason; no fresh tree is prepared |
+| `continueFromTaskId` is not a string | refused at the MCP schema (`MCP_ARGUMENT_TYPE`) and again by the engine (`JOB_CONTINUATION_REFUSED`) |
+| the settings page is asked to save a conversation mode | `setConversation` refuses with `CONVERSATION_MODE_REMOVED`; the stored legacy value is untouched and still inert |

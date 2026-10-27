@@ -13,10 +13,11 @@
 //   * the discovery path is the one *this* activation published (or would publish),
 //     so the MCP entry points Codex at the same DSH the plugin is running in —
 //     never at a repository checkout, never at a hard-coded default;
-//   * nothing is written here. `status` only reads; `run` forwards an explicit
-//     operator action.
+//   * status only reads and run forwards an explicit operator action. The sole
+//     startup write is `refreshKnownAgent`, which refreshes a byte-exact shipped
+//     template and never creates a file or edits config.toml.
 
-import { runCodexAction, readCodexStatus, resolveCodexHome } from './installer.js';
+import { runCodexAction, readCodexStatus, refreshKnownAgentTemplate, resolveCodexHome } from './installer.js';
 import { resolveEndpointDiscoveryPath } from '../runtime/endpoint-discovery.js';
 
 /**
@@ -70,6 +71,14 @@ export function createCodexSeam(options = {}) {
   });
 
   return {
+    /**
+     * Migrate a byte-exact, known prior agent template during plugin startup.
+     * This never creates the file or edits Codex MCP configuration.
+     * @returns {Promise<object>} migration outcome.
+     */
+    async refreshKnownAgent() {
+      return await refreshKnownAgentTemplate(base());
+    },
     /**
      * Read the Codex state. Never writes.
      * @returns {Promise<object>} status document.

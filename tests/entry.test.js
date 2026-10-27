@@ -1,4 +1,4 @@
-﻿test('a replaced preset registry retires the composition the plugin registered in the old one', async () => {
+test('a replaced preset registry retires the composition the plugin registered in the old one', async () => {
   // `apply` observes `agentPresets` on every review, because the service can be
   // replaced after load. The composition already registered in the previous
   // registry must be retired at the swap: forgetting it would leave a live
@@ -61,7 +61,33 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
+import { useDirectoryClassifier } from '../src/codex/installer.js';
 import * as entry from '../src/index.js';
+
+// Plugin startup refreshes a byte-exact shipped Codex agent, and that read inspects
+// `$CODEX_HOME` through {@link useDirectoryClassifier} territory: on Windows the
+// answer normally comes from a `powershell.exe` child. A suite has to run where a
+// child cannot be spawned at all, so this file answers on the platform's behalf
+// through the documented classifier hook — the product code path stays the same,
+// only the platform answer is supplied. `lstat` still does the work: a missing Codex
+// home, a real directory and a junction each get the verdict the platform would give.
+useDirectoryClassifier(async (paths) => {
+  const { lstatSync } = await import('node:fs');
+  const kinds = new Map();
+  for (const path of paths) {
+    let info = null;
+    try {
+      info = lstatSync(path);
+    } catch {
+      info = null;
+    }
+    if (info === null) kinds.set(path, 'missing');
+    else if (info.isSymbolicLink()) kinds.set(path, 'link');
+    else if (info.isDirectory()) kinds.set(path, 'directory');
+    else kinds.set(path, 'other');
+  }
+  return kinds;
+});
 
 test('the entry declares a name and the services the harness must provide', () => {
   assert.equal(entry.name, 'dsh-delegate');
@@ -212,7 +238,9 @@ async function applyWithRealRuntime(options = {}) {
   ctx.llm = new LlmRuntime(ctx);
 
   const previousHome = process.env.DSH_HOME;
+  const previousCodexHome = process.env.CODEX_HOME;
   process.env.DSH_HOME = directory;
+  process.env.CODEX_HOME = options.codexHome ?? join(directory, 'codex-home');
   let published = null;
   ctx.provide = (serviceName, value) => { published = value; };
   try {
@@ -222,6 +250,8 @@ async function applyWithRealRuntime(options = {}) {
     });
   } finally {
     process.env.DSH_HOME = previousHome;
+    if (previousCodexHome === undefined) delete process.env.CODEX_HOME;
+    else process.env.CODEX_HOME = previousCodexHome;
   }
 
   return { published, llm: ctx.llm, routes, directory, ctx, effects };
@@ -242,6 +272,35 @@ async function applyWithRecorder(options = {}) {
   const handle = await applyWithRealRuntime(options);
   return handle;
 }
+
+test('plugin startup refreshes exact shipped Codex agents and leaves unknown files alone', async () => {
+  const { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const { cleanup } = await import('./helpers/fakes.js');
+  const prior = readFileSync(new URL('./fixtures/codex-agent-0.1.7.toml', import.meta.url), 'utf8')
+    .replace(/\r?\n/gu, '\r\n');
+  const current = readFileSync(new URL('../codex/dsh-delegate.toml', import.meta.url), 'utf8');
+
+  for (const entry of [
+    { name: 'known', contents: prior, expected: current },
+    { name: 'edited', contents: `${prior}# operator note\r\n`, expected: `${prior}# operator note\r\n` },
+  ]) {
+    const codexHome = mkdtempSync(join(tmpdir(), `dsh-delegate-codex-${entry.name}-`));
+    const agentPath = join(codexHome, 'agents', 'dsh-delegate.toml');
+    mkdirSync(join(codexHome, 'agents'), { recursive: true });
+    writeFileSync(agentPath, entry.contents, 'utf8');
+    let handle;
+    try {
+      handle = await applyWithRealRuntime({ codexHome });
+      assert.equal(readFileSync(agentPath, 'utf8'), entry.expected);
+      assert.equal(existsSync(join(codexHome, 'config.toml')), false, 'startup migration must not install an MCP entry');
+    } finally {
+      if (handle !== undefined) await cleanup(handle.directory);
+      rmSync(codexHome, { recursive: true, force: true });
+    }
+  }
+});
 
 test('apply wires a lazy review composition and registers nothing at activation', async () => {
   const { nativePresetRegistry } = await import('./helpers/fakes.js');
@@ -323,6 +382,22 @@ test('without a preset registry the review composition reports itself unavailabl
     assert.equal(late.registerCalls, 1);
     await published.reviewPreset.dispose();
     assert.equal(late.definitions.size, 0);
+  } finally {
+    await cleanup(directory);
+  }
+});
+
+test('the runtime report states the per-task conversation rule and exposes no mode', async () => {
+  // The removed control must be gone from the report an operator (and the settings
+  // page) reads: a leftover `conversationMode` field would tell a reader that a
+  // directory-level choice still exists.
+  const { published, directory } = await applyWithRealRuntime();
+  const { cleanup } = await import('./helpers/fakes.js');
+  try {
+    const report = published.deps.describeRuntime();
+    assert.equal('conversationMode' in report, false, 'the retired mode must not be reported');
+    assert.equal(report.conversation, 'per-task');
+    assert.equal(report.conversationContinuation, 'continueFromTaskId');
   } finally {
     await cleanup(directory);
   }

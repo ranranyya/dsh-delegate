@@ -555,9 +555,12 @@ function effectiveView(value) {
       model: label(review.model),
       reasoningEffort: label(review.reasoningEffort),
     },
-    // The conversation mode this task was frozen with, so a historical record
-    // states whether the run continued a conversation. No session id is stored.
-    conversation: conversationView(value.conversation),
+    // The conversation policy the task was frozen with (a rule, not a stored
+    // setting) plus, in `value.conversation` below, what the run actually did. No
+    // session id is stored here, so history is not a way back into a conversation.
+    conversation: isPlainObject(value.conversation)
+      ? { policy: label(value.conversation.policy) }
+      : null,
     provenance: {
       projectPath: path(provenance.projectPath),
       projectKey: path(provenance.projectKey),
@@ -685,12 +688,15 @@ function executionView(value, ctx) {
 
 /**
  * @returns {object | null} bounded conversation placement. `sessionId` and every
- *   other resumable handle is absent on purpose.
+ *   other resumable handle is absent on purpose: the durable job history must not be
+ *   a second way into a conversation. `kind`/`continuedFromTaskId` state whether the
+ *   run started a new thread or continued the task it named.
  */
 function conversationView(value) {
   if (!isPlainObject(value)) return null;
   return {
-    mode: knownValue(value.mode, ['new', 'reuse']),
+    kind: knownValue(value.kind, ['new', 'continuation']),
+    continuedFromTaskId: label(value.continuedFromTaskId),
     reused: value.reused === true,
     workspaceId: label(value.workspaceId),
     workspacePath: path(value.workspacePath),

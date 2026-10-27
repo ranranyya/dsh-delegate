@@ -9,12 +9,11 @@
 import { posix, win32 } from 'node:path';
 
 import {
-  CONVERSATION_MODES,
-  DEFAULT_CONVERSATION_MODE,
   DEFAULT_ISOLATION,
   EFFORT_ORDER,
   ISOLATION_MODES,
   KNOWN_EFFORTS,
+  LEGACY_CONVERSATION_MODES,
   LIMITS,
   SCHEMA_VERSION,
   SUPPORTED_PROTOCOLS,
@@ -514,13 +513,18 @@ export function validateProjectOverride(value, providers) {
 }
 
 /**
- * Validate the conversation block.
+ * Validate the retired conversation block.
  *
- * The mode is a closed vocabulary with one documented default. An absent block
- * (every document written before this field existed) resolves to `new`; an
- * unrecognized value is refused rather than mapped onto a default, because
- * "resume the previous conversation" is exactly the kind of behaviour an
- * operator must not get by accident.
+ * The directory-level mode is gone: what a run does with its DSH conversation is
+ * now decided per submission (`continueFromTaskId`), not by a saved setting. A
+ * document that still carries `conversation.mode` is accepted so an upgraded
+ * installation keeps loading, and the stored value is preserved verbatim so this
+ * build never rewrites an operator's file on read.
+ *
+ * The value is INERT. Nothing consults it, which is what makes a legacy
+ * `reuse` incapable of causing an implicit reuse. A value that is not one of the
+ * documented legacy ids is still refused rather than quietly normalized, because a
+ * hand-edited document should be reported, not silently reinterpreted.
  * @param {unknown} value - candidate conversation block.
  * @returns {{ mode: string }} normalized block.
  */
@@ -529,17 +533,23 @@ export function validateConversationSettings(value) {
   if (typeof source !== 'object' || Array.isArray(source)) {
     throw new ConfigError('CONVERSATION_INVALID', 'conversation settings must be an object', {});
   }
+  // An empty string is not "absent": a document that explicitly stores a blank mode
+  // is malformed, not a request for the default. Only a missing field takes the
+  // default, so a hand-edited file is reported instead of silently reinterpreted.
+  const requested = source.mode === undefined ? LEGACY_CONVERSATION_MODES[0] : source.mode;
   const mode = requireString(
-    source.mode ?? DEFAULT_CONVERSATION_MODE,
+    requested,
     'CONVERSATION_MODE_UNSUPPORTED',
     'conversation.mode',
     { max: 16 },
   );
-  if (!CONVERSATION_MODES.includes(mode)) {
+  if (!LEGACY_CONVERSATION_MODES.includes(mode)) {
     throw new ConfigError('CONVERSATION_MODE_UNSUPPORTED', `conversation mode ${mode} is not supported`, {
       field: 'conversation.mode',
       mode,
-      supported: [...CONVERSATION_MODES],
+      supported: [...LEGACY_CONVERSATION_MODES],
+      deprecated: true,
+      reason: 'the directory-level conversation mode has been removed; use continueFromTaskId for a follow-up',
     });
   }
   return { mode };

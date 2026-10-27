@@ -1,10 +1,11 @@
 // dsh-delegate — native DSH plugin entry point.
 //
 // Load order matters and is visible here: services are injected, configuration is
-// read, both HTTP planes are registered on their respective carriers, and the
-// native provider/adapter/worktree/history machinery is constructed. The
-// persisted local-call switch is restored at startup and defaults to OFF; no
-// task is dispatched until an operator enables it in the DSH plugin settings.
+// read, a byte-exact shipped Codex agent is refreshed, both HTTP planes are
+// registered on their respective carriers, and the native
+// provider/adapter/worktree/history machinery is constructed. The persisted
+// local-call switch is restored at startup and defaults to OFF; no task is
+// dispatched until an operator enables it in the DSH plugin settings.
 //
 // Service access is deliberately split in three:
 //
@@ -140,9 +141,11 @@ export async function apply(ctx, config = {}) {
 
   const history = new HistoryStore(dataDir);
   const worktrees = new WorktreeManager({ runGit }, { rootDir: join(dataDir, 'worktrees') });
-  // The session-identity map: canonical execution path -> DSH Workspace/Session
-  // ids, so an opt-in `reuse` run can continue the conversation for the same
-  // directory. Stores identities only, never transcript content.
+  // The task-thread identity map: task id -> the DSH Workspace/Session that task
+  // drove, plus the paths and (for an isolated run) the tree ownership facts a
+  // `continueFromTaskId` follow-up is validated against. Keyed by task, never by
+  // directory, so nothing here can make a new submission continue an old
+  // conversation. Stores identities only, never transcript content.
   const sessionStore = new SessionStore(dataDir, { logger });
 
   // The independent review composes its own read-only agent preset instead of
@@ -222,12 +225,22 @@ export async function apply(ctx, config = {}) {
     logger,
     delegationEnabled: initialSettings.delegationEnabled === true,
     authorizationMode: 'switch',
-    // The Codex integration is an explicit operator action reached from the
-    // settings page. It is constructed here (never run on load) and its version is
-    // this plugin's own, so an upgraded package reports the new agent template as
-    // available instead of silently leaving an older file behind.
+    // Startup only refreshes an agent file whose bytes match a shipped template.
+    // Agent creation and MCP registration remain explicit settings-page actions.
     codex: resolveCodexActionSeam({ version: PLUGIN_VERSION }),
   };
+
+  try {
+    const migration = await deps.codex?.refreshKnownAgent();
+    if (migration?.changed.includes('agent')) {
+      logger?.info?.(`dsh-delegate: refreshed a managed Codex agent template to ${PLUGIN_VERSION}`);
+    }
+    for (const refusal of migration?.refused ?? []) {
+      logger?.warn?.(`dsh-delegate: Codex agent refresh was refused (${refusal.code})`);
+    }
+  } catch (error) {
+    logger?.warn?.(`dsh-delegate: Codex agent refresh check failed (${diagnostic(error?.message ?? error, 200)})`);
+  }
 
   /**
    * Bring the native routes and the adapter's served snapshot to the state this
@@ -358,7 +371,12 @@ export async function apply(ctx, config = {}) {
     // being described by the load-time snapshot.
     workspaceController: deps.workspaces?.current === null ? 'unavailable' : 'available',
     sessionController: deps.sessionController?.current === null ? 'unavailable' : 'available',
-    conversationMode: initialSettings.conversation.mode,
+    // The conversation rule, not a stored setting: a new submission starts a new DSH
+    // conversation, and a follow-up continues only the task named by
+    // `continueFromTaskId`. Reported so an operator can see that there is no longer
+    // a directory-level mode to configure.
+    conversation: 'per-task',
+    conversationContinuation: 'continueFromTaskId',
     // Whether the review's own composition was ever registered, i.e. whether a
     // read-only review has been attempted in this activation. Lazy by design.
     reviewPreset: reviewPreset.createdId ?? 'not-registered',
@@ -418,7 +436,8 @@ export async function apply(ctx, config = {}) {
     locks.releaseAll();
   });
 
-  logger?.info?.(`dsh-delegate: loaded (local MCP switch ${initialSettings.delegationEnabled === true ? 'on' : 'off'}, conversation ${initialSettings.conversation.mode})`);
+  logger?.info?.(`dsh-delegate: loaded (local MCP switch ${initialSettings.delegationEnabled === true ? 'on' : 'off'}, `
+    + 'conversation per task: new unless continueFromTaskId names the task to continue)');
 
   // Published as a Cordis service, not assigned: `ctx.provide` is the only legal
   // way to add a property, and its disposer removes the face on unload.
@@ -438,7 +457,7 @@ export async function apply(ctx, config = {}) {
 }
 
 /** Version reported by the runtime facts block. Mirrors `package.json`. */
-const PLUGIN_VERSION = '0.1.8';
+const PLUGIN_VERSION = '0.1.10';
 
 /**
  * Resolve the plugin's own data directory.

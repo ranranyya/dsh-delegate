@@ -39,7 +39,7 @@ Desktop 侧的包操作只能交给应用完成——不要在 Desktop 的正式
 
    ```bash
    npm pack
-   #    → dsh-delegate-0.1.8.tgz
+   #    → dsh-delegate-0.1.10.tgz
    ```
 
 2. 打开 Desktop 的 **Plugins manager**，用它的 add-plugin（添加插件）入口选择上一步生成的
@@ -54,7 +54,7 @@ Desktop 侧的包操作只能交给应用完成——不要在 Desktop 的正式
 
 ```bash
 # 装进一个 profile（例：web）
-dsh plugin --profile web add ./dsh-delegate-0.1.8.tgz && dsh plugin --profile web why dsh-delegate
+dsh plugin --profile web add ./dsh-delegate-0.1.10.tgz && dsh plugin --profile web why dsh-delegate
 
 # 启动（首次启动会自动把插件 bundle 追加到 dsh.profile.bundles）
 dsh --profile web
@@ -67,7 +67,7 @@ dsh --profile web
 ### 说明与注意
 
 - **不要装进你正在用的正式 profile 做试验。** 建议先用一次性 profile：
-  `dsh plugin --profile dsh-delegate-try add ./dsh-delegate-0.1.8.tgz`，再把
+  `dsh plugin --profile dsh-delegate-try add ./dsh-delegate-0.1.10.tgz`，再把
   `DSH_HOME` 指向临时目录做隔离验证。该命令同样只用于 CLI profile。
 - 该包声明了 `@deepseek-ai/dsh-*` 的 peer，若你的包管理器默认自动安装 peer，
   安装过程会尝试解析这些版本。可显式关闭：`npm_config_auto_install_peers=false`
@@ -104,6 +104,12 @@ dsh --profile web
 6. **Codex 集成**——一键安装 Codex 子智能体文件并登记 MCP 条目（见 6.1）；三种状态分开显示。
 
 界面只负责切换本机调用能力和配置；任务由 MCP 宿主提交。
+
+**对话不再是一个设置。** 目录级的「复用上一次对话」开关已移除：每次新的提交都会在它实际执行
+目录对应的 Workspace 里**新开**一条 DSH 会话，即使这个目录此前跑过任务、即使旧设置文档里
+还留着 `conversation.mode: "reuse"`。只有 `delegate_submit` 显式带上
+`continueFromTaskId` 的**跟进任务**才会续接那一条任务会话（同 Workspace、同 Session）。
+详见 `docs/conversation-placement.md`。
 
 ## 4. 本机调用开关
 
@@ -152,6 +158,21 @@ dsh --profile web
 - 开关关闭时，`delegate_submit` 返回 `DELEGATION_DISABLED`；状态、预检、结果和取消工具仍可使用。
   `delegate_preflight` 只读取工作区事实，不创建任何东西，因此不受开关和并发上限限制。
 
+**任务会话与跟进（`continueFromTaskId`）**：`delegate_submit` 有一个可选字段
+`continueFromTaskId`。
+
+- **省略**：永远新开一条 DSH 会话。同一目录之前跑过多少任务都不影响，旧设置里残留的
+  `conversation.mode: "reuse"` 也不会让新提交接续任何旧对话。
+- **填写**：声明本次提交是某个先前任务的跟进，必须续接**那一条**任务会话（同 Workspace、同
+  Session）。只用于属于同一任务的修改、纠正或重试；无关任务一律省略，不要"为了保留上下文"
+  随手复用 id。
+- 续接是**失败即拒绝**：未知/已被清理的父任务、仍在运行的父任务、没有产生对话的失败任务、
+  不同源仓库、不同执行目录、已删除或身份不符的工作树、已不存在的 Session，都会被拒绝
+  （`JOB_CONTINUATION_REFUSED`，具体原因在 `error.details.session`），**不会**悄悄改成新开会话。
+- 工作区状态会被保留：共享模式的任务在原目录继续；隔离工作树的跟进任务仍使用父任务的原始
+  `workspacePath` 做授权和预检，由插件内部恢复**同一棵**受管工作树继续上一次未提交的改动。
+  不要把内部 `execution.workspacePath` 当成新的授权路径，也不要切换隔离模式；同一任务链由工作区锁串行化。
+
 **派工前预检（`delegate_preflight`）**：只读检查一个绝对工作区路径——是否 Git 仓库、是否有
 提交、是否有未提交改动、变更文件总数和一个有上限的路径清单，并给出建议隔离
 （`worktree` / `shared` / `block`）与稳定的原因码。它**不会**创建提交、stash、worktree
@@ -184,11 +205,14 @@ Codex 是唯一支持的宿主。**「Codex 集成」**分页提供一个明确�
 
 需要说明的边界（分页里也有同样的提示）：
 
-- **只有点击才会写文件。** 打开分页、加载插件、安装/升级 `.tgz` 都不会碰 Codex 目录；
-  唯一的写入口是「安装 / 更新 Codex 集成」「仅修复 MCP 配置」「移除插件托管项」三个按钮。
-  「刷新状态」和分页打开时的读取都只是只读诊断。
+- **只有点击才会新建，启动只做受限刷新。** 打开分页、安装/升级 `.tgz` 都不会碰 Codex 目录；
+  新建 agent、登记或迁移 `config.toml` 条目、移除托管项都只能通过「安装 / 更新 Codex 集成」
+  「仅修复 MCP 配置」「移除插件托管项」三个按钮。唯一的例外是**插件启动时的一次受限迁移**：
+  只有当 `agents/dsh-delegate.toml` 与某个**已发布版本的模板逐字节相同**（枚举的摘要表）时，
+  才会把它刷新为当前版本；它**不会**创建缺失的 agent、不会创建 `agents/` 目录、不会写
+  `config.toml`，正文被改过或来源不明的文件一律不动。「刷新状态」和分页打开时的读取都只是只读诊断。
 - **不覆盖、不删除你写的文件。** 同名但内容不同的 `agents/dsh-delegate.toml` 会被保留，
-  界面报告为「已被你修改」；只有与**某个已发布版本逐字节相同**的托管文件才会被更新或删除，
+  界面报告为「不属于已知版本」；只有与**某个已发布版本逐字节相同**的托管文件才会被更新或删除，
   仅版本号变旧、正文被改过一字的文件都不会动。`config.toml` 里由插件写入的条目带托管标记注释；
   **没有该标记**的同名条目（即使 `command`/`args` 与插件要写的完全一致）同样视为你自己写的，
   安装、修复、移除都不会改动它，界面报告为冲突并说明原因。
@@ -236,6 +260,9 @@ Codex 是唯一支持的宿主。**「Codex 集成」**分页提供一个明确�
   再轮询**同一个**任务，把状态、实际 provider/model/effort、
   变更文件、验证证据交回 Codex。子智能体不得为了“让预检通过”去提交、stash、清理或回滚工作区。
   执行完成不等于验收：验收仍由 Codex 负责。
+  **跟进规则**同样写在 agent 文件里：只有属于同一个先前任务的修改/纠正/重试才带上最新的那个
+  任务 id 作为 `continueFromTaskId`；无关任务一律省略，省略即新开对话。隔离工作树的跟进任务
+  保持父任务的原始授权路径，由插件恢复同一棵内部工作树。
 
 也可以用命令行执行同一套动作（脚本化 / CI 用，与设置页共用一份实现）：
 
@@ -261,7 +288,7 @@ node bin/dsh-delegate-codex-agent.js remove    # 只删除插件托管项
 # 不要在 Desktop 的正式 profile 下执行下面的 CLI 命令。
 
 # CLI web profile 的升级：换成本地新包或（将来）新版本
-dsh plugin --profile web add ./dsh-delegate-0.1.8.tgz
+dsh plugin --profile web add ./dsh-delegate-0.1.10.tgz
 
 # 导出：界面里"导出非敏感配置"按钮，或用只读 API
 #   GET /api/dsh-delegate/settings
@@ -313,7 +340,7 @@ dsh plugin --profile web remove dsh-delegate
 
 ```bash
 npm install          # 安装开发依赖（仅本仓库内）
-npm test             # node --test --test-concurrency=1 tests/*.test.js（当前 641 项）
+npm test             # node --test --test-concurrency=1 tests/*.test.js（当前 794 项）
 npm run check:client # scripts/build-client.mjs --check，校验 lib/client.js 与源码一致
 npm run build:client # 由 src/client/index.jsx 重建 lib/client.js
 npm run pack:dry     # npm pack --dry-run

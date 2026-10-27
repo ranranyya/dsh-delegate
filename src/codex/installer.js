@@ -27,9 +27,12 @@
 //      command documented by `isLegacyDesktopCommand` below.
 //
 // Every other byte of `config.toml` is preserved verbatim, including comments,
-// table order and CRLF line endings (see `src/codex/toml.js`). Nothing here runs on
-// plugin load or on package install: each of install/repair/remove is an operator
-// action reached through the settings page, and `status` only reads.
+// table order and CRLF line endings (see `src/codex/toml.js`). Nothing here writes on
+// package install: install/repair/remove are operator actions reached through the
+// settings page, and `status` only reads. The one write that can happen without a
+// click is {@link refreshKnownAgentTemplate}, which plugin startup calls to migrate a
+// file whose complete bytes still match a published template; it never creates a
+// missing agent and never touches `config.toml`.
 //
 // The write sets do not overlap by accident: `install` writes both targets, `repair`
 // writes the MCP entry and nothing else (never creating, refreshing or deleting the
@@ -99,8 +102,8 @@ export const CODEX_ACTIONS = Object.freeze(['status', 'install', 'repair', 'remo
  * Regenerating a digest is a deliberate act: add the entry for a release only after
  * that release has been packed and its agent file verified.
  *
- * The 0.1.6 and 0.1.7 templates are enumerated here because they are published
- * Codex agent builds. A file that is not byte-identical to one of these releases or
+ * The 0.1.6, both 0.1.7 builds, and the 0.1.8 and 0.1.9 templates are enumerated
+ * here because they are published Codex agent builds. A file that is not byte-identical to one of these releases or
  * the current template is reported as `modified`, rather than guessed as ours.
  * The array is intentionally mutable (not frozen) so a test can pin a temporary
  * entry and prove the "known build is refreshable" path without shipping a fake
@@ -114,7 +117,37 @@ export const KNOWN_AGENT_TEMPLATES = [
   },
   {
     version: '0.1.7',
+    sha256: '3b5a58df0f989e87ae160a2952b7699cd5e2978e43a0f9a86c4eceb155d7af92',
+  },
+  {
+    version: '0.1.7',
     sha256: '75ec5f97452754ba22747680598583b8ab457f64a0a3d487b96d73b3a3cc35c7',
+  },
+  {
+    version: '0.1.8',
+    sha256: '56f1cb8ac6460c590e27e3bf44144174dadb09dfd3f904aa9b5ee2a805ae1c4e',
+  },
+  {
+    version: '0.1.9',
+    sha256: '3aa3a2e3a621584ebe002d6a7469ce56c85a899f12d63c26d782f02a47d4d4ca',
+  },
+  // Rebuilds of the 0.1.10 template at the older version markers. A shipped
+  // template changes bytes whenever its instructions change (the per-task
+  // conversation policy is one such change), so the rebuilds of the current
+  // template are enumerable here as well: without them, a file this plugin
+  // published is reported `modified` — "somebody else's file" — and is never
+  // refreshed.
+  {
+    version: '0.1.7',
+    sha256: 'e3689492ee0f24d2defd2a9254b653e7bc54c258dd38fb0c2fc70ce5b386f2b3',
+  },
+  {
+    version: '0.1.8',
+    sha256: '5cd02783d0fd5b1ffe5375e5d0e1b009931163e6f4fa87de9ea3c9c399fcd40e',
+  },
+  {
+    version: '0.1.9',
+    sha256: 'b5db667d114baf881f59c9367a80137379960b1fccb524c883ab0edcf9f0d516',
   },
 ];
 
@@ -1585,7 +1618,7 @@ function buildNotes({ agent, mcp, script, configError, nodeError = null }) {
     notes.push({ code: 'AGENT_PATH_CONFLICT', text });
   }
   if (agent.state === AGENT_STATES.outdated) {
-    notes.push({ code: 'AGENT_OUTDATED', text: '已安装的 agent 是旧版本（与某个已发布版本逐字节相同），重新安装可更新为当前清单版本。' });
+    notes.push({ code: 'AGENT_OUTDATED', text: '已安装的 agent 是旧版本（与某个已发布版本逐字节相同）。插件下次启动时会自动刷新为当前版本；也可以点「安装 / 更新 Codex 集成」立即更新。' });
   }
   if (mcp.state === MCP_STATES.conflict) {
     notes.push({
@@ -1702,7 +1735,46 @@ export async function runCodexAction(action, {
  * @returns {Promise<void>} resolves after both targets were attempted.
  */
 async function installManaged(before, outcome) {
-  const { agent, mcp } = before;
+  await installManagedAgent(before, outcome);
+  await installMcpEntry(before, outcome);
+}
+
+/**
+ * Refresh only an agent file whose complete bytes match a known shipped template.
+ *
+ * This is called during plugin activation so a plugin upgrade can migrate a
+ * previously shipped agent automatically. It never creates a missing file and
+ * never touches config.toml; all replacement writes still re-prove the exact
+ * bytes immediately before the atomic rename.
+ * @param {object} options - same Codex home and version options as the status reader.
+ * @returns {Promise<{ changed: string[], refused: object[], status: object }>} migration result.
+ */
+export async function refreshKnownAgentTemplate(options = {}) {
+  const { codexHome = null, env = process.env, discoveryFile, version = null, hostNode = null } = options;
+  if (codexHome !== null && (typeof codexHome !== 'string' || codexHome.trim() === '' || !isAbsolute(codexHome))) {
+    throw new CodexInstallError('CODEX_HOME_INVALID', 'the Codex home must be an absolute path');
+  }
+  const home = codexHome === null ? resolveCodexHome({ env }) : requireCodexHome(codexHome);
+  const before = await readCodexStatus({ codexHome: home, env, discoveryFile, version, hostNode });
+  const changed = [];
+  const refused = [];
+
+  if (before.agent.state === AGENT_STATES.outdated) {
+    const boundary = await inspectCodexBoundary(home);
+    if (boundary.blocked === true) {
+      refused.push(linkedBoundaryRefusal({ ...before, boundary }));
+    } else {
+      await installManagedAgent(before, { changed, refused });
+    }
+  }
+
+  const status = await readCodexStatus({ codexHome: home, env, discoveryFile, version, hostNode });
+  return { changed, refused, status };
+}
+
+/** Install or refresh the managed agent file without touching the MCP entry. */
+async function installManagedAgent(before, outcome) {
+  const { agent } = before;
   if (agent.state === AGENT_STATES.missing || agent.state === AGENT_STATES.outdated) {
     const template = renderAgentFile(await readAgentTemplate(), before.packageVersion);
     await mkdir(dirname(agent.path), { recursive: true, mode: 0o700 });
@@ -1718,7 +1790,7 @@ async function installManaged(before, outcome) {
           path: agent.path,
           reason: 'created-concurrently',
         });
-        return await installMcpEntry(before, outcome);
+        return;
       }
       outcome.changed.push('agent');
     } else {
@@ -1733,7 +1805,7 @@ async function installManaged(before, outcome) {
           message: 'the agent file changed while updating and was left untouched',
           path: agent.path,
         });
-        return await installMcpEntry(before, outcome);
+        return;
       }
       await writeFileAtomic(agent.path, template);
       outcome.changed.push('agent');
@@ -1746,7 +1818,6 @@ async function installManaged(before, outcome) {
       path: agent.path,
     });
   }
-  await installMcpEntry(before, outcome);
 }
 
 /**

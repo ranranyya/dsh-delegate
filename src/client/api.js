@@ -361,28 +361,31 @@ export const ISOLATION_LABELS = Object.freeze({
 });
 
 /**
- * Conversation modes, mirroring the host's `CONVERSATION_MODES`.
+ * The retired directory-level conversation modes, kept for display compatibility.
  *
- * `new` is first because it is the default and the safe one: every task gets its
- * own DSH conversation in the Workspace for its execution directory. `reuse` is
- * an explicit opt-in that continues the most recent recorded conversation for
- * that SAME directory — never across directories, so two isolated worktrees stay
- * two conversations even when they were forked from one repository.
+ * They are no longer a choice. A new submission always starts a new DSH
+ * conversation, and a follow-up continues only the task thread named by
+ * `continueFromTaskId`. The values remain here so a page can still render a task
+ * record or a stored document written by an earlier build, and so the migration
+ * note can name what went away.
  */
 export const CONVERSATION_MODES = Object.freeze(['new', 'reuse']);
 
-/** Chinese labels for conversation modes. */
+/** Chinese labels for the retired conversation modes. */
 export const CONVERSATION_LABELS = Object.freeze({
-  new: '每个任务新开对话（默认）',
-  reuse: '复用同一执行目录最近的对话',
+  new: '每个任务新开对话',
+  reuse: '复用同一执行目录最近的对话（已移除）',
 });
+
+/** Chinese explanation of the conversation policy that replaced the mode setting. */
+export const CONVERSATION_POLICY_LABEL = '每次提交默认新开对话；只有带上 continueFromTaskId 的跟进任务才续接同一条对话';
 
 /**
  * The conversation block a draft/request should carry.
  *
- * The page must round-trip this value on save: it is what makes "reuse" persist
- * instead of silently reverting to the default on the next reload. An absent or
- * unknown mode resolves to the default rather than being invented.
+ * The value is inert: it is preserved so saving a page never rewrites an operator's
+ * stored document into a state it did not choose, and it never influences what a
+ * run does. A stored `reuse` is kept verbatim and still means nothing on dispatch.
  * @param {object} [draft] - editable document.
  * @returns {{ mode: string }} conversation block.
  */
@@ -487,7 +490,7 @@ export const CODEX_STATE_LABELS = Object.freeze({
   'not-installed': '未安装',
   installed: '已安装',
   outdated: '旧版本，可更新',
-  modified: '已被你修改（插件不会改动）',
+  modified: '不属于已知版本（插件不会改动）',
   conflict: '存在冲突（插件不会改动）',
   'not-configured': '未配置',
   configured: '已配置',
@@ -599,9 +602,9 @@ export function defaultDraft() {
     authorization: { taskGrantTtlSeconds: 900, sessionGrantTtlSeconds: 14400 },
     projectOverrides: {},
     presets: [],
-    // What a run does with its DSH conversation. `new` is the default, and it is
-    // present in the draft so the control round-trips instead of being dropped on
-    // save and silently reverting on the next load.
+    // Deprecated and inert, kept only so a save round-trips the stored document
+    // instead of rewriting it. There is no conversation-mode control: a submission
+    // starts a new DSH conversation unless it names `continueFromTaskId`.
     conversation: { mode: CONVERSATION_MODES[0] },
   };
 }
@@ -648,9 +651,9 @@ export function draftFromSettings(document) {
         review: preset.review === null || preset.review === undefined ? null : { ...preset.review },
       }))
       : [],
-    // Read back through the same resolver the save path uses, so a document with
-    // an absent block (every document written before this field existed) opens as
-    // the default and a document with `reuse` opens as `reuse`.
+    // Read back through the same resolver the save path uses, so a document written
+    // before this field existed opens with the default and an inert stored `reuse`
+    // is preserved verbatim rather than silently rewritten.
     conversation: conversationOf(source),
   };
 }
@@ -690,9 +693,8 @@ export function documentFromDraft(draft) {
       ...(preset.worker === null ? {} : { worker: { ...preset.worker } }),
       ...(preset.review === null ? {} : { review: { ...preset.review } }),
     })),
-    // Sent explicitly on every save. The host defaults an absent block to `new`,
-    // so omitting it would be safe but would also silently discard an operator's
-    // choice of `reuse` on the next write.
+    // Sent on every save only so the round-trip is faithful. It is inert: the host
+    // validates it as a retired value and no run consults it.
     conversation: conversationOf(source),
   };
 }

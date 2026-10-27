@@ -67,7 +67,7 @@ import { AUTH_CODES, AuthError } from '../auth/grants.js';
 import { resolveRoute } from '../model/routing.js';
 import { PROVIDER_SET_CODES, managedProvidersOf } from '../model/providers.js';
 import { RUN_OUTCOMES, RunError, SessionPlacementRefusal, diagnostic, runAgent } from '../runtime/agent-runner.js';
-import { rememberSession } from '../runtime/session-placement.js';
+import { rememberSession, SESSION_CODES } from '../runtime/session-placement.js';
 import { REVIEW_STATES, reviewWork } from '../review/reviewer.js';
 import { buildReviewPrompt, buildWorkerPrompt } from '../review/prompts.js';
 import { captureBaseline, captureDiff } from '../workspace/audit.js';
@@ -122,6 +122,10 @@ export const JOB_CODES = Object.freeze({
   // Workspace, or could not create/resume the Workspace's session. A specific
   // `SESSION_*` code is carried in `details.session`.
   conversationUnavailable: 'JOB_CONVERSATION_UNAVAILABLE',
+  // A `continueFromTaskId` follow-up was requested and cannot be honoured. Always
+  // fail-closed: the run is refused rather than turned into a new conversation the
+  // caller did not ask for. `details.session` carries the specific `SESSION_*` code.
+  continuationRefused: 'JOB_CONTINUATION_REFUSED',
 });
 
 /** Default interval of the internal authorization sweep. */
@@ -328,7 +332,9 @@ export class JobEngine {
    * a grant authorizes one attempt at one task, not a free retry loop. A retry is
    * a new `start` with a new grant; a consumed grant is never restored.
    * @param {object} request - `connectionId`, `grantId`, `workspacePath`, `prompt`, `overrides`,
-   *   and `authorization` (`'task'` consumes a single-use grant, `'session'` checks the named live session grant).
+   *   `authorization` (`'task'` consumes a single-use grant, `'session'` checks the named live session grant),
+   *   and optional `continueFromTaskId` (this submission is a follow-up to that named
+   *   delegated task and must continue exactly its DSH thread).
    * @returns {Promise<object>} the created task view.
    */
   async start(request) {
@@ -344,11 +350,24 @@ export class JobEngine {
         limit: LIMITS.promptChars,
       });
     }
+    // A continuation identity that is not a string is a caller bug, refused here
+    // rather than coerced: coercing would either name some other task (`String(42)`)
+    // or silently drop the request and start a new conversation.
+    const rawContinuation = request?.continueFromTaskId;
+    if (rawContinuation !== undefined && rawContinuation !== null && typeof rawContinuation !== 'string') {
+      throw new JobError(JOB_CODES.continuationRefused, 'continueFromTaskId must be a task id string', {
+        requestedType: typeof rawContinuation,
+      });
+    }
+    const continueFromTaskId = typeof rawContinuation === 'string' ? rawContinuation.trim() : '';
 
     const authorization = this.authorizationMode === 'switch'
       ? 'switch'
       : (request?.authorization === 'session' ? 'session' : 'task');
     const task = this.createTask(prompt, authorization);
+    // Frozen before the first await so the task record states, from the moment it
+    // exists, whether it starts a conversation or continues one.
+    task.continueFromTaskId = continueFromTaskId === '' ? null : continueFromTaskId;
     this.tasks.set(task.taskId, task);
     this.prune();
 
@@ -390,6 +409,10 @@ export class JobEngine {
       endedAt: null,
       prompt,
       authorization,
+      // The task whose DSH thread this submission continues, or null for a new
+      // conversation. Frozen at creation: it is what the run does with its session,
+      // and it must not be re-read after the first await.
+      continueFromTaskId: null,
       connectionId: null,
       grantId: null,
       grantKind: null,
@@ -414,14 +437,20 @@ export class JobEngine {
       slotHeld: false,
       diff: null,
       execution: null,
-      // Session placement facts for this task: which DSH Workspace group it ran
-      // in, whether the conversation was new or continued, and whether the
-      // identity was saved for a later reuse. `conversationError` is recorded
-      // rather than thrown, because failing to save a resume handle must not
-      // change the run's outcome.
+      // Session placement facts for this task: which DSH Workspace group it ran in,
+      // whether it started a new conversation or continued the task it named, and
+      // whether the identity was saved so a later follow-up can continue it.
+      // `conversationError` is recorded rather than thrown, because failing to save
+      // a continuation handle must not change the run's outcome.
       conversation: null,
       conversationSaved: null,
       conversationError: null,
+      // A continuation may reuse the parent task's managed worktree. These are
+      // admission-only facts; the public task view exposes the resulting
+      // execution path and conversation, never the internal parent object.
+      continuationParent: null,
+      continuationRecord: null,
+      reusedWorktree: false,
       review: { state: REVIEW_STATES.notRun, verdict: null, text: '', error: null },
       error: null,
       cancelRequested: false,
@@ -513,6 +542,17 @@ export class JobEngine {
     this.assertLive(task, 'authorization');
     }
 
+    // ---- 2b. a follow-up must name a continuable parent, fail-closed ---------
+    // The parent is validated here, where the caller's connection identity and the
+    // resolved source workspace are both known, so a continuation can never be
+    // granted across a connection, a repository or a directory. Every refusal below
+    // states why; none of them falls back to starting a new conversation.
+    if (task.continueFromTaskId !== null) {
+      task.phase = 'continuation';
+      await this.assertContinuation(task, sourcePath);
+      this.assertLive(task, 'continuation');
+    }
+
     // ---- 3. one immutable settings snapshot ----------------------------------
     task.phase = 'settings';
     const settings = await this.guardPreflight(task, 'settings', () => this.settings.read());
@@ -524,6 +564,21 @@ export class JobEngine {
     // ---- 4. effective configuration and the concurrency slot -----------------
     task.phase = 'effective';
     const overrides = sanitizeOverrides(grant.overrides ?? request?.overrides);
+    if (task.continuationRecord !== null) {
+      const parentIsolation = task.continuationRecord.isolation;
+      if (overrides.isolation !== undefined && overrides.isolation !== parentIsolation) {
+        throw this.continuationRefusal('a follow-up must keep the isolation mode of the task it continues', {
+          continueFromTaskId: task.continueFromTaskId,
+          requestedIsolation: overrides.isolation,
+          parentIsolation,
+          session: SESSION_CODES.continuationUnavailable,
+        });
+      }
+      // A continuation belongs to the original task chain. If the global or
+      // project setting changed after its parent ran, use the parent's isolation
+      // so the follow-up reaches the same checkout or the same managed worktree.
+      overrides.isolation = parentIsolation;
+    }
     let effective;
     try {
       effective = resolveEffectiveConfig(settings, { projectPath: sourcePath, overrides });
@@ -566,14 +621,17 @@ export class JobEngine {
     // ---- 7. isolation: a real worktree, or explicitly shared -----------------
     if (effective.worker.isolation === 'worktree') {
       task.phase = 'worktree';
-      const prepared = await this.guardPreflight(task, 'worktree', () => this.prepareWorktree(task), {
-        // A tree that finished after this start was abandoned still exists on
-        // disk. It is recorded and marked complete, never deleted or merged: it
-        // is evidence, and the host decides what happens to it.
-        onLateSettle: (value) => this.adoptLateWorktree(task, value),
-      });
+      const prepared = task.continuationRecord === null
+        ? await this.guardPreflight(task, 'worktree', () => this.prepareWorktree(task), {
+          // A tree that finished after this start was abandoned still exists on
+          // disk. It is recorded and marked complete, never deleted or merged: it
+          // is evidence, and the host decides what happens to it.
+          onLateSettle: (value) => this.adoptLateWorktree(task, value),
+        })
+        : await this.guardPreflight(task, 'continuation-worktree', () => this.reuseContinuationWorktree(task));
       task.worktree = prepared;
       task.executionPath = prepared.workspacePath;
+      task.reusedWorktree = task.continuationRecord !== null;
       this.assertLive(task, 'worktree');
       this.acquireExecutionLock(task);
     } else if (effective.worker.isolation !== 'shared') {
@@ -1278,6 +1336,240 @@ export class JobEngine {
   }
 
   /**
+   * Shape a continuation refusal as the job error that carries its `SESSION_*` cause.
+   *
+   * The specific placement code travels in `details.session` so a caller can tell a
+   * stale identity from a live one from an unreadable store, exactly as a
+   * conversation-placement refusal does.
+   * @param {string} message - operator-readable explanation.
+   * @param {object} [details] - bounded context; never a credential or a transcript.
+   * @returns {JobError} refusal to throw.
+   */
+  continuationRefusal(message, details = {}) {
+    return new JobError(JOB_CODES.continuationRefused, message, redactDeep(details));
+  }
+
+  /**
+   * Validate a `continueFromTaskId` parent, or refuse.
+   *
+   * A continuation is the one thing that may join an existing conversation, so it is
+   * the one thing that has to be proven before anything is created. The checks are
+   * ordered from "does this task exist at all" to "may this caller continue it":
+   *
+   *  1. **the parent must be known here** — this engine's own records, which is what
+   *     a continuing submission almost always names;
+   *  2. **the caller must be the one that submitted it** — one connection never
+   *     continues another's task, even in a workspace both are authorized for;
+   *  3. **the parent must not be live** — a running task's conversation is being
+   *     written, and the workspace lease of the same path is what makes the
+   *     overlapping run impossible anyway. This is the chain lock: the parent's
+   *     lease is still held while it runs, so a follow-up starting in its directory
+   *     fails the source lock rather than driving a thread mid-turn;
+   *  4. **the parent must have ended in a state that has a thread** — `awaiting-host-
+   *     review`, or `failed`/`cancelled` with a recorded conversation (a retry of a
+   *     run that really did talk to the model). A parent that failed before any
+   *     session existed has nothing to continue;
+   *  5. **the parent must have run for this source repository** — a chain never
+   *     crosses repositories;
+   *  6. **the recorded identity must be continuable here** — the persisted row's own
+   *     path/isolation rules are re-checked by the placement module, which is also
+   *     what handles a parent from a previous process.
+   *
+   * A parent recorded by an earlier process is reachable through the persisted
+   * identity map (`sessionStore`); a parent this process never admitted *and* the
+   * store does not know is `SESSION_CONTINUATION_UNKNOWN`, which the placement
+   * module reports. Everything decidable from the live record is decided here.
+   * @param {object} task - pending record with `continueFromTaskId`.
+   * @param {string} sourcePath - the resolved source workspace of this submission.
+   * @returns {void}
+   * @throws {JobError} when the continuation cannot be honoured.
+   */
+  async assertContinuation(task, sourcePath) {
+    const parentTaskId = task.continueFromTaskId;
+    // `assertAdmissible` is the single authority for "does a continuation chain
+    // exist here and may it be joined", so the in-memory record and a row recovered
+    // from the persisted map are judged by ONE implementation. That is what keeps a
+    // parent from a previous process ("failed without a session", "worktree gone")
+    // as strictly validated as one this process just finished.
+    const parent = this.assertAdmissible(parentTaskId, {
+      sourcePath,
+      connectionId: task.connectionId,
+      selfTaskId: task.taskId,
+    });
+    const store = this.deps?.sessionStore ?? null;
+    if (store === null || typeof store.get !== 'function') {
+      throw this.continuationRefusal('the task-to-conversation identity store is unavailable, so the follow-up cannot be placed safely', {
+        continueFromTaskId: parentTaskId,
+        session: SESSION_CODES.continuationUnavailable,
+      });
+    }
+    let identity;
+    try {
+      identity = await this.guardPreflight(task, 'continuation-identity', () => store.get(parentTaskId));
+    } catch (error) {
+      if (error instanceof JobError) throw error;
+      throw this.continuationRefusal('the task-to-conversation identity could not be read, so the follow-up cannot be placed safely', {
+        continueFromTaskId: parentTaskId,
+        session: SESSION_CODES.continuationUnavailable,
+        cause: typeof error?.code === 'string' ? error.code : null,
+      });
+    }
+    if (identity === null || typeof identity !== 'object') {
+      throw this.continuationRefusal('no conversation identity is recorded for the named task', {
+        continueFromTaskId: parentTaskId,
+        session: SESSION_CODES.continuationUnknown,
+      });
+    }
+    if (!samePath(identity.sourcePath, sourcePath)) {
+      throw this.continuationRefusal('the named task belongs to another source repository, so its conversation was not continued', {
+        continueFromTaskId: parentTaskId,
+        session: SESSION_CODES.continuationWorkspaceMismatch,
+      });
+    }
+    if (!['shared', 'worktree'].includes(identity.isolation)
+      || typeof identity.executionPath !== 'string' || identity.executionPath.trim() === '') {
+      throw this.continuationRefusal('the named task has no usable execution-path identity, so its conversation cannot be continued', {
+        continueFromTaskId: parentTaskId,
+        session: SESSION_CODES.continuationUnavailable,
+      });
+    }
+    if (parent !== undefined && (!samePath(parent.executionPath, identity.executionPath)
+      || parent.effective?.worker?.isolation !== identity.isolation)) {
+      throw this.continuationRefusal('the recorded conversation identity does not match the named task', {
+        continueFromTaskId: parentTaskId,
+        session: SESSION_CODES.continuationUnavailable,
+      });
+    }
+    task.continuationParent = parent ?? null;
+    task.continuationRecord = identity;
+  }
+
+  /**
+   * Resolve and validate the existing managed tree for a continuation.
+   *
+   * A new tree would hide the parent's uncommitted work and create a different
+   * DSH Workspace, so this path never calls `prepare()`. After a plugin restart,
+   * or after explicit disposal, the in-memory registry cannot prove ownership and
+   * the continuation is refused rather than guessed from a directory name.
+   * @param {object} task - continuation with a stored parent identity.
+   * @returns {Promise<object>} the existing tree metadata.
+   * @throws {JobError} when the original tree cannot be proven reusable.
+   */
+  async reuseContinuationWorktree(task) {
+    const identity = task.continuationRecord;
+    const manager = this.deps?.worktrees ?? null;
+    const refuse = (message, reason) => this.continuationRefusal(message, {
+      continueFromTaskId: task.continueFromTaskId,
+      session: SESSION_CODES.continuationUnavailable,
+      reason,
+    });
+    if (identity?.isolation !== 'worktree') {
+      throw refuse('the named task did not use a managed worktree', 'parent was not isolated');
+    }
+    if (manager === null || typeof manager.get !== 'function') {
+      throw refuse('the managed worktree service is unavailable, so the original tree cannot be proven reusable', 'no worktree registry');
+    }
+    let tree;
+    try {
+      tree = manager.get(identity.executionPath);
+    } catch (error) {
+      throw refuse('the managed worktree service refused to report the original tree', typeof error?.code === 'string' ? error.code : 'registry read failed');
+    }
+    if (tree === null || typeof tree !== 'object') {
+      throw refuse('the original worktree is no longer registered; a new tree will not be substituted', 'tree not managed here');
+    }
+    const expectedTreeId = identity.worktreeId ?? identity.taskId;
+    if (!samePath(tree.workspacePath, identity.executionPath)
+      || !samePath(tree.sourcePath, identity.sourcePath)
+      || (typeof expectedTreeId === 'string' && expectedTreeId !== '' && tree.taskId !== expectedTreeId)
+      || tree.state === 'disposed'
+      || tree.isolated !== true
+      || tree.detached !== true) {
+      throw refuse('the registered worktree does not match the task being continued', 'worktree identity mismatch');
+    }
+    let workspacePath;
+    try {
+      workspacePath = await resolveWorkspacePath(identity.executionPath);
+    } catch {
+      throw refuse('the original worktree path is no longer available', 'worktree path unavailable');
+    }
+    if (!samePath(workspacePath, identity.executionPath)) {
+      throw refuse('the original worktree path resolves to a different directory', 'worktree path mismatch');
+    }
+    return { ...tree, workspacePath, reused: true };
+  }
+
+  /**
+   * Decide whether a named task thread may be joined, from the facts of one parent.
+   *
+   * Shared by the admission check (a parent this process admitted) and the
+   * continuation path (a parent recovered from the persisted identity map), so a
+   * refusal means the same thing whether the parent ran a second ago or before the
+   * plugin restarted.
+   *
+   * The refusal codes are the placement module's own (`SESSION_*`), carried in
+   * `details.session`, so a caller sees one vocabulary for "this continuation cannot
+   * be honoured" no matter which layer noticed.
+   * @param {string} parentTaskId - the task id the caller named.
+   * @param {object} facts - `sourcePath` (this submission's source workspace),
+   *   `connectionId` (this submission's verified connection, or null), optional
+   *   `selfTaskId` (the submitting task, for the self-continuation guard).
+   * @returns {object | undefined} the live parent record when this process has one.
+   * @throws {JobError} when the chain cannot be joined.
+   */
+  assertAdmissible(parentTaskId, facts = {}) {
+    const parent = this.tasks.get(parentTaskId);
+    if (parent === undefined) return undefined;
+    if (facts.selfTaskId !== undefined && parent.taskId === facts.selfTaskId) {
+      throw this.continuationRefusal('a task cannot continue its own conversation', {
+        continueFromTaskId: parentTaskId,
+        session: SESSION_CODES.continuationState,
+      });
+    }
+    if (parent.connectionId !== null && facts.connectionId !== null && facts.connectionId !== undefined
+      && parent.connectionId !== facts.connectionId) {
+      // Reported as absent rather than forbidden, the same way a cross-connection
+      // task read is: a distinct code would confirm that the id exists.
+      throw new JobError(JOB_CODES.taskNotFound, 'no such task for this connection', { continueFromTaskId: parentTaskId });
+    }
+    if (!TERMINAL.has(parent.state)) {
+      throw this.continuationRefusal('the named task is still running, so its conversation cannot be continued yet', {
+        continueFromTaskId: parentTaskId,
+        state: parent.state,
+        session: SESSION_CODES.continuationState,
+      });
+    }
+    if (parent.state !== TASK_STATES.awaitingHostReview && parent.execution?.conversation == null) {
+      // A run that ended without ever driving a session (an admission refusal, a
+      // policy failure) has no thread; continuing it would silently start a new one.
+      throw this.continuationRefusal('the named task ended without driving a conversation, so there is nothing to continue', {
+        continueFromTaskId: parentTaskId,
+        state: parent.state,
+        session: SESSION_CODES.continuationState,
+      });
+    }
+    if (parent.sourcePath !== null && facts.sourcePath !== undefined && facts.sourcePath !== null
+      && !samePath(parent.sourcePath, facts.sourcePath)) {
+      throw this.continuationRefusal('the named task belongs to another source repository, so its conversation was not continued', {
+        continueFromTaskId: parentTaskId,
+        reason: 'different source repository',
+        session: SESSION_CODES.continuationWorkspaceMismatch,
+      });
+    }
+    return parent;
+  }
+
+  /**
+   * Shape a continuation refusal as the job error that carries its `SESSION_*` cause.
+   * @param {string} message - operator-readable explanation.
+   * @param {object} [details] - bounded context; never a credential or a transcript.
+   * @returns {JobError} refusal to throw.
+   */
+  continuationRefusal(message, details = {}) {
+    return new JobError(JOB_CODES.continuationRefused, message, redactDeep(details));
+  }
+
+  /**
    * Re-check the three facts that make a preflight step legal: not disposed, not
    * cancelled, and still authorized for exactly this task and source workspace.
    * @param {object} task - pending record.
@@ -1398,7 +1690,7 @@ export class JobEngine {
         task.cancelledBy = task.cancelledBy ?? (this.aborted ? 'dispose' : 'request');
         task.error = null;
       } else {
-        task.error = this.errorOf(error);
+        task.error = this.errorOf(error, task);
       }
     }
     // A tree prepared before the refusal is evidence, not garbage: it is kept and
@@ -1417,14 +1709,42 @@ export class JobEngine {
 
   /**
    * Project a thrown refusal into a bounded task error.
+   *
+   * A session-placement refusal is also handled here, not only in the execution
+   * path: `start()` raises these during admission, and reporting one as a generic
+   * `JOB_START_FAILED` would hide the one code an operator can act on. A
+   * continuation refusal keeps its `SESSION_*` cause in `details.session`.
    * @param {unknown} error - thrown value.
+   * @param {object} [task] - the task record, when the error belongs to one.
    * @returns {object} error record.
    */
-  errorOf(error) {
+  errorOf(error, task = null) {
+    if (error instanceof SessionPlacementRefusal && task !== null) {
+      return this.conversationErrorOf(error, task);
+    }
     return {
       code: typeof error?.code === 'string' ? error.code : JOB_CODES.failed,
       message: diagnostic(error?.message ?? String(error), 400) ?? 'the task could not start',
       details: redactDeep(error?.details ?? {}),
+    };
+  }
+
+  /**
+   * Shape one session-placement refusal into the task error an operator reads.
+   * @param {object} error - placement refusal.
+   * @param {object} task - the task the refusal belongs to.
+   * @returns {{ code: string, message: string, details: object }} bounded error.
+   */
+  conversationErrorOf(error, task) {
+    const continuation = task?.continueFromTaskId ?? null;
+    return {
+      code: continuation === null ? JOB_CODES.conversationUnavailable : JOB_CODES.continuationRefused,
+      message: error.message,
+      details: {
+        session: error.code,
+        ...(continuation === null ? {} : { continueFromTaskId: continuation }),
+        ...redactDeep(error.details ?? {}),
+      },
     };
   }
 
@@ -1513,10 +1833,23 @@ export class JobEngine {
         selection: workerSelection,
         timeoutMs: task.effective.worker.timeoutSeconds * 1000,
         signal: task.controller.signal,
-        // Whether a run starts a fresh DSH conversation or resumes the last one for
-        // its actual execution directory. Frozen in `task.effective`, so a settings
-        // edit during the run cannot change what this task does.
-        conversationMode: task.effective.conversation.mode,
+        // What this run does with its DSH conversation, frozen on the task at
+        // creation: omitted means a new conversation, present means continue exactly
+        // that task's thread. There is no directory-level mode to consult, so a
+        // settings edit (or a legacy `reuse` value) cannot change it mid-run.
+        ...(task.continueFromTaskId === null ? {} : { continueFromTaskId: task.continueFromTaskId }),
+        // The task/connection/source facts a continuation identity must match.
+        taskId: task.taskId,
+        connectionId: task.connectionId,
+        sourcePath: task.sourcePath,
+        // The engine is the authority for "may this chain be joined": a parent it
+        // still holds is judged live here, and a parent recovered from the persisted
+        // map is judged by the same rule through this hook.
+        assertAdmissible: (parentTaskId) => this.assertAdmissible(parentTaskId, {
+          sourcePath: task.sourcePath,
+          connectionId: task.connectionId,
+          selfTaskId: task.taskId,
+        }),
       });
       task.native.promise = pending;
       let run;
@@ -1549,10 +1882,11 @@ export class JobEngine {
         error: run.error,
       };
 
-      // Remember the session this run drove, so an opt-in `reuse` run in the SAME
-      // directory can continue it. Only the identity is stored; the transcript
-      // stays in the native session log. A failure here is recorded and never
-      // changes the run's outcome.
+      // Remember the thread this run drove, keyed by THIS task, so a later explicit
+      // `continueFromTaskId` follow-up can continue exactly that conversation in
+      // exactly this execution path. Only identity and provenance are stored; the
+      // transcript stays in the native session log. A failure here is recorded and
+      // never changes the run's outcome.
       await this.rememberConversation(task);
 
       // Evidence is captured even for a failed or cancelled run: a partial
@@ -1632,7 +1966,7 @@ export class JobEngine {
       }
       task.state = TASK_STATES.failed;
       task.phase = 'failed';
-      task.error = this.errorOf(error);
+      task.error = this.runErrorOf(error, task);
       task.endedAt = Date.now();
     } finally {
       await this.finishTask(task);
@@ -1640,24 +1974,20 @@ export class JobEngine {
   }
 
   /**
-   * Shape any thrown value into the bounded error record a task reports.
+   * Shape any thrown value from the EXECUTION path into the bounded error record.
    *
    * A session-placement refusal keeps its own `SESSION_*` code as a detail and is
-   * reported as the job-level `JOB_CONVERSATION_UNAVAILABLE`, because the cause an
-   * operator needs is "this harness cannot place the run in a Workspace", not the
-   * name of the missing service. It is never mapped onto a generic execution
-   * failure: the run did not fail, it never started.
+   * reported as the job-level `JOB_CONVERSATION_UNAVAILABLE` — or, when the run was
+   * a `continueFromTaskId` follow-up, `JOB_CONTINUATION_REFUSED` — because the cause
+   * an operator needs is "this harness cannot place the run in a Workspace" or "this
+   * thread cannot be continued", not the name of the missing service. It is never
+   * mapped onto a generic execution failure: the run did not fail, it never started.
    * @param {unknown} error - thrown value.
+   * @param {object} [task] - the task record, when the error belongs to one.
    * @returns {{ code: string, message: string, details?: object }} bounded error.
    */
-  errorOf(error) {
-    if (error instanceof SessionPlacementRefusal) {
-      return {
-        code: JOB_CODES.conversationUnavailable,
-        message: error.message,
-        details: { session: error.code, ...redactDeep(error.details ?? {}) },
-      };
-    }
+  runErrorOf(error, task = null) {
+    if (error instanceof SessionPlacementRefusal) return this.conversationErrorOf(error, task ?? {});
     if (error instanceof RunError) {
       return { code: error.code, message: error.message, details: redactDeep(error.details ?? null) };
     }
@@ -1747,17 +2077,21 @@ export class JobEngine {
   }
 
   /**
-   * Persist the minimal session identity a later `reuse` run needs.
+   * Persist the minimal task-thread identity a later `continueFromTaskId` needs.
    *
-   * Three deliberate properties, mirroring {@link persistHistory}:
+   * Four deliberate properties, mirroring {@link persistHistory}:
    *
-   *   * only `{ path, workspaceId, sessionId }` is stored — no prompt, transcript,
-   *     output, usage or credential has a field in the map;
+   *   * the row is keyed by TASK, and holds only what a continuation is validated
+   *     against — the two paths, the DSH Workspace/Session ids, the isolation that
+   *     was used and (for a managed tree) that tree's ownership facts. No prompt,
+   *     transcript, output, usage figure or credential has a field;
    *   * a failure is recorded on the task (`conversationError`) instead of thrown,
-   *     because losing the ability to *resume* a conversation is not a reason to
-   *     fail or un-finish the run that just succeeded;
-   *   * a missing store is silent: an engine constructed without one simply never
-   *     reuses, which is the safe default.
+   *     because losing the ability to *continue* this thread later is not a reason
+   *     to fail or un-finish the run that just succeeded;
+   *   * a missing store is silent: an engine constructed without one simply cannot
+   *     offer continuation, which is the safe default;
+   *   * an unplaced run (the additional review) records nothing, because it is not
+   *     part of the worker thread and must not become continuable.
    * @param {object} task - task record with a completed `task.execution`.
    * @returns {Promise<void>} resolves after the attempt, never rejects.
    */
@@ -1765,11 +2099,25 @@ export class JobEngine {
     const store = this.deps?.sessionStore ?? null;
     const placement = task.execution?.conversation ?? null;
     if (store === null || store === undefined || placement === null) return;
+    const worktree = task.worktree === null || task.worktree === undefined ? null : task.worktree;
     try {
       const saved = await rememberSession(store, {
         workspaceId: placement.workspaceId,
         sessionId: placement.sessionId,
-      }, task.executionPath);
+      }, {
+        taskId: task.taskId,
+        sourcePath: task.sourcePath,
+        executionPath: task.executionPath,
+        isolation: task.effective?.worker?.isolation ?? null,
+        // A worktree row carries the tree's identity so a follow-up can prove it is
+        // reusing the same tree instead of a fresh one.
+        worktreeId: worktree === null
+          ? null
+          : (typeof worktree.worktreeId === 'string' && worktree.worktreeId !== ''
+            ? worktree.worktreeId
+            : (typeof worktree.taskId === 'string' ? worktree.taskId : task.taskId)),
+        worktreeState: worktree === null ? null : (typeof worktree.state === 'string' ? worktree.state : null),
+      });
       task.conversationSaved = saved;
       task.conversationError = null;
     } catch (error) {
@@ -1952,9 +2300,9 @@ export class JobEngine {
     const effective = task.effective === null ? null : {
       worker: { ...task.effective.worker },
       review: { ...task.effective.review },
-      // What this task did with its conversation, frozen with the rest of the
-      // snapshot. Nonsecret, and it is what a task detail renders: whether the
-      // run started a new conversation or continued one, for which directory.
+      // The conversation policy this task ran under. It is a rule, not a stored
+      // setting: a new submission starts a new DSH conversation, and a follow-up
+      // continues the thread named by `continueFromTaskId`.
       conversation: { ...task.effective.conversation },
       provenance: task.effective.provenance,
     };
@@ -2010,10 +2358,13 @@ export class JobEngine {
         cancelCause: task.execution.cancelCause,
         error: task.execution.error,
       },
-      // Where the run's conversation was placed in DSH. `workspaceId` is the group
-      // an operator sees; `mode` is the setting that was frozen for this task, and
-      // `reused` says whether the run continued an existing conversation.
+      // Where the run's conversation was placed in DSH. `workspaceId` is the group an
+      // operator sees; `kind` is `new` or `continuation`, and `continuedFromTaskId`
+      // names the task whose thread this run continued (null for a new one).
       conversation: task.execution?.conversation ?? null,
+      // Frozen on the task at creation, so the record states the intent even when
+      // the run never got as far as driving a conversation.
+      continueFromTaskId: task.continueFromTaskId ?? null,
       conversationSaved: task.conversationSaved,
       conversationError: task.conversationError,
       review: task.review,

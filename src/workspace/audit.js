@@ -22,7 +22,7 @@
 
 import { execFile } from 'node:child_process';
 import { lstat } from 'node:fs/promises';
-import { resolve as resolvePath } from 'node:path';
+import { resolve as resolvePath, win32 } from 'node:path';
 
 import { isSensitivePath, redactText } from '../config/redact.js';
 import { isInside } from './locks.js';
@@ -284,8 +284,11 @@ export async function probeRepository(runGit, workspacePath) {
  * @returns {boolean} true when they are the same path.
  */
 function samePath(left, right) {
-  const fold = (value) => (process.platform === 'win32' ? value.toLowerCase() : value);
-  return fold(String(left).replace(/[\\/]+$/, '')) === fold(String(right).replace(/[\\/]+$/, ''));
+  if (process.platform === 'win32') {
+    return win32.normalize(String(left)).toLowerCase() === win32.normalize(String(right)).toLowerCase();
+  }
+  const trimTrailingSeparators = (value) => String(value).replace(/[\\/]+$/, '');
+  return trimTrailingSeparators(left) === trimTrailingSeparators(right);
 }
 
 /**

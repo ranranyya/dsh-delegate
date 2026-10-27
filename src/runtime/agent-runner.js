@@ -165,8 +165,8 @@ export function userMessage(text) {
  *
  *  * a Workspace PLACEMENT (`request.placement`, or one resolved from the native
  *    controllers when the caller did not supply it): the DSH Session already exists
- *    in its Workspace, so the run drives the live Agent resolved for it. A reused
- *    conversation arrives this way, and so does a freshly created Session —
+ *    in its Workspace, so the run drives the live Agent resolved for it. A continued
+ *    task thread arrives this way, and so does a freshly created Session —
  *    resolving it is what attaches the native Agent to the Workspace the Session
  *    was created in.
  *  * no placement: the historical path, which creates a Session (and Agent) through
@@ -174,8 +174,8 @@ export function userMessage(text) {
  *    caller that owns its own conversation identity — the additional review, which
  *    composes its own preset and must not join the operator's history.
  *
- * The runner never disposes an agent it resolved. Disposal is what makes a Session
- * non-resumable for the next `reuse` run, so {@link driveAgent} accepts an
+ * The runner never disposes an agent it resolved. Disposal would end a conversation
+ * a later follow-up must be able to continue, so {@link driveAgent} accepts an
  * inherited `disposeOwned` and this entry point sets it only for agents it created.
  *
  * Cancellation is decided before anything is created: a run whose signal is
@@ -187,7 +187,7 @@ export function userMessage(text) {
  *   `sessions` persistence service (flush only), and `logger`.
  * @param {object} request - `prompt`, `cwd`, `selection`, `timeoutMs`, `signal`,
  *   `onEvent`, the optional preset selection (`presetId`, `presetOwnership`), and the
- *   optional `placement` / `conversationMode` / `allowUnplaced`.
+ *   optional `placement` / `continueFromTaskId` / `allowUnplaced`.
  * @returns {Promise<object>} run result with text, usage facts, the `conversation`
  *   placement fact and lifecycle evidence.
  */
@@ -220,10 +220,10 @@ export async function runAgent(deps, request) {
   return await driveAgent(deps, {
     ...request,
     placement,
-    // Only an Agent this run created is owned by it. Both conversation modes now
-    // drive a RESOLVED Agent (a new Session is resolved to its Agent too), and a
-    // resolved Agent belongs to its Session: disposing it would end the
-    // conversation and make the next `reuse` run unable to resume.
+    // Only an Agent this run created is owned by it. Both placement paths drive a
+    // RESOLVED Agent (a new Session is resolved to its Agent too), and a resolved
+    // Agent belongs to its Session: disposing it would end a conversation that a
+    // later `continueFromTaskId` follow-up must be able to resume.
     disposeOwned: owned ? (placement === null || placement.reused !== true) : false,
   });
 }
@@ -252,7 +252,16 @@ async function resolvePlacement(deps, request) {
   if (request?.sessionId !== undefined && request?.sessionId !== null) return null;
   const placement = await placeSession(deps, {
     path: request?.cwd,
-    mode: request?.conversationMode,
+    // The only thing that can continue an existing conversation, and it is the
+    // caller's explicit statement that this submission is a follow-up to THAT task.
+    // Omitted means a new conversation, always.
+    continueFromTaskId: request?.continueFromTaskId,
+    // Task/connection facts the continuation identity must match. The engine passes
+    // them because it is the only component that knows which task and connection
+    // this run belongs to.
+    taskId: request?.taskId,
+    connectionId: request?.connectionId,
+    sourcePath: request?.sourcePath,
     presetId: request?.placementPresetId,
   });
   return placement;
@@ -296,10 +305,10 @@ export async function driveAgent(deps, request) {
   // A resolved agent carries its own session and preset composition; the run must
   // not mount a second composition onto it. An agent created here still does.
   //
-  // This holds in BOTH conversation modes: a `new` Session is also driven through
-  // the Agent the session controller resolved for it, because the Session already
-  // exists in the Workspace and `agents.create` would create a second one. The
-  // preset is installed by whoever created that Agent (the session controller's
+  // This holds on BOTH placement paths: a freshly created Session is also driven
+  // through the Agent the session controller resolved for it, because the Session
+  // already exists in the Workspace and `agents.create` would create a second one.
+  // The preset is installed by whoever created that Agent (the session controller's
   // own composition, or — on the unplaced review path — this run's setup).
   const mountsPreset = resolvedAgent === null;
   const disposeOwned = request?.disposeOwned !== false;
@@ -360,7 +369,7 @@ export async function driveAgent(deps, request) {
     //
     // `createdOwnAgent` is the lifecycle fact that decides disposal: only an Agent
     // this run created may be disposed by it. Disposing a resolved Agent would end
-    // the Session it belongs to and make the next `reuse` run unable to resume.
+    // the Session it belongs to and make a later follow-up unable to continue it.
     createdOwnAgent: resolvedAgent === null,
     disposeOwned,
     // Bounded and deduplicating: the native loop streams `text-delta` events and
@@ -624,9 +633,10 @@ export async function driveAgent(deps, request) {
    * Release one handle at the end of a run.
    *
    * Disposal is skipped for an Agent this run did not create, and for any handle
-   * the caller marked as not owned. A Session that is disposed cannot be resumed,
-   * so disposing a resolved Agent would silently break the next `reuse` run —
-   * exactly the failure this feature must not have.
+   * the caller marked as not owned. A Session that is disposed cannot be
+   * continued, so disposing a resolved Agent would silently break a later
+   * `continueFromTaskId` follow-up — exactly the failure this feature must not
+   * have.
    * @param {object} target - run state.
    * @param {object} handle - handle to release.
    * @returns {Promise<void>} resolves after the attempt.
@@ -727,10 +737,11 @@ export async function driveAgent(deps, request) {
       maxTokens: target.maxTokens?.value ?? null,
       // Where this run's conversation landed, or `null` for the unplaced path
       // (the review). Stated as its own fact so a caller can report the Workspace
-      // group and whether the conversation was continued without re-deriving it
-      // from the ids.
+      // group, whether the run started a new conversation or continued the task
+      // thread it named, without re-deriving any of it from the ids.
       conversation: placement === null ? null : {
-        mode: placement.mode ?? null,
+        kind: placement.kind ?? null,
+        continuedFromTaskId: placement.continuedFromTaskId ?? null,
         reused: placement.reused === true,
         workspaceId: placement.workspaceId ?? null,
         workspacePath: placement.workspacePath ?? null,

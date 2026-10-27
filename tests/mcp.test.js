@@ -1280,3 +1280,154 @@ test('an unmapped route is refused locally instead of being sent as a guessed pa
   }
   assert.deepEqual(calls, [], 'an unmapped route must not be turned into an HTTP request');
 });
+
+// ---------------------------------------------------------------------------
+// 6. Explicit task-thread continuation (`continueFromTaskId`)
+// ---------------------------------------------------------------------------
+//
+// A new submission is a new conversation; `continueFromTaskId` is the ONLY way to
+// continue one. These tests pin the surface: the field is declared and typed, it is
+// forwarded untouched, and its absence is not invented into a value.
+
+test('delegate_submit declares continueFromTaskId as an optional string and nothing else', () => {
+  const submit = TOOLS.find((tool) => tool.name === 'delegate_submit');
+  assert.ok(submit !== undefined, 'delegate_submit must exist');
+  const field = submit.inputSchema.properties.continueFromTaskId;
+  assert.ok(field !== undefined, 'the continuation field must be declared, or a caller cannot ask for one');
+  assert.equal(field.type, 'string');
+  assert.equal(typeof field.description, 'string');
+  assert.ok(field.description.length > 20, 'the description is what a model reads before choosing');
+  // Omitted must be legal: a new submission carries no continuation.
+  assert.equal(submit.inputSchema.required.includes('continueFromTaskId'), false);
+  // The field is the ONLY continuation-shaped argument: no mode, no reuse flag.
+  for (const forbidden of ['conversationMode', 'mode', 'reuse', 'continueFrom', 'sessionId']) {
+    assert.equal(forbidden in submit.inputSchema.properties, false, `delegate_submit must not accept ${forbidden}`);
+  }
+  // The copy states both halves of the rule, so a model cannot read "continue" as
+  // the default behaviour.
+  assert.match(submit.description, /NEW task conversation/i);
+  assert.match(submit.description, /follow-up/i);
+});
+
+test('continueFromTaskId is forwarded verbatim, and an omitted one is not invented', async () => {
+  const { server, seen } = fixture();
+  await server.handle({ jsonrpc: '2.0', id: 1, method: 'initialize', params: {} });
+
+  await server.handle({
+    jsonrpc: '2.0',
+    id: 2,
+    method: 'tools/call',
+    params: {
+      name: 'delegate_submit',
+      arguments: { workspacePath: '/w', prompt: 'go', continueFromTaskId: 'task-abc' },
+    },
+  });
+  assert.deepEqual(seen[0].payload, { workspacePath: '/w', prompt: 'go', continueFromTaskId: 'task-abc' });
+
+  seen.length = 0;
+  await server.handle({
+    jsonrpc: '2.0',
+    id: 3,
+    method: 'tools/call',
+    params: { name: 'delegate_submit', arguments: { workspacePath: '/w', prompt: 'unrelated' } },
+  });
+  assert.deepEqual(
+    seen[0].payload,
+    { workspacePath: '/w', prompt: 'unrelated' },
+    'a new submission must not carry an invented continuation',
+  );
+  assert.equal('continueFromTaskId' in seen[0].payload, false);
+});
+
+test('delegate_submit refuses a non-string continueFromTaskId before any harness call', async () => {
+  const { server, seen } = fixture();
+  await server.handle({ jsonrpc: '2.0', id: 1, method: 'initialize', params: {} });
+  for (const value of [42, true, { taskId: 't' }, ['t']]) {
+    const response = await server.handle({
+      jsonrpc: '2.0',
+      id: 2,
+      method: 'tools/call',
+      params: { name: 'delegate_submit', arguments: { workspacePath: '/w', prompt: 'go', continueFromTaskId: value } },
+    });
+    assert.equal(response.result.isError, true, `${JSON.stringify(value)} must be refused`);
+    assert.equal(JSON.parse(response.result.content[0].text).error.code, 'MCP_ARGUMENT_TYPE');
+  }
+  assert.deepEqual(seen, [], 'a malformed continuation id must not reach the plane');
+});
+
+test('the MCP handshake tells a model that an explicit id is the only way to continue', async () => {
+  const { server } = fixture();
+  const answer = await server.handle({ jsonrpc: '2.0', id: 1, method: 'initialize', params: {} });
+  assert.match(answer.result.instructions, /continueFromTaskId/u);
+  assert.match(answer.result.instructions, /new task conversation/i);
+});
+
+
+test('the execution plane forwards continueFromTaskId and refuses an unusable one', async () => {
+  // The HTTP half of the rule: the plane is a pass-through for the continuation
+  // identity, and the ENGINE is the authority that validates it. Two properties are
+  // asserted — a valid id reaches the engine as written, and a continuation that
+  // cannot be honoured fails the task instead of silently starting a new one.
+  const plane = await executionPlaneFixture();
+  const origin = 'http://127.0.0.1:3210';
+  try {
+    const submitted = await dispatch(plane.handler, `${origin}${EXECUTION_PREFIX}/tasks`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ workspacePath: plane.workspace, prompt: 'unrelated task' }),
+    });
+    assert.equal(submitted.status, 202);
+    const rootTaskId = (await submitted.json()).task.taskId;
+
+    // A non-string continuation is a job-level refusal with its own code: the
+    // plane does not coerce it, and nothing is submitted.
+    const bad = await dispatch(plane.handler, `${origin}${EXECUTION_PREFIX}/tasks`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ workspacePath: plane.workspace, prompt: 'x', continueFromTaskId: 42 }),
+    });
+    // The first call above started a task in this workspace, so this refusal may be
+    // a 409 (workspace busy) before the continuation is even reached; what matters is
+    // that it is refused and never admitted as a run.
+    assert.ok(bad.status === 400 || bad.status === 409, `expected a refusal, saw ${bad.status}`);
+    assert.equal((await bad.json()).error.code, 'JOB_CONTINUATION_REFUSED');
+
+    // Release the root task's workspace lease before the next request, so the
+    // unknown-parent case reaches continuation validation rather than admission.
+    const settledRoot = await settleTask(plane.engine, rootTaskId, 'local-mcp');
+    assert.equal(settledRoot.state, TASK_STATES.awaitingHostReview);
+    assert.equal(settledRoot.execution.conversation.kind, 'new');
+    await plane.engine.tasks.get(rootTaskId).settled;
+
+    // A continuation of a task this deployment does not know fails closed during
+    // admission, before a worker Session can be created.
+    const unknown = await dispatch(plane.handler, `${origin}${EXECUTION_PREFIX}/tasks`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        workspacePath: plane.workspace,
+        prompt: 'continue something unknown',
+        continueFromTaskId: 'task-does-not-exist',
+      }),
+    });
+    assert.equal(unknown.status, 409, 'an unusable parent is refused before a run is admitted');
+    const unknownResponse = await unknown.json();
+    assert.equal(unknownResponse.error.code, 'JOB_CONTINUATION_REFUSED');
+    const unknownTask = [...plane.engine.tasks.values()].find((task) => task.prompt === 'continue something unknown');
+    assert.ok(unknownTask, 'the refused submission remains visible in task history');
+    await unknownTask.settled;
+    const settledUnknown = plane.engine.get(unknownTask.taskId);
+    assert.equal(settledUnknown.state, TASK_STATES.failed);
+    assert.equal(settledUnknown.error.code, 'JOB_CONTINUATION_REFUSED');
+    // This fixture is constructed without a session identity store, so the stated
+    // reason is that the deployment keeps no continuation identity at all; either
+    // way the run is refused rather than started as a new conversation.
+    assert.ok(
+      ['SESSION_CONTINUATION_UNKNOWN', 'SESSION_CONTINUATION_UNAVAILABLE'].includes(settledUnknown.error.details.session),
+      `unexpected placement reason ${settledUnknown.error.details.session}`,
+    );
+    assert.equal(settledUnknown.execution, null, 'no conversation was started in its place');
+  } finally {
+    await plane.close();
+  }
+});

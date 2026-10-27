@@ -15,9 +15,9 @@
 // dispatch. Two properties are asserted, and they are different claims:
 //
 //  * a controller that appears later is USED by the next run (the fix);
-//  * the grouping/reuse behaviour already shipped in 0.1.8 is unchanged
-//    (no regression: same directory -> one Workspace + a new Session per run, or
-//    the recorded Session under `reuse`).
+//  * the grouping behaviour already shipped in 0.1.8 is unchanged (same directory
+//    -> one Workspace + a new Session per run), and an explicit
+//    `continueFromTaskId` follow-up continues exactly the parent task's Session.
 //
 // Nothing here touches the network: every native service is either a fake from
 // `helpers/fakes.js` or a stub whose only job is to be absent.
@@ -30,7 +30,6 @@ import { join } from 'node:path';
 import { apply } from '../src/index.js';
 import { SESSION_CODES, SessionPlacementError, liveControllerAccessor } from '../src/runtime/session-placement.js';
 import { runAgent } from '../src/runtime/agent-runner.js';
-import { CONVERSATION_MODES } from '../src/config/defaults.js';
 import {
   cleanup,
   fakeAgentPresets,
@@ -137,13 +136,17 @@ async function mountWithoutControllers(options = {}) {
   ctx.llm = new LlmRuntime(ctx);
 
   const previousHome = process.env.DSH_HOME;
+  const previousCodexHome = process.env.CODEX_HOME;
   process.env.DSH_HOME = directory;
+  process.env.CODEX_HOME = join(directory, 'codex-home');
   let published = null;
   ctx.provide = (serviceName, value) => { published = value; };
   try {
     await apply(ctx, { dataDir: directory });
   } finally {
     process.env.DSH_HOME = previousHome;
+    if (previousCodexHome === undefined) delete process.env.CODEX_HOME;
+    else process.env.CODEX_HOME = previousCodexHome;
   }
 
   return {
@@ -445,84 +448,358 @@ test('runs in one directory stay grouped while each new-mode run gets its own Se
   }
 });
 
-test('reuse continues the Session recorded for the same directory, through the real engine', async () => {
-  // The other half of the shipped behaviour, and the reason this test drives the
-  // real `JobEngine`: recording the identity a `reuse` run resumes is the ENGINE's
-  // job (`rememberConversation`), so a runner-only test would assert a resume that
-  // nothing ever wrote down.
-  //
-  // Both controllers are published AFTER the plugin activated, so the run that
-  // records and the run that resumes each go through the late-bound accessors.
+test('a new submission in a directory with history still starts a new Session, through the real engine', async () => {
+  // The behaviour a removed directory-level setting used to change. Two submissions
+  // in one directory, with the local-call switch on: same Workspace group, two
+  // Sessions. Nothing about the directory's history makes the second one continue
+  // the first.
   const handle = await mountWithoutControllers({
-    // `reuse` is the operator's opt-in conversation mode, and the local-call
-    // switch must be on for a task to start at all — both are plugin config, not
-    // wiring, so they are stated in the mounted document.
-    providers: { ...validSettings(), delegationEnabled: true, conversation: { mode: 'reuse' } },
-    // A run that joins no preset composition has no tools and is refused before an
-    // agent exists, so the harness must offer one. It is published BEFORE
-    // activation here only because the preset registry is not a placement
-    // controller: the two services under test are still published afterwards.
+    providers: { ...validSettings(), delegationEnabled: true },
     controllers: { agentPresets: fakeAgentPresets() },
   });
   try {
     const agents = fakeAgents({ respond: { text: 'turn' } });
     const { sessionController } = await publishPair(handle, agents);
-
-    const { engine, auth } = handle.published;
-    // The engine's audit/preflight layer shells out to `git`. The real binary is
-    // not available to a confined test process, and the audit is not what this
-    // test is about, so the runner answers in the NUL-delimited shape the parser
-    // requires (an empty tree with no changes) instead of being skipped.
+    const { engine } = handle.published;
     engine.deps.runGit = fakeGit();
-    // The engine resolves the directory it is handed, so the run needs a real one.
-    const directory = await realDirectory(handle.directory, 'placement');
-
-    // A task may only start on a route the native runtime actually serves. The
-    // route set is this plugin's own registration, so it is ensured from the
-    // mounted document before the first dispatch; routing itself is covered by
-    // `entry.test.js` and is not what this test is about.
+    const directory = await realDirectory(handle.directory, 'fresh');
     await engine.deps.ensureRoutes(await handle.published.settings.read());
 
-    /**
-     * Authorize and run one task in `path`, then wait for it to settle.
-     * @param {string} path - execution directory.
-     * @param {string} prompt - task prompt.
-     * @returns {Promise<object>} settled task view.
-     */
-    const runTask = async (path, prompt) => {
-      const connection = auth.issueConnection({ label: 'lifecycle' });
-      const grant = auth.issueGrant(connection.connectionId, {
-        kind: 'task',
-        workspacePath: path,
-        ttlSeconds: 600,
-      });
+    const runTask = async (prompt) => {
       const started = await engine.start({
-        connectionId: connection.connectionId,
-        grantId: grant.grantId,
-        workspacePath: path,
+        connectionId: 'local-mcp',
+        workspacePath: directory,
         prompt,
       });
       return await settleTask(engine, started.taskId);
     };
 
-    const fresh = await runTask(directory, 'start the conversation');
-    assert.equal(fresh.state, 'awaiting-host-review', 'the first task must complete');
-    assert.equal(fresh.execution.conversation.reused, false, 'nothing was recorded for this directory yet');
-    assert.equal(fresh.conversationSaved, true, 'the engine recorded the Session it drove');
+    const first = await runTask('first task');
+    assert.equal(first.state, 'awaiting-host-review', 'the first task must complete');
+    assert.equal(first.execution.conversation.kind, 'new');
+    assert.equal(first.conversationSaved, true, 'the engine recorded the thread it drove');
+    assert.equal(first.continueFromTaskId, null);
 
-    // The same directory continues THAT conversation: no second Session is made.
-    const continued = await runTask(directory, 'carry on');
-    assert.equal(continued.execution.conversation.reused, true, 'the recorded Session is resumed');
-    assert.equal(continued.execution.conversation.sessionId, fresh.execution.conversation.sessionId);
-    assert.equal(continued.execution.conversation.workspaceId, fresh.execution.conversation.workspaceId);
-    assert.equal(sessionController.creates.length, 1, 'reuse must not create a second Session');
+    const second = await runTask('unrelated second task');
+    assert.equal(second.state, 'awaiting-host-review');
+    assert.equal(second.execution.conversation.kind, 'new', 'an unrelated task never continues the previous one');
+    assert.equal(second.execution.conversation.reused, false);
+    assert.notEqual(
+      second.execution.conversation.sessionId,
+      first.execution.conversation.sessionId,
+      'the second task has its own conversation',
+    );
+    assert.equal(
+      second.execution.conversation.workspaceId,
+      first.execution.conversation.workspaceId,
+      'while the directory keeps one Workspace group',
+    );
+    assert.equal(sessionController.creates.length, 2, 'two submissions, two Sessions');
+  } finally {
+    await handle.dispose();
+  }
+});
 
-    // The map holds the identity and nothing else — no prompt, no model output.
+test('continueFromTaskId continues that task thread through the real engine', async () => {
+  // The positive half of the feature, driven end to end: the engine records the
+  // thread a completed task drove, and a follow-up naming that task resumes the SAME
+  // Session instead of creating a second one.
+  const handle = await mountWithoutControllers({
+    providers: { ...validSettings(), delegationEnabled: true },
+    controllers: { agentPresets: fakeAgentPresets() },
+  });
+  try {
+    const agents = fakeAgents({ respond: { text: 'turn' } });
+    const { sessionController } = await publishPair(handle, agents);
+    const { engine } = handle.published;
+    engine.deps.runGit = fakeGit();
+    const directory = await realDirectory(handle.directory, 'continuation');
+    await engine.deps.ensureRoutes(await handle.published.settings.read());
+
+    /**
+     * Start one submission and wait for it to settle.
+     * @param {string} prompt - task prompt.
+     * @param {object} [extra] - extra start fields.
+     * @returns {Promise<object>} settled task view.
+     */
+    const runTask = async (prompt, extra = {}) => {
+      const started = await engine.start({
+        connectionId: 'local-mcp',
+        workspacePath: directory,
+        prompt,
+        ...extra,
+      });
+      return await settleTask(engine, started.taskId);
+    };
+
+    const root = await runTask('start the thread');
+    assert.equal(root.state, 'awaiting-host-review');
+    assert.equal(root.execution.conversation.kind, 'new');
+
+    const followUp = await runTask('carry on with the same task', { continueFromTaskId: root.taskId });
+    assert.equal(followUp.state, 'awaiting-host-review');
+    assert.equal(followUp.continueFromTaskId, root.taskId, 'the task record states what it continues');
+    assert.equal(followUp.execution.conversation.kind, 'continuation');
+    assert.equal(followUp.execution.conversation.reused, true);
+    assert.equal(followUp.execution.conversation.continuedFromTaskId, root.taskId);
+    assert.equal(
+      followUp.execution.conversation.sessionId,
+      root.execution.conversation.sessionId,
+      'the follow-up drives the SAME Session',
+    );
+    assert.equal(
+      followUp.execution.conversation.workspaceId,
+      root.execution.conversation.workspaceId,
+      'in the SAME Workspace',
+    );
+    assert.equal(sessionController.creates.length, 1, 'a continuation must not create a Session');
+
+    // A second follow-up of the same chain re-uses that thread rather than branching.
+    const chained = await runTask('and one more', { continueFromTaskId: followUp.taskId });
+    assert.equal(chained.execution.conversation.sessionId, root.execution.conversation.sessionId);
+    assert.equal(sessionController.creates.length, 1);
+
+    // The map holds identity and provenance only — no prompt, no model output.
     const stored = JSON.parse(await readFile(join(handle.directory, 'dsh-delegate', 'sessions.json'), 'utf8'));
-    const record = stored.sessions.find((entry) => entry.sessionId === fresh.execution.conversation.sessionId);
-    assert.ok(record !== undefined, 'the run recorded the Session it drove');
-    assert.deepEqual(Object.keys(record).sort(), ['path', 'sessionId', 'updatedAt', 'workspaceId']);
-    assert.equal(JSON.stringify(stored).includes('carry on'), false, 'no prompt may reach the session map');
+    const record = stored.sessions.find((entry) => entry.taskId === root.taskId);
+    assert.ok(record !== undefined, 'the root task recorded the thread it drove');
+    assert.equal(typeof record.executionPath, 'string');
+    assert.equal(JSON.stringify(stored).includes('start the thread'), false, 'no prompt may reach the identity map');
+    assert.equal(JSON.stringify(stored).includes('carry on'), false, 'nor a follow-up prompt');
+  } finally {
+    await handle.dispose();
+  }
+});
+
+test('a worktree follow-up reuses the parent tree and its uncommitted changes', async () => {
+  const handle = await mountWithoutControllers({
+    providers: { ...validSettings(), delegationEnabled: true, worker: { ...validSettings().worker, isolation: 'worktree' } },
+    controllers: { agentPresets: fakeAgentPresets() },
+  });
+  try {
+    const agents = fakeAgents({ respond: { text: 'turn' } });
+    const { sessionController } = await publishPair(handle, agents);
+    const { engine } = handle.published;
+    engine.deps.runGit = fakeGit();
+    const source = await realDirectory(handle.directory, 'worktree-source');
+    const treePath = await realDirectory(handle.directory, 'managed-tree');
+    const calls = { prepare: 0, get: 0, complete: 0 };
+    let managedTree = null;
+    engine.deps.worktrees = {
+      async prepare({ taskId, sourcePath }) {
+        calls.prepare += 1;
+        managedTree = {
+          taskId,
+          workspacePath: treePath,
+          sourcePath,
+          baseHead: 'a'.repeat(40),
+          isolated: true,
+          detached: true,
+          state: 'active',
+        };
+        return { ...managedTree };
+      },
+      get(path) {
+        calls.get += 1;
+        return managedTree !== null && path === treePath ? { ...managedTree } : null;
+      },
+      markComplete(path) {
+        assert.equal(path, treePath);
+        calls.complete += 1;
+        managedTree.state = 'awaiting-host-review';
+        return { ...managedTree };
+      },
+    };
+    await engine.deps.ensureRoutes(await handle.published.settings.read());
+
+    const runTask = async (prompt, extra = {}) => {
+      const started = await engine.start({ connectionId: 'local-mcp', workspacePath: source, prompt, ...extra });
+      return await settleTask(engine, started.taskId);
+    };
+
+    const parent = await runTask('create the first isolated change');
+    assert.equal(parent.state, 'awaiting-host-review');
+    assert.equal(parent.execution.workspacePath, treePath);
+    assert.equal(parent.execution.conversation.kind, 'new');
+    assert.equal(parent.conversationSaved, true);
+
+    const followUp = await runTask('improve that same change', { continueFromTaskId: parent.taskId });
+    assert.equal(followUp.state, 'awaiting-host-review');
+    assert.equal(followUp.execution.workspacePath, treePath, 'the follow-up mutates the original tree');
+    assert.equal(followUp.execution.conversation.kind, 'continuation');
+    assert.equal(followUp.execution.conversation.sessionId, parent.execution.conversation.sessionId);
+    assert.equal(followUp.execution.conversation.workspaceId, parent.execution.conversation.workspaceId);
+    assert.equal(followUp.worktree.taskId, parent.taskId, 'tree ownership stays with the task that created it');
+    assert.equal(calls.prepare, 1, 'a continuation must not create a clean replacement tree');
+    assert.equal(calls.get, 2, 'the engine and DSH placement each verify the managed tree');
+    assert.equal(calls.complete, 2, 'both turns leave the retained tree ready for host review');
+    assert.equal(sessionController.creates.length, 1, 'the follow-up resumes the same Session');
+  } finally {
+    await handle.dispose();
+  }
+});
+
+test('a worktree follow-up refuses when the original managed tree is no longer available', async () => {
+  const handle = await mountWithoutControllers({
+    providers: { ...validSettings(), delegationEnabled: true, worker: { ...validSettings().worker, isolation: 'worktree' } },
+    controllers: { agentPresets: fakeAgentPresets() },
+  });
+  try {
+    const agents = fakeAgents({ respond: { text: 'turn' } });
+    const { sessionController } = await publishPair(handle, agents);
+    const { engine } = handle.published;
+    engine.deps.runGit = fakeGit();
+    const source = await realDirectory(handle.directory, 'missing-tree-source');
+    const treePath = await realDirectory(handle.directory, 'missing-managed-tree');
+    let available = true;
+    let taskId = null;
+    engine.deps.worktrees = {
+      async prepare(request) {
+        taskId = request.taskId;
+        return {
+          taskId,
+          workspacePath: treePath,
+          sourcePath: request.sourcePath,
+          baseHead: 'a'.repeat(40),
+          isolated: true,
+          detached: true,
+          state: 'active',
+        };
+      },
+      get() {
+        if (!available) return null;
+        return {
+          taskId,
+          workspacePath: treePath,
+          sourcePath: source,
+          baseHead: 'a'.repeat(40),
+          isolated: true,
+          detached: true,
+          state: 'awaiting-host-review',
+        };
+      },
+      markComplete() { return { taskId, state: 'awaiting-host-review' }; },
+    };
+    await engine.deps.ensureRoutes(await handle.published.settings.read());
+
+    const started = await engine.start({ connectionId: 'local-mcp', workspacePath: source, prompt: 'start isolated work' });
+    const parent = await settleTask(engine, started.taskId);
+    assert.equal(parent.state, 'awaiting-host-review');
+    available = false;
+
+    await assert.rejects(
+      () => engine.start({
+        connectionId: 'local-mcp',
+        workspacePath: source,
+        prompt: 'continue isolated work',
+        continueFromTaskId: parent.taskId,
+      }),
+      (error) => {
+        assert.equal(error.code, 'JOB_CONTINUATION_REFUSED');
+        assert.equal(error.details.session, SESSION_CODES.continuationUnavailable);
+        return true;
+      },
+    );
+    const refused = engine.list().find((task) => task.continueFromTaskId === parent.taskId);
+    assert.ok(refused !== undefined);
+    assert.equal(refused.state, 'failed');
+    assert.equal(refused.error.code, 'JOB_CONTINUATION_REFUSED');
+    assert.equal(refused.error.details.session, SESSION_CODES.continuationUnavailable);
+    assert.equal(refused.execution, null, 'the absent tree is never replaced by a fresh checkout');
+    assert.equal(sessionController.creates.length, 1, 'no unrelated conversation is created');
+  } finally {
+    await handle.dispose();
+  }
+});
+
+test('a follow-up naming an unknown task is refused, not started as a new conversation', async () => {
+  const handle = await mountWithoutControllers({
+    providers: { ...validSettings(), delegationEnabled: true },
+    controllers: { agentPresets: fakeAgentPresets() },
+  });
+  try {
+    const agents = fakeAgents({ respond: { text: 'turn' } });
+    const { sessionController } = await publishPair(handle, agents);
+    const { engine } = handle.published;
+    engine.deps.runGit = fakeGit();
+    const directory = await realDirectory(handle.directory, 'unknown-parent');
+    await engine.deps.ensureRoutes(await handle.published.settings.read());
+
+    // The task-to-conversation map is checked during admission, before a slot,
+    // worktree or Session can be created.
+    await assert.rejects(
+      () => engine.start({
+        connectionId: 'local-mcp',
+        workspacePath: directory,
+        prompt: 'continue something that never existed',
+        continueFromTaskId: 'task-does-not-exist',
+      }),
+      (error) => {
+        assert.equal(error.code, 'JOB_CONTINUATION_REFUSED');
+        assert.equal(error.details.session, SESSION_CODES.continuationUnknown);
+        return true;
+      },
+    );
+    const refused = engine.list().find((task) => task.continueFromTaskId === 'task-does-not-exist');
+    assert.ok(refused !== undefined);
+    assert.equal(refused.state, 'failed', 'a refused continuation must not run as a new conversation');
+    assert.equal(refused.error.code, 'JOB_CONTINUATION_REFUSED');
+    assert.equal(refused.error.details.session, SESSION_CODES.continuationUnknown);
+    assert.equal(refused.error.details.continueFromTaskId, 'task-does-not-exist');
+    assert.equal(refused.execution, null, 'the run never reached a conversation');
+    assert.equal(sessionController.creates.length, 0, 'a refused continuation creates no conversation');
+  } finally {
+    await handle.dispose();
+  }
+});
+
+test('a follow-up to a still-running task is refused, so one chain never runs twice', async () => {
+  const handle = await mountWithoutControllers({
+    providers: { ...validSettings(), delegationEnabled: true },
+    controllers: { agentPresets: fakeAgentPresets() },
+  });
+  try {
+    // A conversation that never goes idle: the first task stays running for the
+    // whole test, which is exactly the "parent is live" case.
+    const agents = fakeAgents();
+    const { workspaces, sessionController } = await publishPair(handle, agents);
+    const { engine } = handle.published;
+    engine.deps.runGit = fakeGit();
+    const directory = await realDirectory(handle.directory, 'live-parent');
+    await engine.deps.ensureRoutes(await handle.published.settings.read());
+
+    const running = await engine.start({
+      connectionId: 'local-mcp',
+      workspacePath: directory,
+      prompt: 'long task',
+    });
+    // Wait until the parent has really started, so the refusal is about liveness.
+    for (let attempt = 0; attempt < 200 && engine.get(running.taskId).state === 'pending'; attempt += 1) {
+      await new Promise((resolvePromise) => { setTimeout(resolvePromise, 5); });
+    }
+    assert.equal(engine.get(running.taskId).state, 'running');
+
+    // A live parent is refused during admission, so `start()` itself rejects: the
+    // engine decides liveness before it does anything a parent could conflict with.
+    await assert.rejects(
+      () => engine.start({
+        connectionId: 'local-mcp',
+        workspacePath: directory,
+        prompt: 'follow up too early',
+        continueFromTaskId: running.taskId,
+      }),
+      (error) => {
+        assert.equal(error.code, 'JOB_CONTINUATION_REFUSED');
+        assert.match(error.message, /still running/);
+        assert.equal(error.details.session, SESSION_CODES.continuationState);
+        return true;
+      },
+    );
+
+    await engine.cancel(running.taskId, 'test');
+    // Nothing was created for the refused follow-up: one Workspace, one Session.
+    assert.equal(workspaces.workspaces.size, 1, 'the refused follow-up created no second Workspace');
+    assert.equal(sessionController.creates.length, 1, 'and only the parent\'s own Session exists');
   } finally {
     await handle.dispose();
   }

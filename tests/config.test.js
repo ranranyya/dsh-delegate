@@ -11,6 +11,7 @@ import {
   ConfigError,
 } from '../src/config/validate.js';
 import {
+  CONVERSATION_POLICY,
   exportSettings,
   projectKey,
   publicSettings,
@@ -528,23 +529,26 @@ test('a stored document whose project key is not canonical is still found', asyn
   }
 });
 
-// --- Conversation mode in the settings document -----------------------------
-//
-// What a run does with its DSH conversation is a stored setting, so it has to
-// survive validation, the public projection, export, the persistence round trip
-// and the layered effective snapshot. `new` is the default for every document,
-// including ones written before the field existed.
 
-test('an absent conversation block resolves to new, never to reuse', () => {
+
+// --- The retired conversation mode ------------------------------------------
+//
+// What a run does with its DSH conversation used to be a stored, directory-level
+// setting. It is not one any more: a new submission always starts a new DSH
+// conversation, and only `continueFromTaskId` continues one. The stored block is
+// kept as accepted input so an upgraded document still loads, and it is INERT —
+// the assertions below are what "inert" means in code.
+
+test('an absent conversation block resolves to the default, never to the retired reuse', () => {
   const document = validSettings();
   delete document.conversation;
   assert.deepEqual(validateSettings(document).conversation, { mode: 'new' });
   assert.deepEqual(validateSettings(validSettings()).conversation, { mode: 'new' });
 });
 
-test('reuse is storable and is not rewritten by validation', () => {
+test('a legacy reuse value is still storable, so an existing document keeps loading', () => {
   const validated = validateSettings(validSettings({ conversation: { mode: 'reuse' } }));
-  assert.deepEqual(validated.conversation, { mode: 'reuse' });
+  assert.deepEqual(validated.conversation, { mode: 'reuse' }, 'the stored value is preserved verbatim, not rewritten');
 });
 
 test('an unsupported conversation mode is refused rather than defaulted', () => {
@@ -556,13 +560,23 @@ test('an unsupported conversation mode is refused rather than defaulted', () => 
       `mode ${JSON.stringify(mode)} must be refused`,
     );
   }
+  // The refusal states that the field is retired, so a caller is pointed at the
+  // replacement rather than at a typo.
+  assert.throws(
+    () => validateSettings(validSettings({ conversation: { mode: 'reuse-all' } })),
+    (error) => error.code === 'CONVERSATION_MODE_UNSUPPORTED'
+      && error.details.deprecated === true
+      && /continueFromTaskId/.test(error.details.reason),
+  );
   assert.throws(
     () => validateSettings(validSettings({ conversation: 'reuse' })),
     (error) => error instanceof ConfigError && error.code === 'CONVERSATION_INVALID',
   );
 });
 
-test('the public projection and export carry the conversation mode', () => {
+test('the public projection and export still carry the stored value verbatim', () => {
+  // Compatibility, not a capability: a client that renders the block sees what the
+  // document says, and a round-trip never rewrites it.
   for (const mode of ['new', 'reuse']) {
     const validated = validateSettings(validSettings({ conversation: { mode } }));
     assert.deepEqual(publicSettings(validated).conversation, { mode });
@@ -570,27 +584,32 @@ test('the public projection and export carry the conversation mode', () => {
   }
 });
 
-test('the conversation mode reaches the effective snapshot and its provenance is unchanged', () => {
+test('the effective snapshot carries the conversation RULE, not the retired stored mode', () => {
+  // This is the property that makes a legacy `reuse` incapable of an implicit
+  // reuse: a run reads the snapshot, and the snapshot no longer has a mode to read.
   const validated = validateSettings(validSettings({ conversation: { mode: 'reuse' } }));
   const effective = resolveEffectiveConfig(validated, { projectPath: null });
-  assert.deepEqual(effective.conversation, { mode: 'reuse' });
+  assert.deepEqual(effective.conversation, { policy: CONVERSATION_POLICY });
+  assert.equal('mode' in effective.conversation, false, 'no mode reaches a run');
   assert.deepEqual(effective.provenance.applied, []);
 });
 
-test('a project override cannot change the conversation mode', () => {
-  // The mode is a deployment-level decision, not a per-project one: an override
-  // block that names it must not be able to switch a repair into "reuse".
+test('a project override cannot change what a run does with its conversation', () => {
+  const project = process.platform === 'win32' ? 'C:\\work\\project' : '/work/project';
   const document = validSettings({
-    projectOverrides: { [process.platform === 'win32' ? 'C:\\work\\project' : '/work/project']: { conversation: { mode: 'reuse' } } },
+    projectOverrides: { [project]: { conversation: { mode: 'reuse' } } },
   });
   const validated = validateSettings(document);
-  const effective = resolveEffectiveConfig(validated, {
-    projectPath: process.platform === 'win32' ? 'C:\\work\\project' : '/work/project',
-  });
-  assert.deepEqual(effective.conversation, { mode: 'new' }, 'the deployment mode still applies');
+  assert.deepEqual(
+    validated.projectOverrides[project].conversation,
+    undefined,
+    'a project block cannot even store a conversation decision',
+  );
+  const effective = resolveEffectiveConfig(validated, { projectPath: project });
+  assert.deepEqual(effective.conversation, { policy: CONVERSATION_POLICY });
 });
 
-test('the conversation mode persists across a service restart', async () => {
+test('a legacy reuse value persists across a service restart, and still means nothing', async () => {
   const dir = await makeTempDir();
   try {
     const service = new SettingsService(dir);
@@ -598,48 +617,60 @@ test('the conversation mode persists across a service restart', async () => {
     assert.deepEqual((await service.read()).conversation, { mode: 'reuse' });
 
     const reopened = new SettingsService(dir);
-    assert.deepEqual((await reopened.read()).conversation, { mode: 'reuse' }, 'the choice must survive a restart');
-  } finally {
-    await cleanup(dir);
-  }
-});
-
-test('setConversation validates and persists in one queued write', async () => {
-  const dir = await makeTempDir();
-  try {
-    const service = new SettingsService(dir);
-    await service.replace(validSettings());
-    const committed = await service.setConversation({ mode: 'reuse' });
-    assert.deepEqual(committed.conversation, { mode: 'reuse' });
-    assert.deepEqual((await service.read()).conversation, { mode: 'reuse' });
-
-    await assert.rejects(
-      () => service.setConversation({ mode: 'resume' }),
-      (error) => error.code === 'CONVERSATION_MODE_UNSUPPORTED',
+    const stored = await reopened.read();
+    assert.deepEqual(stored.conversation, { mode: 'reuse' }, 'the stored document survives a restart unchanged');
+    assert.deepEqual(
+      resolveEffectiveConfig(stored, { projectPath: null }).conversation,
+      { policy: CONVERSATION_POLICY },
+      'and a run started after the restart still follows the per-task rule',
     );
-    assert.deepEqual((await service.read()).conversation, { mode: 'reuse' }, 'a refused edit changes nothing');
   } finally {
     await cleanup(dir);
   }
 });
 
-test('replacing the configuration keeps a separately stored conversation mode', async () => {
-  // The page sends a full document on save; the host must not silently drop the
-  // mode it did not mention, and must honour it when it does.
+test('setConversation refuses: there is no mode control left to write', async () => {
   const dir = await makeTempDir();
   try {
     const service = new SettingsService(dir);
     await service.replace(validSettings({ conversation: { mode: 'reuse' } }));
-
-    const withoutMode = validSettings();
-    delete withoutMode.conversation;
-    const committed = await service.replaceConfiguration(withoutMode);
-    assert.deepEqual(committed.conversation, { mode: 'new' }, 'an absent block on a full replace states the default');
-
-    const withMode = validSettings({ conversation: { mode: 'reuse' } });
-    const again = await service.replaceConfiguration(withMode);
-    assert.deepEqual(again.conversation, { mode: 'reuse' });
+    await assert.rejects(
+      () => service.setConversation({ mode: 'reuse' }),
+      (error) => error instanceof ConfigError
+        && error.code === 'CONVERSATION_MODE_REMOVED'
+        && error.details.replacement === 'continueFromTaskId',
+    );
+    assert.deepEqual((await service.read()).conversation, { mode: 'reuse' }, 'a refused write changes nothing');
   } finally {
     await cleanup(dir);
   }
+});
+
+test('replacing the configuration keeps a stored legacy block instead of dropping it', () => {
+  // The page sends a full document on save. An absent block must not resurrect a
+  // capability, so an absent one states the default while a present one is kept as
+  // it was; neither influences a run.
+  return (async () => {
+    const dir = await makeTempDir();
+    try {
+      const service = new SettingsService(dir);
+      await service.replace(validSettings({ conversation: { mode: 'reuse' } }));
+
+      const withoutMode = validSettings();
+      delete withoutMode.conversation;
+      const committed = await service.replaceConfiguration(withoutMode);
+      assert.deepEqual(committed.conversation, { mode: 'new' }, 'an absent block on a full replace states the default');
+
+      const withMode = validSettings({ conversation: { mode: 'reuse' } });
+      const again = await service.replaceConfiguration(withMode);
+      assert.deepEqual(again.conversation, { mode: 'reuse' }, 'a present block round-trips verbatim');
+      assert.deepEqual(
+        resolveEffectiveConfig(again, { projectPath: null }).conversation,
+        { policy: CONVERSATION_POLICY },
+        'and neither value changes what a run does',
+      );
+    } finally {
+      await cleanup(dir);
+    }
+  })();
 });

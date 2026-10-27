@@ -39,6 +39,15 @@ import {
 } from './validate.js';
 
 /**
+ * The conversation policy every run follows, frozen into each task snapshot.
+ *
+ * One sentence, in the task record, so a finished task can explain itself without
+ * the reader consulting a setting: a new submission is a new conversation, and a
+ * follow-up continues the thread named by `continueFromTaskId`.
+ */
+export const CONVERSATION_POLICY = 'per-task';
+
+/**
  * Canonical key for one project path.
  *
  * The single source of truth is `canonicalProjectKey` in `validate.js`: the key
@@ -151,10 +160,11 @@ export function resolveEffectiveConfig(settings, { projectPath = null, overrides
       reasoningEffort: effectiveReview.reasoningEffort ?? null,
       providerRoute: effectiveReview.providerId ?? null,
     },
-    // What this task does with its DSH conversation. Frozen here with the rest of
-    // the snapshot, so a settings edit mid-run cannot change whether a task
-    // continues a previous conversation.
-    conversation: { ...validateConversationSettings(settings.conversation) },
+    // What this task does with its DSH conversation is NOT a settings fact any
+    // more: it is decided per submission by `continueFromTaskId`. The frozen
+    // snapshot therefore carries the rule rather than a stored mode, so a task
+    // record states what the plugin will do instead of echoing a retired setting.
+    conversation: { policy: CONVERSATION_POLICY },
     provenance: {
       // Canonical, not the caller's spelling: a recorded snapshot must compare
       // equal to the key its override is stored under.
@@ -222,9 +232,10 @@ export function publicSettings(settings) {
     authorization: { ...settings.authorization },
     projectOverrides: structuredClone(settings.projectOverrides ?? {}),
     presets: presets.map(publicPreset),
-    // Whether a run starts a fresh DSH conversation or resumes the last one for
-    // its execution directory. Nonsecret, and part of the export for the same
-    // reason: a restored configuration should keep the operator's choice.
+    // Kept in the export for compatibility with documents and clients that read
+    // it, but no longer a choice: the value is the retired directory-level mode and
+    // is inert. A restored configuration therefore cannot reintroduce implicit
+    // conversation reuse.
     conversation: { ...validateConversationSettings(settings.conversation) },
   });
 }
@@ -412,20 +423,24 @@ export class SettingsService {
   }
 
   /**
-   * Replace the conversation block (what a run does with its DSH session).
+   * Refuse to write a conversation block from a settings edit.
    *
-   * Queued like every other mutation, and validated through the shared
-   * conversation validator so a value this build does not implement is refused
-   * instead of being stored and interpreted later.
-   * @param {unknown} candidate - candidate conversation block, e.g. `{ mode: 'reuse' }`.
-   * @returns {Promise<object>} committed settings.
+   * The directory-level conversation mode has been removed, so there is no longer
+   * an operator control for it and no legitimate caller for this mutator. It is
+   * kept as a stated refusal rather than deleted so an older client that still
+   * posts the block gets an explanation instead of a silent no-op — the failure
+   * mode where a page believes it saved a mode that governs runs.
+   * @param {unknown} _candidate - ignored.
+   * @returns {Promise<never>} never resolves.
+   * @throws {ConfigError} always, with `code: CONVERSATION_MODE_REMOVED`.
    */
-  async setConversation(candidate) {
-    const conversation = validateConversationSettings(candidate);
-    return await this.serialize(async () => {
-      const previous = await this.snapshot();
-      return await this.persistWithinQueue({ ...previous, conversation }, previous);
-    });
+  async setConversation(_candidate) {
+    throw new ConfigError(
+      'CONVERSATION_MODE_REMOVED',
+      'the directory-level conversation mode has been removed; new submissions always start a new DSH conversation, '
+      + 'and a follow-up continues the thread named by continueFromTaskId',
+      { field: 'conversation.mode', replacement: 'continueFromTaskId' },
+    );
   }
 
   /**

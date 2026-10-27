@@ -30,27 +30,31 @@ export const ISOLATION_MODES = Object.freeze(['worktree', 'shared']);
 export const DEFAULT_ISOLATION = 'worktree';
 
 /**
- * Conversation modes: what a delegated run does with the DSH session it creates.
+ * The retired directory-level conversation mode, kept only as accepted input.
  *
- * `new` is the default and the safe one: every task gets its own DSH session in
- * the Workspace for its actual execution directory. `reuse` opts into resuming
- * the most recent recorded session for that same directory, which keeps a
- * conversation going across tasks. Reuse is scoped by the canonical execution
- * path and never crosses directories, so two isolated worktrees remain two
- * conversations even when they were forked from one repository.
+ * A stored settings document may still say `conversation.mode: "reuse"` from an
+ * earlier build that let an operator make every run in a directory continue the
+ * previous one. That setting is GONE: a new submission always starts a new DSH
+ * conversation, and a follow-up continues only the task thread named by
+ * `continueFromTaskId`. The value is still tolerated on read so an existing
+ * document keeps loading, and it is incapable of causing a reuse because no code
+ * path consults it. {@link LEGACY_CONVERSATION_MODES} is the complete set of
+ * values a document may still carry.
  */
-export const CONVERSATION_MODES = Object.freeze(['new', 'reuse']);
+export const LEGACY_CONVERSATION_MODE = 'reuse';
 
-/** Conversation mode stored when a document does not name one. */
-export const DEFAULT_CONVERSATION_MODE = 'new';
+/** Every conversation-mode value a stored document may still carry. */
+export const LEGACY_CONVERSATION_MODES = Object.freeze(['new', LEGACY_CONVERSATION_MODE]);
 
 /**
- * Session-identity map file name inside the plugin data directory.
+ * Session/task-thread identity map file name inside the plugin data directory.
  *
- * Holds only `canonical execution path -> DSH session id` plus the native
- * Workspace id, so a later `reuse` run can ask the harness to resume that
- * conversation. No transcript, prompt, credential or model output is stored
- * here: the native session log remains the single owner of conversation content.
+ * Holds only `task id -> { source/execution path, DSH Workspace id, DSH Session id,
+ * isolation, worktree ownership facts }`, so an explicit `continueFromTaskId`
+ * follow-up can ask the harness to resume THAT task's conversation in the same
+ * execution path it ran in. No transcript, prompt, output, credential or usage
+ * figure is stored here: the native session log remains the single owner of
+ * conversation content.
  */
 export const SESSIONS_FILE = 'sessions.json';
 
@@ -119,11 +123,13 @@ export function defaultSettings() {
     // in documents written before presets existed — validation fills it in, so
     // schema version 1 stays readable both ways.
     presets: [],
-    // What a delegated run does with its DSH conversation. `new` is the default
-    // for every stored document, including ones written before this field
-    // existed, so an upgrade never silently resumes somebody's old session.
+    // Deprecated and inert. A document that carries `conversation.mode: "reuse"`
+    // from an earlier build still loads, but the value is never consulted: a new
+    // submission starts a new DSH conversation and a follow-up continues the task
+    // thread named by `continueFromTaskId`. It is written as `new` so an upgraded
+    // document stops advertising a capability the plugin no longer has.
     conversation: {
-      mode: DEFAULT_CONVERSATION_MODE,
+      mode: LEGACY_CONVERSATION_MODES[0],
     },
   };
 }

@@ -308,11 +308,13 @@ test('an authorized task runs and ends awaiting host review, never approved', as
     assert.equal(settled.execution.outcome, 'completed');
     assert.match(settled.execution.text, /implemented the change/);
     // The run was grouped into a real Workspace keyed by its execution directory,
-    // and started a fresh conversation there (the default mode).
+    // and started a fresh conversation there (the only thing a new submission does).
     const conversation = settled.execution.conversation;
     assert.ok(conversation !== null && conversation !== undefined, 'a worker run must report where it was placed');
-    assert.equal(conversation.mode, 'new');
-    assert.equal(conversation.reused, false, 'the default mode starts a new conversation');
+    assert.equal(conversation.kind, 'new');
+    assert.equal(conversation.continuedFromTaskId, null);
+    assert.equal(conversation.reused, false, 'a new submission starts a new conversation');
+    assert.equal(settled.continueFromTaskId, null, 'the task states it continues nothing');
     assert.equal(h.workspaces.workspaces.get(conversation.workspaceId)?.path, h.workspace,
       'the Workspace is keyed by the actual execution directory');
     assert.equal(h.agents.created.length, 0, 'a placed run must not create a second agent');
@@ -636,12 +638,14 @@ test('a session grant starts repeated tasks', async () => {
     });
     assert.notEqual(one.taskId, two.taskId);
     await settle(h.engine, two.taskId);
-    // `new` is the default mode, so the second task starts its own conversation in
-    // the SAME Workspace group rather than continuing the first.
+    // An unrelated second submission starts its own conversation in the SAME
+    // Workspace group rather than continuing the first.
     const firstRun = h.engine.get(one.taskId).execution;
     const secondRun = h.engine.get(two.taskId).execution;
     assert.notEqual(firstRun.conversation.sessionId, secondRun.conversation.sessionId, 'two tasks, two conversations');
     assert.equal(firstRun.conversation.workspaceId, secondRun.conversation.workspaceId, 'in one Workspace group');
+    assert.equal(firstRun.conversation.kind, 'new');
+    assert.equal(secondRun.conversation.kind, 'new', 'nothing continues without an explicit continuation');
     assert.equal(h.sessionController.creates.length, 2);
   } finally {
     await h.close();

@@ -174,6 +174,10 @@ test('agent installed, MCP configured and the DSH switch are three independent r
   assert.equal(codexTargetView(codex, null, 'mcp').detail, '未配置');
   assert.equal(codexTargetView(codex, { authorized: false }, 'switch').detail.includes('不会'), true);
   assert.equal(codexTargetView(codex, { authorized: true }, 'switch').tone, 'on');
+  const unrecognizedAgent = codexDocument({
+    agent: { path: 'agent.toml', state: 'modified', installed: false, managed: false },
+  });
+  assert.match(codexTargetView(unrecognizedAgent, null, 'agent').detail, /不属于已知版本/u);
   // A conflict is warn-toned, not "on", even though the state string differs.
   const conflict = codexDocument({ mcp: { state: 'conflict', configured: false, path: 'M', script: 'S' } });
   assert.equal(codexTargetView(conflict, null, 'mcp').tone, 'warn');

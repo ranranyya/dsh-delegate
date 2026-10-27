@@ -90,7 +90,7 @@ async function readDiscoveryRecord(filePath) {
     if (error?.code === 'ENOENT') {
       throw new EndpointDiscoveryError(
         'MCP_ENDPOINT_NOT_FOUND',
-        'no DSH endpoint is published; start DSH with dsh-delegate 0.1.8 or set DSH_DELEGATE_BASE_URL',
+        'no DSH endpoint is published; start DSH with dsh-delegate 0.1.10 or set DSH_DELEGATE_BASE_URL',
       );
     }
     throw new EndpointDiscoveryError('MCP_ENDPOINT_READ_FAILED', 'the DSH endpoint discovery file could not be read');
