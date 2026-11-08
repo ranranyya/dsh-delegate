@@ -102,9 +102,12 @@ export const CODEX_ACTIONS = Object.freeze(['status', 'install', 'repair', 'remo
  * Regenerating a digest is a deliberate act: add the entry for a release only after
  * that release has been packed and its agent file verified.
  *
- * The 0.1.6, both 0.1.7 builds, and the 0.1.8 and 0.1.9 templates are enumerated
- * here because they are published Codex agent builds. A file that is not byte-identical to one of these releases or
- * the current template is reported as `modified`, rather than guessed as ours.
+ * The 0.1.6, both 0.1.7 builds, the 0.1.8 and 0.1.9 builds, the published 0.1.10
+ * template (in both its packed CRLF and its LF byte form), the published 0.1.11
+ * template and the published 0.1.12 template are enumerated here because they are
+ * published Codex agent builds. A file that is not byte-identical to one of these
+ * releases or the current template is reported as `modified`, rather than guessed as
+ * ours.
  * The array is intentionally mutable (not frozen) so a test can pin a temporary
  * entry and prove the "known build is refreshable" path without shipping a fake
  * historical release in the product data.
@@ -148,6 +151,77 @@ export const KNOWN_AGENT_TEMPLATES = [
   {
     version: '0.1.9',
     sha256: 'b5db667d114baf881f59c9367a80137379960b1fccb524c883ab0edcf9f0d516',
+  },
+  // The published 0.1.10 template. Its body differs from this build's only in the
+  // version line, but that line is part of the bytes an operator's file is proved
+  // against, so the digest is distinct and has to be enumerated on its own: without
+  // it, a 0.1.10 install is reported `modified` and is never refreshed by startup
+  // migration.
+  //
+  // Both digests below are enumerated for 0.1.10, because the release exists in two
+  // byte forms and either one can be sitting on an operator's disk:
+  //
+  // * `fc7b2710…` — the packed `dsh-delegate-0.1.10.tgz`, whose
+  //   `package/codex/dsh-delegate.toml` carries CRLF line endings (the form a Windows
+  //   install writes).
+  // * `6583f08a…` — the same template with LF line endings. It is an exact byte
+  //   identity like the other, not a normalized comparison: the product hashes the
+  //   file it finds and never rewrites its line endings, so an LF checkout of that
+  //   release stays a recognized build.
+  //
+  // Neither digest is derived from the other: normalization is a defect, not a
+  // convenience, because it would also make an edited file hash to a known value.
+  {
+    version: '0.1.10',
+    sha256: 'fc7b27104dbb50f4e614cd4fd8df8db87fd8f59fcf2b3c27b412b49f8b89fbba',
+  },
+  {
+    version: '0.1.10',
+    sha256: '6583f08a3ec4912a875249e6b127357b41cc3f8bf388b8e5cadbbeff469349be',
+  },
+  // The published 0.1.11 template: the bytes of the immediately previous release,
+  // which is what an existing installation holds when this build starts. Its body is
+  // the same as the 0.1.10 body (0.1.11 changed `package.json`, the permissions
+  // contract and the runtime facts, not the companion instructions), so the only
+  // difference from the 0.1.10 entry is the stamped version line — and a version
+  // line is part of the bytes an operator's file is proved against, so this digest
+  // is distinct and has to be enumerated on its own. Without it a 0.1.11
+  // installation is reported `modified` ("somebody else's file") and neither startup
+  // migration nor an explicit install would ever refresh it.
+  {
+    version: '0.1.11',
+    sha256: 'b6ca7c3258fc00c1c1682abf099994b9f5abe650acc3ecf9635eec4a35520151',
+  },
+  // The published 0.1.12 template: the file the immediately previous release packed,
+  // which is what an existing installation holds when this build starts. It was
+  // verified byte for byte against the packed `dsh-delegate-0.1.12.tgz`
+  // (`package/codex/dsh-delegate.toml`) and against the saved release baseline, so
+  // the digest is an exact identity rather than a reconstruction. Without this entry
+  // a 0.1.12 installation is reported `modified` — "somebody else's file" — and
+  // neither startup migration nor an explicit install would ever refresh it.
+  {
+    version: '0.1.12',
+    sha256: 'ff04a4bf2c09b97747f835770c837637869581bb13bad3b8a870a3e92218514f',
+  },
+  // The published 0.1.13 template: the file the immediately previous release packed,
+  // which is what an existing installation holds when this build starts. Verified byte
+  // for byte against the packed `dsh-delegate-0.1.13.tgz`
+  // (`package/codex/dsh-delegate.toml`): 9191 bytes, CRLF, this exact digest. It is an
+  // exact content identity like every other entry here, never a heuristic match on the
+  // version line — an operator-edited file whose version line still says 0.1.13 hashes
+  // differently and stays `modified` (preserved, never refreshed). Without this entry a
+  // 0.1.13 installation is reported `modified` — "somebody else's file" — and neither
+  // startup migration nor an explicit install would ever refresh it.
+  {
+    version: '0.1.13',
+    sha256: 'b3a1d2f0520774c0067ea733f27fd47c67c5f5ac44394d0eec2564c7959700aa',
+  },
+  // The published 0.1.14 template. Version 1.0.0 keeps the same companion body
+  // while changing the release marker, so an unchanged 0.1.14 installation must
+  // remain a byte-proven managed file and migrate automatically.
+  {
+    version: '0.1.14',
+    sha256: '11379c0152f3fb2bd4da1170812e51fe68006d98f6378c720cbadcee9ee4750c',
   },
 ];
 

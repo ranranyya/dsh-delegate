@@ -41,6 +41,7 @@ import {
   fakeSessionController,
   fakeWorkspaceController,
   makeTempDir,
+  nativePolicyServices,
   validSettings,
 } from './helpers/fakes.js';
 
@@ -312,6 +313,10 @@ async function engineWire(options = {}) {  const wired = wire();
   // auto-answering controller instead.
   const workspaces = options.workspaces ?? fakeWorkspaceController();
   const sessionController = options.sessionController ?? gatedSessionController(workspaces, ['first', 'second']);
+  // The native policy services a delegated run verifies its sandbox policy
+  // through. Built once per harness: both services fold each Session's own log, so
+  // they hold no state this file needs to reset between tasks.
+  const policyServices = options.policyServices ?? await nativePolicyServices();
   const deps = {
     agents,
     agentPresets: { async mount() { return { id: 'default' }; } },
@@ -319,6 +324,7 @@ async function engineWire(options = {}) {  const wired = wire();
     sessions: { async flush() {} },
     workspaces,
     sessionController,
+    policyServices: () => policyServices,
     llm: options.llm ?? wired.llm,
     settings,
     auth,
@@ -798,6 +804,9 @@ test('a native-only configuration passes a real engine preflight without refusin
   // preflight instead of being refused for an unplaceable run.
   const placementWorkspaces = fakeWorkspaceController();
   const placementSessions = fakeSessionController({ workspaces: placementWorkspaces, respond: { text: 'done' } });
+  // Every worker run is a delegated run: it verifies the sandbox/approval policy
+  // it wrote through the native services before it delivers a prompt.
+  const policyServices = await nativePolicyServices();
   const engine = new JobEngine({
     agents: fakeAgents({ respond: { text: 'done' } }),
     agentPresets: { async mount() { return { id: 'default' }; } },
@@ -805,6 +814,7 @@ test('a native-only configuration passes a real engine preflight without refusin
     sessions: { async flush() {} },
     workspaces: placementWorkspaces,
     sessionController: placementSessions,
+    policyServices: () => policyServices,
     llm: wired.llm,
     settings,
     auth,

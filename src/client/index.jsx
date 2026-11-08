@@ -59,6 +59,9 @@ import {
   ISOLATION_MODES,
   KNOWN_EFFORTS,
   LIMITS,
+  PERMISSION_DECISION_LABELS,
+  PERMISSION_OUTCOME_LABELS,
+  PERMISSION_STATE_LABELS,
   REVIEW_STATE_LABELS,
   REVIEW_VERDICT_LABELS,
   SUPPORTED_PROTOCOLS,
@@ -77,10 +80,14 @@ import {
   exportDocument,
   formatTime,
   grantState,
+  isAwaitingPermission,
   isCancellable,
+  pendingPermission,
+  permissionSummary,
   precheckDraft,
   previewEffective,
   taskOutcome,
+  taskPhaseLabel,
   taskStateLabel,
 } from './api.js';
 import { injectStyles } from './styles.js';
@@ -1602,13 +1609,20 @@ function TaskDetail({ store, task }) {
   const diff = task.diff ?? null;
   const execution = task.execution ?? null;
   const error = task.error ?? execution?.error ?? null;
+  const permission = permissionSummary(task);
+  const pending = pendingPermission(task);
+  const evidence = Array.isArray(task.permission?.evidence) ? task.permission.evidence : [];
+  const badgeTone = isAwaitingPermission(task)
+    ? 'warn'
+    : (task.state === 'awaiting-host-review' ? 'warn' : (task.state === 'failed' ? 'warn' : 'off'));
   return (
     <div className="dshdg-item">
       <div className="dshdg-item-head">
         <strong className="dshdg-mono">{task.taskId}</strong>
-        <Badge tone={task.state === 'awaiting-host-review' ? 'warn' : (task.state === 'failed' ? 'warn' : 'off')}>
+        <Badge tone={badgeTone}>
           {taskStateLabel(task.state)}
         </Badge>
+        {isAwaitingPermission(task) ? <Badge tone="warn">{PERMISSION_STATE_LABELS.pending}</Badge> : null}
         <span className="dshdg-spacer" />
         <button
           type="button"
@@ -1642,6 +1656,8 @@ function TaskDetail({ store, task }) {
               ? `续接 ${execution.conversation.continuedFromTaskId ?? '上一任务'} · 工作区 ${execution.conversation.workspaceId ?? '—'}`
               : `新开 · 工作区 ${execution.conversation.workspaceId ?? '—'}`)}
         </dd>
+        <dt>阶段</dt>
+        <dd>{taskPhaseLabel(task.phase)}</dd>
         <dt>创建</dt>
         <dd>{formatTime(task.createdAt)}</dd>
         <dt>结束</dt>
@@ -1688,6 +1704,46 @@ function TaskDetail({ store, task }) {
         </>
       )}
 
+      <h4>本次调用授权</h4>
+      <p className={isAwaitingPermission(task) ? 'dshdg-hint' : 'dshdg-faint'}>{permission.note}</p>
+      {permission.detail === '' ? null : <p className="dshdg-faint dshdg-mono">{permission.detail}</p>}
+      {pending === null ? null : (
+        <dl className="dshdg-kv">
+          <dt>工具</dt>
+          <dd className="dshdg-mono">{pending.toolName ?? '—'}</dd>
+          <dt>调用编号</dt>
+          <dd className="dshdg-mono">{pending.callId ?? '—'}</dd>
+          <dt>请求的权限</dt>
+          <dd className="dshdg-mono">{pending.requestedAccess?.mode ?? '（该工具自身的调用）'}</dd>
+          <dt>实际参数（已脱敏）</dt>
+          <dd className="dshdg-mono">{boundedText(pending.arguments ?? '（不可读）', 2000)}</dd>
+          <dt>工作进程给出的理由</dt>
+          <dd>{pending.reason ?? '（未给出）'}（这是工作进程自己的说法，不是被决定的操作本身）</dd>
+          <dt>截止</dt>
+          <dd>{formatTime(pending.deadlineAt)}</dd>
+        </dl>
+      )}
+      {evidence.length === 0 ? null : (
+        <>
+          <h4>授权决定记录</h4>
+          <ul className="dshdg-mono">
+            {evidence.slice().reverse().map((entry) => (
+              <li key={entry.requestId}>
+                {`${entry.requestId} · ${entry.toolName ?? '—'} · `
+                  + `${PERMISSION_STATE_LABELS[entry.state] ?? entry.state ?? '—'} · `
+                  + `${PERMISSION_OUTCOME_LABELS[entry.outcome] ?? entry.outcome ?? '—'}`
+                  + `${entry.decidedBy === 'commander' ? ` · ${PERMISSION_DECISION_LABELS[entry.outcome === 'allowed-once' ? 'allow-once' : 'reject'] ?? '本机指挥官'}` : ''}`}
+              </li>
+            ))}
+          </ul>
+        </>
+      )}
+      <p className="dshdg-hint">
+        逐次授权桥只决定“这一次调用”。它不能创建或扩大任何长期有效的授权（“长期有效”指跨调用、跨会话持久的授权），不能修改设置、凭据、本机调用开关、提供方、模型或隔离方式，
+        也不能预先批准后续调用；工作进程的常规沙箱权限始终保持 workspace-write。此界面不提供手工批准按钮，决定由本机 MCP 指挥官通过
+        delegate_permission_decide 作出。
+      </p>
+
       <p className="dshdg-hint">
         重试前请确认顶部的本机调用开关已开启，然后在 MCP 宿主重新提交任务。本界面不会直接提交任务。
       </p>
@@ -1714,9 +1770,12 @@ function TasksPanel({ store, snapshot }) {
             <div className="dshdg-item" key={task.taskId}>
               <div className="dshdg-item-head">
                 <span className="dshdg-mono">{task.taskId}</span>
-                <Badge tone={task.state === 'awaiting-host-review' ? 'warn' : (task.state === 'failed' ? 'warn' : 'off')}>
+                <Badge tone={isAwaitingPermission(task)
+                  ? 'warn'
+                  : (task.state === 'awaiting-host-review' ? 'warn' : (task.state === 'failed' ? 'warn' : 'off'))}>
                   {taskStateLabel(task.state)}
                 </Badge>
+                {isAwaitingPermission(task) ? <Badge tone="warn">{PERMISSION_STATE_LABELS.pending}</Badge> : null}
                 <span className="dshdg-mono dshdg-faint">
                   {task.config?.worker?.model ?? '—'}
                   {' / '}
@@ -1740,7 +1799,9 @@ function TasksPanel({ store, snapshot }) {
                   取消
                 </button>
               </div>
-              <p className="dshdg-hint">{taskStateLabel(task.state) === '等待宿主审查' ? taskOutcome(task).note : ''}</p>
+              {isAwaitingPermission(task)
+                ? <p className="dshdg-hint">{permissionSummary(task).note}</p>
+                : <p className="dshdg-hint">{taskStateLabel(task.state) === '等待宿主审查' ? taskOutcome(task).note : ''}</p>}
             </div>
           ))}
         </div>

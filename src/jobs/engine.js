@@ -67,6 +67,8 @@ import { AUTH_CODES, AuthError } from '../auth/grants.js';
 import { resolveRoute } from '../model/routing.js';
 import { PROVIDER_SET_CODES, managedProvidersOf } from '../model/providers.js';
 import { RUN_OUTCOMES, RunError, SessionPlacementRefusal, diagnostic, runAgent } from '../runtime/agent-runner.js';
+import { PermissionBridge, PermissionError, PERMISSION_CODES } from '../runtime/permissions.js';
+import { DELEGATE_SANDBOX_MODE } from '../runtime/sandbox.js';
 import { rememberSession, SESSION_CODES } from '../runtime/session-placement.js';
 import { REVIEW_STATES, reviewWork } from '../review/reviewer.js';
 import { buildReviewPrompt, buildWorkerPrompt } from '../review/prompts.js';
@@ -126,6 +128,10 @@ export const JOB_CODES = Object.freeze({
   // fail-closed: the run is refused rather than turned into a new conversation the
   // caller did not ask for. `details.session` carries the specific `SESSION_*` code.
   continuationRefused: 'JOB_CONTINUATION_REFUSED',
+  // A pending per-call permission request the worker is waiting on. The task is
+  // still `running`; the PHASE says it is waiting for the commander's decision.
+  // `waitingForPermission` is not a terminal state and is not a failure.
+  permissionPending: 'JOB_PERMISSION_PENDING',
 });
 
 /** Default interval of the internal authorization sweep. */
@@ -172,6 +178,18 @@ const HISTORY_WRITE_TIMEOUT_MS = 5000;
 
 /** Upper bound on retained task records; oldest terminal records go first. */
 const MAX_RETAINED_TASKS = 256;
+
+/**
+ * The phase a running task reports while a permission request is outstanding.
+ *
+ * It is a PHASE, not a state, on purpose: the worker is still running and its
+ * workspace slot, lock and execution budget are still its own. Reporting a new
+ * `waiting` state would have changed every state contract downstream (terminal
+ * sets, cancel rules, history rehydration) to describe something that is not a
+ * new lifecycle.
+ */
+const PHASE_AWAITING_PERMISSION = 'awaiting-permission';
+const PHASE_EXECUTE = 'execute';
 
 /** Raised for job-level refusals. */
 export class JobError extends Error {
@@ -450,6 +468,10 @@ export class JobEngine {
       // execution path and conversation, never the internal parent object.
       continuationParent: null,
       continuationRecord: null,
+      // The identity map row, read exactly once, and the single durable snapshot the
+      // continuation is judged by. Both are admission-only facts; the public task view
+      // exposes the resulting execution path and conversation, never the internals.
+      continuationIdentity: null,
       reusedWorktree: false,
       review: { state: REVIEW_STATES.notRun, verdict: null, text: '', error: null },
       error: null,
@@ -468,6 +490,15 @@ export class JobEngine {
       // the leases: a workspace must not be handed to the next job while the
       // previous executor may still be writing to it.
       native: { started: false, settled: false, promise: null },
+      // The per-call permission surface of this run. `bridge` is the answerer the
+      // runner arms for this task's own Agent (null when the run was not offered
+      // one), `pending` is the one request the worker is waiting on (null when
+      // nothing is outstanding), and `evidence` is the bounded settled trail the
+      // task view and the durable history carry. `pausedExecutionMs` is how much
+      // of the execution budget was spent WAITING: it is given back to the run's
+      // timer when the request settles, so an approval wait can never be charged
+      // to the execution timeout.
+      permission: { bridge: null, pending: null, evidence: [], pausedAt: null, pausedExecutionMs: 0 },
       // Idempotence latch for {@link finalize}: one promise per task, ever.
       finalizing: null,
       finalizedAt: null,
@@ -542,11 +573,16 @@ export class JobEngine {
     this.assertLive(task, 'authorization');
     }
 
-    // ---- 2b. a follow-up must name a continuable parent, fail-closed ---------
-    // The parent is validated here, where the caller's connection identity and the
-    // resolved source workspace are both known, so a continuation can never be
-    // granted across a connection, a repository or a directory. Every refusal below
-    // states why; none of them falls back to starting a new conversation.
+    // ---- 2b. a follow-up must be owned by this caller, fail-closed -----------
+    // Proven here, where the caller's verified connection identity is known, and
+    // before anything about the parent can be described. One call decides the whole
+    // chain — ownership, outcome, paths, isolation and the identity map — from a
+    // single durable snapshot, so nothing about the parent can reach a caller who has
+    // not proven ownership and no later step reads history or the identity map again.
+    // Running it here, before settings and the concurrency slot, is what makes a
+    // refusal stable: a still-running parent is refused for its own state rather than
+    // for a slot it was never entitled to, and the parent's isolation mode is known
+    // before any mode is resolved.
     if (task.continueFromTaskId !== null) {
       task.phase = 'continuation';
       await this.assertContinuation(task, sourcePath);
@@ -1350,98 +1386,286 @@ export class JobEngine {
   }
 
   /**
-   * Validate a `continueFromTaskId` parent, or refuse.
+   * Prove that this caller owns the named parent thread, then judge whether the chain
+   * may be joined — in one method, from one snapshot, with no branch that skips a check.
    *
-   * A continuation is the one thing that may join an existing conversation, so it is
-   * the one thing that has to be proven before anything is created. The checks are
-   * ordered from "does this task exist at all" to "may this caller continue it":
+   * Admission calls this once, before settings are read and before a concurrency slot
+   * is claimed, so everything a continuation needs is decided in one order:
    *
-   *  1. **the parent must be known here** — this engine's own records, which is what
-   *     a continuing submission almost always names;
-   *  2. **the caller must be the one that submitted it** — one connection never
-   *     continues another's task, even in a workspace both are authorized for;
-   *  3. **the parent must not be live** — a running task's conversation is being
-   *     written, and the workspace lease of the same path is what makes the
-   *     overlapping run impossible anyway. This is the chain lock: the parent's
-   *     lease is still held while it runs, so a follow-up starting in its directory
-   *     fails the source lock rather than driving a thread mid-turn;
-   *  4. **the parent must have ended in a state that has a thread** — `awaiting-host-
-   *     review`, or `failed`/`cancelled` with a recorded conversation (a retry of a
-   *     run that really did talk to the model). A parent that failed before any
-   *     session existed has nothing to continue;
-   *  5. **the parent must have run for this source repository** — a chain never
-   *     crosses repositories;
-   *  6. **the recorded identity must be continuable here** — the persisted row's own
-   *     path/isolation rules are re-checked by the placement module, which is also
-   *     what handles a parent from a previous process.
+   *  1. **Ownership.** The caller must state a verified connection id (the empty side is
+   *     never a wildcard). A live parent record is proven by its own exact
+   *     `connectionId`; a record that states none is unprovable rather than ownerless.
+   *     A parent this process does not hold is proven by its durable history row, whose
+   *     exact `connectionId` must equal the caller's. A deployment without durable
+   *     history, an unreadable or malformed document, a pruned or missing record, a
+   *     truncated record and a record with no owner all fail closed the same way, because
+   *     each of them would otherwise confirm that some task exists. Every ownership
+   *     failure is the same `JOB_TASK_NOT_FOUND`, reported as absent rather than
+   *     forbidden, so the answer cannot enumerate another connection's tasks.
+   *  2. **The durable snapshot.** History is read exactly once here and the row is
+   *     reduced to one standard shape: `state`, `sourcePath`, `executionWorkspacePath`,
+   *     `isolation` and `conversation`. A parent that is live in this process supplies
+   *     that shape from its own record; a parent from a previous process supplies it from
+   *     the durable row, with `conversation` taken from `row.execution?.conversation`.
+   *     There is no "row was null, so skip the checks" path: a failed read is a refusal,
+   *     never a pass.
+   *  3. **The identity map**, read exactly once, and **the outcome**: {@link admitContinuation}
+   *     judges state, paths, isolation and Session from that snapshot and this identity.
    *
-   * A parent recorded by an earlier process is reachable through the persisted
-   * identity map (`sessionStore`); a parent this process never admitted *and* the
-   * store does not know is `SESSION_CONTINUATION_UNKNOWN`, which the placement
-   * module reports. Everything decidable from the live record is decided here.
-   * @param {object} task - pending record with `continueFromTaskId`.
-   * @param {string} sourcePath - the resolved source workspace of this submission.
-   * @returns {void}
-   * @throws {JobError} when the continuation cannot be honoured.
+   * The verified result is recorded on the task, because steps 4 and 7 of admission
+   * (effective isolation, and reusing the parent's tree instead of preparing a new one)
+   * read `task.continuationRecord`. Nothing below re-reads history or the identity map.
+   * @param {object} task - pending record with `continueFromTaskId` and a verified `connectionId`.
+   * @param {string} sourcePath - this submission's resolved source workspace.
+   * @returns {Promise<void>} resolves once the chain is proven continuable.
+   * @throws {JobError} `JOB_TASK_NOT_FOUND` when ownership is unprovable, a `SESSION_*`
+   *   refusal when a proven parent cannot be joined.
    */
   async assertContinuation(task, sourcePath) {
-    const parentTaskId = task.continueFromTaskId;
-    // `assertAdmissible` is the single authority for "does a continuation chain
-    // exist here and may it be joined", so the in-memory record and a row recovered
-    // from the persisted map are judged by ONE implementation. That is what keeps a
-    // parent from a previous process ("failed without a session", "worktree gone")
-    // as strictly validated as one this process just finished.
-    const parent = this.assertAdmissible(parentTaskId, {
-      sourcePath,
-      connectionId: task.connectionId,
-      selfTaskId: task.taskId,
-    });
-    const store = this.deps?.sessionStore ?? null;
-    if (store === null || typeof store.get !== 'function') {
-      throw this.continuationRefusal('the task-to-conversation identity store is unavailable, so the follow-up cannot be placed safely', {
-        continueFromTaskId: parentTaskId,
-        session: SESSION_CODES.continuationUnavailable,
-      });
+    const parentId = task.continueFromTaskId;
+    const caller = typeof task.connectionId === 'string' && task.connectionId !== '' ? task.connectionId : null;
+    if (caller === null) throw this.absentContinuation(parentId);
+
+    // One snapshot of the parent, in one standard shape. A live record is authoritative
+    // for its own outcome and paths; otherwise the durable row must supply them, and a
+    // row that cannot be found or read is a refusal, never a skip.
+    const parent = this.tasks.get(parentId) ?? null;
+    let row;
+    if (parent !== null) {
+      if (parent.connectionId !== caller) throw this.absentContinuation(parentId);
+      row = {
+        state: parent.state,
+        sourcePath: parent.sourcePath,
+        executionWorkspacePath: parent.executionPath,
+        isolation: parent.effective?.worker?.isolation ?? null,
+        conversation: parent.execution?.conversation ?? null,
+      };
+    } else {
+      const durable = await this.durableParent(task, parentId, caller);
+      if (durable === null) throw this.absentContinuation(parentId);
+      row = {
+        state: durable.state ?? null,
+        sourcePath: durable.sourcePath ?? null,
+        executionWorkspacePath: durable.executionWorkspacePath ?? null,
+        isolation: durable.isolation ?? null,
+        conversation: durable.execution?.conversation ?? null,
+      };
     }
-    let identity;
+
+    // The identity map is the only document carrying the exact execution directory and
+    // the Session; it is read once, here, and judged together with the snapshot above.
+    task.continuationIdentity = await this.readContinuationIdentity(task);
+    this.admitContinuation(task, row, sourcePath);
+
+    // Recorded only after every check passed: these two facts are what admission's
+    // isolation and worktree steps read to resume the parent instead of starting over.
+    task.continuationParent = parent;
+    task.continuationRecord = task.continuationIdentity;
+  }
+
+  /**
+   * The one refusal an unprovable owner gets.
+   *
+   * Unknown, ownerless and another connection's parent are indistinguishable on
+   * purpose: the details carry the id the caller itself supplied and nothing else,
+   * so the answer cannot confirm that any other task exists.
+   * @param {string} parentTaskId - the id the caller named.
+   * @returns {JobError} refusal to throw.
+   */
+  absentContinuation(parentTaskId) {
+    return new JobError(JOB_CODES.taskNotFound, 'no such task for this connection', { continueFromTaskId: parentTaskId });
+  }
+
+  /**
+   * Read the durable record of a parent this process does not hold, and decide
+   * whether it proves this caller's ownership.
+   *
+   * Fail-closed by construction: a deployment without durable history, an
+   * unreadable or malformed document, a missing (pruned, never written) record, a
+   * truncated record and a record that states no owner all answer `null`, which the
+   * caller turns into the same `JOB_TASK_NOT_FOUND` an unknown id gets.
+   * @param {object} task - pending record (for the guarded await).
+   * @param {string} parentTaskId - the id the caller named.
+   * @param {string} caller - this submission's verified connection id.
+   * @returns {Promise<object | null>} the proven row, or null.
+   */
+  async durableParent(task, parentTaskId, caller) {
+    const history = this.history;
+    if (history === null || history === undefined || typeof history.load !== 'function') return null;
+    let rows;
     try {
-      identity = await this.guardPreflight(task, 'continuation-identity', () => store.get(parentTaskId));
+      rows = await this.guardPreflight(task, 'continuation-history', () => history.load());
     } catch (error) {
       if (error instanceof JobError) throw error;
-      throw this.continuationRefusal('the task-to-conversation identity could not be read, so the follow-up cannot be placed safely', {
-        continueFromTaskId: parentTaskId,
+      return null;
+    }
+    // Read once. The document is newest-first, so the first match is recent.
+    const row = Array.isArray(rows)
+      ? rows.find((entry) => entry !== null && typeof entry === 'object' && entry.taskId === parentTaskId) ?? null
+      : null;
+    if (row === null) return null;
+    // A record that had to be cut to fit its byte budget is not complete evidence of
+    // either ownership or outcome.
+    if (row.truncation !== undefined && row.truncation !== null) return null;
+    if (typeof row.connectionId !== 'string' || row.connectionId === '' || row.connectionId !== caller) return null;
+    return row;
+  }
+
+  /**
+   * Decide whether a proven parent may be joined, and record what joining it needs.
+   *
+   * Ownership is already proven, so every refusal here may name its reason. They are
+   * all `SESSION_*` codes carried in `details.session`, and none of them falls back to
+   * a new conversation.
+   *
+   *  1. **The snapshot decides the outcome.** It must be terminal — `pending`,
+   *     `running`, `interrupted` (live when a previous process stopped) and anything
+   *     this build does not know are refused — and it must name a conversation that
+   *     really drove a Session: a placement of kind `new` or `continuation` with a
+   *     non-empty Workspace id and Workspace path. A run that failed before it reached
+   *     one has no thread, and continuing it would silently start a new one.
+   *  2. **Its paths must be usable proof.** Both the source repository and the
+   *     execution directory must be stated, unmasked and non-empty. A masked path was
+   *     rewritten by redaction and cannot prove which directory it names, so it is
+   *     refused exactly like a missing one — a mask is never a wildcard and never equals
+   *     anything.
+   *  3. **The identity map supplies the thread and must agree.** It is the only
+   *     document carrying the exact execution directory and Session, so it must state
+   *     one, its source repository must be this submission's, and its Workspace id,
+   *     execution directory and isolation must be the ones the snapshot names. The
+   *     native Session and its Agent are then verified by placement.
+   * @param {object} task - pending record carrying the once-read `continuationIdentity`.
+   * @param {object} row - the single parent snapshot, already in the standard shape.
+   * @param {string} sourcePath - this submission's resolved source workspace.
+   * @returns {void}
+   * @throws {JobError} a `SESSION_*` refusal naming the reason.
+   */
+  admitContinuation(task, row, sourcePath) {
+    const parentId = task.continueFromTaskId;
+    const refuse = (message, session, reason, extra = {}) => this.continuationRefusal(message, {
+      continueFromTaskId: parentId,
+      session,
+      reason,
+      ...extra,
+    });
+    const state = row.state;
+    if (!TERMINAL.has(state)) {
+      // A parent that is merely unfinished (`pending`/`running`) is the one refusal an
+      // operator retries, and says so in the same words the live re-check uses. A run
+      // that stopped without ending (`interrupted`, or a state this build does not
+      // know) is not "still running" and keeps the message that does not promise a retry.
+      const message = state === TASK_STATES.pending || state === TASK_STATES.running
+        ? 'the named task is still running, so its conversation cannot be continued yet'
+        : 'the named task did not end, so its conversation cannot be continued';
+      throw refuse(message, SESSION_CODES.continuationState,
+        typeof state === 'string' ? state : 'no recorded end state');
+    }
+    const conversation = row.conversation;
+    // A conversation is proof only when it names a placement that reached a Session in a
+    // named Workspace. An absent one, an unknown kind or an empty Workspace id is a run
+    // that never drove a thread, whichever terminal state it ended in.
+    if (conversation === null || typeof conversation !== 'object'
+      || !['new', 'continuation'].includes(conversation.kind)
+      || typeof conversation.workspaceId !== 'string' || conversation.workspaceId.trim() === ''
+      || typeof conversation.workspacePath !== 'string' || conversation.workspacePath.trim() === '') {
+      throw refuse('the named task ended without driving a conversation, so there is nothing to continue',
+        SESSION_CODES.continuationState, typeof state === 'string' ? state : 'no recorded end state');
+    }
+    // Paths are proof, not a hint: a value written through a projection that rewrote it
+    // (a mask) cannot say which directory it named, so it is refused exactly like a
+    // missing one. No path, connection or isolation value is ever a wildcard.
+    for (const [field, session] of [
+      ['sourcePath', SESSION_CODES.continuationWorkspaceMismatch],
+      ['executionWorkspacePath', SESSION_CODES.continuationUnavailable],
+    ]) {
+      if (typeof row[field] !== 'string' || row[field].trim() === '' || recordedPathIsMasked(row[field])) {
+        throw refuse('the named task has no reliably recorded path, so its conversation cannot be continued', session, `unusable recorded ${field}`);
+      }
+    }
+    if (!samePath(row.sourcePath, sourcePath)) {
+      throw refuse('the named task belongs to another source repository, so its conversation was not continued',
+        SESSION_CODES.continuationWorkspaceMismatch, 'different source repository');
+    }
+    if (!['shared', 'worktree'].includes(row.isolation)) {
+      throw refuse('the named task has no recorded isolation, so its conversation cannot be continued',
+        SESSION_CODES.continuationUnavailable, 'no recorded isolation');
+    }
+
+    // The identity map supplies the thread itself, and must agree with the snapshot it
+    // belongs to. It is the only document that carries the exact execution directory and
+    // the Session, so a missing one is refused like a missing path.
+    const identity = task.continuationIdentity;
+    if (identity === null || typeof identity !== 'object') {
+      throw refuse('no conversation identity is recorded for the named task, so it cannot be continued',
+        SESSION_CODES.continuationUnknown, 'unknown, pruned or started by another deployment');
+    }
+    if (typeof identity.sessionId !== 'string' || identity.sessionId.trim() === '') {
+      throw refuse('the recorded conversation identity names no Session, so it cannot be continued',
+        SESSION_CODES.continuationUnavailable, 'no recorded session');
+    }
+    if (typeof identity.executionPath !== 'string' || identity.executionPath.trim() === ''
+      || recordedPathIsMasked(identity.executionPath)) {
+      throw refuse('the named task has no usable execution-path identity, so its conversation cannot be continued',
+        SESSION_CODES.continuationUnavailable, 'unusable recorded execution path');
+    }
+    if (!samePath(identity.sourcePath, sourcePath)) {
+      throw refuse('the named task belongs to another source repository, so its conversation was not continued',
+        SESSION_CODES.continuationWorkspaceMismatch, 'identity source repository differs');
+    }
+    if (typeof identity.workspaceId !== 'string' || identity.workspaceId.trim() === ''
+      || identity.workspaceId !== conversation.workspaceId) {
+      throw refuse('the recorded conversation identity does not match the named task',
+        SESSION_CODES.continuationUnavailable, 'identity workspace differs');
+    }
+    // The conversation names the directory it was recorded against. A record whose path
+    // is masked cannot say which directory that was, and one that names a different
+    // execution directory than the identity resolves is another directory's thread —
+    // the Workspace id alone is not proof, so the Session is never resolved for either.
+    if (recordedPathIsMasked(conversation.workspacePath) || !samePath(conversation.workspacePath, identity.executionPath)) {
+      throw refuse('the recorded conversation path does not match its execution directory',
+        SESSION_CODES.continuationUnavailable, 'conversation workspace path differs');
+    }
+    if (!samePath(identity.executionPath, row.executionWorkspacePath)) {
+      throw refuse('the recorded conversation identity does not match the named task',
+        SESSION_CODES.continuationUnavailable, 'identity execution path differs');
+    }
+    if (!['shared', 'worktree'].includes(identity.isolation) || identity.isolation !== row.isolation) {
+      throw refuse('the recorded conversation identity does not match the named task',
+        SESSION_CODES.continuationUnavailable, 'identity isolation differs');
+    }
+  }
+
+  /**
+   * Read the persisted identity of the named parent task, or refuse.
+   *
+   * This is the only read of the identity map in a submission. A missing store, an
+   * unreadable document and a document with no row for the task are each a refusal,
+   * because without them no Session can be reached and the follow-up would silently
+   * become a new conversation. The row's own facts are judged in
+   * {@link admitContinuation}, once ownership and outcome are known.
+   * @param {object} task - pending record with `continueFromTaskId`.
+   * @returns {Promise<object | null>} the stored row, or null when there is none.
+   * @throws {JobError} when the map cannot be read at all.
+   */
+  async readContinuationIdentity(task) {
+    const store = this.deps?.sessionStore ?? null;
+    if (store === null || typeof store.get !== 'function') {
+      throw this.continuationRefusal('this deployment keeps no task-to-conversation identity, so the named task cannot be continued', {
+        continueFromTaskId: task.continueFromTaskId,
+        session: SESSION_CODES.continuationUnavailable,
+        reason: 'no session identity store',
+      });
+    }
+    try {
+      return await this.guardPreflight(task, 'continuation-identity', () => store.get(task.continueFromTaskId));
+    } catch (error) {
+      if (error instanceof JobError) throw error;
+      throw this.continuationRefusal('the stored task-to-conversation identity could not be read, so the named task cannot be continued', {
+        continueFromTaskId: task.continueFromTaskId,
         session: SESSION_CODES.continuationUnavailable,
         cause: typeof error?.code === 'string' ? error.code : null,
       });
     }
-    if (identity === null || typeof identity !== 'object') {
-      throw this.continuationRefusal('no conversation identity is recorded for the named task', {
-        continueFromTaskId: parentTaskId,
-        session: SESSION_CODES.continuationUnknown,
-      });
-    }
-    if (!samePath(identity.sourcePath, sourcePath)) {
-      throw this.continuationRefusal('the named task belongs to another source repository, so its conversation was not continued', {
-        continueFromTaskId: parentTaskId,
-        session: SESSION_CODES.continuationWorkspaceMismatch,
-      });
-    }
-    if (!['shared', 'worktree'].includes(identity.isolation)
-      || typeof identity.executionPath !== 'string' || identity.executionPath.trim() === '') {
-      throw this.continuationRefusal('the named task has no usable execution-path identity, so its conversation cannot be continued', {
-        continueFromTaskId: parentTaskId,
-        session: SESSION_CODES.continuationUnavailable,
-      });
-    }
-    if (parent !== undefined && (!samePath(parent.executionPath, identity.executionPath)
-      || parent.effective?.worker?.isolation !== identity.isolation)) {
-      throw this.continuationRefusal('the recorded conversation identity does not match the named task', {
-        continueFromTaskId: parentTaskId,
-        session: SESSION_CODES.continuationUnavailable,
-      });
-    }
-    task.continuationParent = parent ?? null;
-    task.continuationRecord = identity;
   }
 
   /**
@@ -1500,20 +1724,29 @@ export class JobEngine {
   }
 
   /**
-   * Decide whether a named task thread may be joined, from the facts of one parent.
+   * Decide whether a named task thread may be joined, from the live facts of one parent.
    *
-   * Shared by the admission check (a parent this process admitted) and the
-   * continuation path (a parent recovered from the persisted identity map), so a
-   * refusal means the same thing whether the parent ran a second ago or before the
-   * plugin restarted.
+   * This is the engine's own answer for a parent still in memory, used by placement
+   * (`deps.assertAdmissible`) as a synchronous re-check of a chain admission has already
+   * proven; a parent this process does not hold is not its business and answers
+   * `undefined`, because {@link assertContinuation} already judged such a parent from its
+   * durable snapshot. It is purely synchronous and never reads history or the identity
+   * map back.
    *
-   * The refusal codes are the placement module's own (`SESSION_*`), carried in
-   * `details.session`, so a caller sees one vocabulary for "this continuation cannot
-   * be honoured" no matter which layer noticed.
+   * The ownership, terminal-state, conversation and path rules are the same ones
+   * {@link admitContinuation} applies to a snapshot, expressed for a live record: a
+   * caller with no verified connection identity and a parent record that states no owner
+   * are both unprovable, a parent that has not ended, or ended without a conversation,
+   * is refused with the `SESSION_*` code that says why, and a parent that ran in another
+   * directory (or records a masked one) cannot be joined merely because its Workspace id
+   * looks familiar.
    * @param {string} parentTaskId - the task id the caller named.
    * @param {object} facts - `sourcePath` (this submission's source workspace),
-   *   `connectionId` (this submission's verified connection, or null), optional
-   *   `selfTaskId` (the submitting task, for the self-continuation guard).
+   *   `executionPath` (the directory this submission runs in — the parent's tree when it
+   *   continues an isolated chain), optional `connectionId` (this submission's verified
+   *   connection, or null), and optional `selfTaskId` (the submitting task, for the
+   *   self-continuation guard). A missing or masked path on either side is never a
+   *   wildcard.
    * @returns {object | undefined} the live parent record when this process has one.
    * @throws {JobError} when the chain cannot be joined.
    */
@@ -1526,20 +1759,22 @@ export class JobEngine {
         session: SESSION_CODES.continuationState,
       });
     }
-    if (parent.connectionId !== null && facts.connectionId !== null && facts.connectionId !== undefined
-      && parent.connectionId !== facts.connectionId) {
-      // Reported as absent rather than forbidden, the same way a cross-connection
-      // task read is: a distinct code would confirm that the id exists.
-      throw new JobError(JOB_CODES.taskNotFound, 'no such task for this connection', { continueFromTaskId: parentTaskId });
-    }
+    // An id is proven by comparing two ids, so a caller that states nothing and a
+    // parent record that states no owner are both unprovable: the empty side is
+    // never a wildcard. Reported as absent rather than forbidden, the same way a
+    // cross-connection task read is — a distinct code would confirm the id exists.
+    const owner = typeof parent.connectionId === 'string' && parent.connectionId !== '' ? parent.connectionId : null;
+    const caller = typeof facts.connectionId === 'string' && facts.connectionId !== '' ? facts.connectionId : null;
+    if (owner === null || caller === null || owner !== caller) throw this.absentContinuation(parentTaskId);
     if (!TERMINAL.has(parent.state)) {
       throw this.continuationRefusal('the named task is still running, so its conversation cannot be continued yet', {
         continueFromTaskId: parentTaskId,
-        state: parent.state,
+        state: typeof parent.state === 'string' ? parent.state : 'no recorded end state',
         session: SESSION_CODES.continuationState,
       });
     }
-    if (parent.state !== TASK_STATES.awaitingHostReview && parent.execution?.conversation == null) {
+    const conversation = parent.execution?.conversation ?? null;
+    if (conversation === null || typeof conversation !== 'object') {
       // A run that ended without ever driving a session (an admission refusal, a
       // policy failure) has no thread; continuing it would silently start a new one.
       throw this.continuationRefusal('the named task ended without driving a conversation, so there is nothing to continue', {
@@ -1548,25 +1783,41 @@ export class JobEngine {
         session: SESSION_CODES.continuationState,
       });
     }
-    if (parent.sourcePath !== null && facts.sourcePath !== undefined && facts.sourcePath !== null
-      && !samePath(parent.sourcePath, facts.sourcePath)) {
+    if (typeof parent.sourcePath !== 'string' || parent.sourcePath === ''
+      || typeof facts.sourcePath !== 'string' || facts.sourcePath === ''
+      || !samePath(parent.sourcePath, facts.sourcePath)) {
       throw this.continuationRefusal('the named task belongs to another source repository, so its conversation was not continued', {
         continueFromTaskId: parentTaskId,
         reason: 'different source repository',
         session: SESSION_CODES.continuationWorkspaceMismatch,
       });
     }
+    // The execution directory is the other half of a chain's identity: the parent's
+    // conversation lives in the Workspace of the directory it ran in, and a live parent
+    // keeps its exact directory even when it drove a managed worktree. Equal Workspace
+    // ids are not enough — the same id two coordinates apart is a workspace the
+    // follow-up did not inherit — and a masked directory cannot prove which one it names.
+    const recordedExecution = parent.executionPath;
+    const execution = facts.executionPath;
+    if (recordedExecution !== undefined && recordedExecution !== null) {
+      if (typeof recordedExecution !== 'string' || recordedExecution.trim() === ''
+        || typeof execution !== 'string' || execution.trim() === ''
+        || recordedPathIsMasked(recordedExecution) || recordedPathIsMasked(execution)) {
+        throw this.continuationRefusal('the named task has no reliably recorded execution path, so its conversation cannot be continued', {
+          continueFromTaskId: parentTaskId,
+          reason: 'unusable recorded execution path',
+          session: SESSION_CODES.continuationUnavailable,
+        });
+      }
+      if (!samePath(recordedExecution, execution)) {
+        throw this.continuationRefusal('the named task ran in another execution directory, so its conversation was not continued', {
+          continueFromTaskId: parentTaskId,
+          reason: 'different execution directory',
+          session: SESSION_CODES.continuationPathMismatch,
+        });
+      }
+    }
     return parent;
-  }
-
-  /**
-   * Shape a continuation refusal as the job error that carries its `SESSION_*` cause.
-   * @param {string} message - operator-readable explanation.
-   * @param {object} [details] - bounded context; never a credential or a transcript.
-   * @returns {JobError} refusal to throw.
-   */
-  continuationRefusal(message, details = {}) {
-    return new JobError(JOB_CODES.continuationRefused, message, redactDeep(details));
   }
 
   /**
@@ -1616,13 +1867,331 @@ export class JobEngine {
   }
 
   /**
+   * Whether a delegated run may be offered a per-call permission bridge.
+   *
+   * The question is capability, not configuration, and it is answered by the
+   * deployment: a bridge is offered only when the entry point says it can surface
+   * pending requests and accept a decision from a commander (`deps.permissionBridge`
+   * is a function returning a bridge). A deployment without that seam keeps the
+   * original fail-closed behaviour for every run, and nothing in this module
+   * invents a second way to grant anything.
+   * @returns {boolean} true when a bridge may be created for a run.
+   */
+  permissionBridgeAvailable() {
+    return typeof this.deps?.permissionBridge === 'function' && this.aborted !== true;
+  }
+
+  /**
+   * Create the permission bridge for one task, or `null`.
+   *
+   * The bridge belongs to the task and to the run inside it. Its observers are
+   * wired here rather than in the runtime so the task record — not the runner —
+   * owns the phase, the execution-time accounting and the evidence trail: those
+   * are task lifecycle facts, and the runner has no authority over the budget.
+   *
+   * The factory is called with the exact facts the commander is later asked to
+   * recognise: the task and the connection that owns it.
+   * @param {object} task - the running task.
+   * @returns {object | null} a bridge to arm, or null when unavailable.
+   */
+  createPermissionBridge(task) {
+    if (!this.permissionBridgeAvailable()) return null;
+    let bridge;
+    try {
+      bridge = this.deps.permissionBridge({
+        taskId: task.taskId,
+        connectionId: task.connectionId,
+        onPending: (view) => this.onPermissionPending(task, view),
+        onSettled: (entry) => this.onPermissionSettled(task, entry),
+      });
+    } catch (error) {
+      // A factory that cannot produce a bridge is the same operator situation as a
+      // deployment without the seam: the run keeps `never` and is not failed for
+      // it. The refusal is logged rather than surfaced as a task error, because
+      // "approvals are not bridged here" is a property of the deployment.
+      this.deps?.logger?.warn?.('dsh-delegate: the per-call permission bridge could not be created', String(error?.code ?? ''));
+      return null;
+    }
+    if (bridge === null || bridge === undefined || typeof bridge !== 'object' || typeof bridge.arm !== 'function') {
+      return null;
+    }
+    return bridge;
+  }
+
+  /**
+   * Record one request the worker is now waiting on.
+   *
+   * The task state stays `running` and only its PHASE changes, so nothing that
+   * reads the state contract has to learn a new lifecycle value: a task waiting for
+   * a decision is neither failed nor execution-complete, and its workspace lock,
+   * concurrency slot and provider lease remain its own.
+   *
+   * The wait is NOT charged to the execution budget. The runner's own timer does
+   * not observe it (the native tool call is paused, not the run), and the request
+   * carries a separate bounded deadline of its own, so a paused call can never
+   * turn into a timeout of the work.
+   * @param {object} task - the running task.
+   * @param {object} view - the bridge's redacted request view.
+   * @returns {void}
+   */
+  onPermissionPending(task, view) {
+    if (TERMINAL.has(task.state)) return;
+    task.permission.pending = view;
+    task.permission.pausedAt = Date.now();
+    if (task.state === TASK_STATES.running) task.phase = PHASE_AWAITING_PERMISSION;
+    // Durable checkpoint: a crash while the worker is PAUSED is exactly the case the
+    // in-memory record cannot describe after a restart, so the pending request is
+    // written now rather than only at terminal time.
+    this.checkpointHistory(task);
+  }
+
+  /**
+   * Record one settled request and account for the time spent waiting.
+   * @param {object} task - the task the request belonged to.
+   * @param {object} entry - the bridge's redacted settled view.
+   * @returns {void}
+   */
+  onPermissionSettled(task, entry) {
+    if (task.permission.pending !== null && entry?.requestId === task.permission.pending.requestId) {
+      task.permission.pending = null;
+    }
+    if (task.permission.pausedAt !== null) {
+      task.permission.pausedExecutionMs += Math.max(0, Date.now() - task.permission.pausedAt);
+      task.permission.pausedAt = null;
+    }
+    if (entry !== null && entry !== undefined) {
+      task.permission.evidence.push(entry);
+      if (task.permission.evidence.length > 8) task.permission.evidence.shift();
+    }
+    // Back to the execution phase, never to a new state: a settled request that was
+    // allowed and one that was rejected both leave the task `running` until the run
+    // itself reaches an outcome.
+    if (task.state === TASK_STATES.running && task.phase === PHASE_AWAITING_PERMISSION) {
+      task.phase = PHASE_EXECUTE;
+    }
+    this.checkpointHistory(task);
+  }
+
+  /**
+   * Write a bounded, fire-and-forget history checkpoint for a LIVE task.
+   *
+   * Three deliberate properties:
+   *
+   *  * it is **serialized by the store**, so a pending checkpoint cannot interleave
+   *    with the terminal write — the documents are whole-file atomic writes and one
+   *    save runs at a time;
+   *  * it **cannot resurrect a terminal task**: `HistoryStore` refuses to overwrite a
+   *    terminal record with a live one, and this method re-checks the task's own state
+   *    before the write lands, so a slow checkpoint that finishes after the run ended
+   *    is dropped instead of rolling the record back to `running`;
+   *  * it is **bounded and silent**. It shares `HISTORY_WRITE_TIMEOUT_MS`, records a
+   *    failure as `historyError` and never rejects upward: a checkpoint is evidence,
+   *    not a step the run depends on.
+   * @param {object} task - live task record.
+   * @returns {void}
+   */
+  checkpointHistory(task) {
+    const history = this.history;
+    if (history === null || history === undefined || typeof history.save !== 'function') return;
+    if (TERMINAL.has(task.state)) return;
+    let view;
+    try {
+      view = this.view(task);
+    } catch {
+      return;
+    }
+    // A save that is already queued for a NEWER snapshot wins; an older one is
+    // discarded rather than allowed to publish a stale phase.
+    this.historyCheckpointSeq = (this.historyCheckpointSeq ?? 0) + 1;
+    task.historyCheckpointSeq = this.historyCheckpointSeq;
+    const seq = this.historyCheckpointSeq;
+    let timer = null;
+    const bounded = new Promise((resolvePromise, rejectPromise) => {
+      timer = setTimeout(() => {
+        rejectPromise(new JobError(JOB_CODES.historyFailed, 'the history checkpoint exceeded its time budget', {
+          code: 'HISTORY_WRITE_TIMEOUT',
+          timeoutMs: HISTORY_WRITE_TIMEOUT_MS,
+        }));
+      }, HISTORY_WRITE_TIMEOUT_MS);
+      timer.unref?.();
+      Promise.resolve(history.save(view)).then(resolvePromise, rejectPromise);
+    });
+    void bounded
+      .then(() => {
+        // A LATER snapshot OF THIS SAME TASK has superseded this one. The counter is
+        // global, so `this.historyCheckpointSeq` would let a concurrent task's
+        // checkpoint discard this task's own successful write (and leave the
+        // bookkeeping fields stale); the comparison is per task, against the
+        // sequence this task last claimed.
+        if (task.historyCheckpointSeq !== seq) return;
+        // The run ended while this write was in flight: the terminal record is the
+        // truth, and a live snapshot must never overwrite it.
+        if (TERMINAL.has(task.state)) return;
+        task.historyError = null;
+        task.historySavedAt = Date.now();
+      })
+      .catch((error) => {
+        task.historyError = {
+          code: typeof error?.code === 'string' ? error.code : JOB_CODES.historyFailed,
+          message: diagnostic(error?.message ?? error, 300),
+        };
+      })
+      .finally(() => {
+        if (timer !== null) clearTimeout(timer);
+      });
+  }
+
+  /**
+   * Decide one pending permission request for one task.
+   *
+   * This is the commander's only way to answer, and it is shaped like every other
+   * refusal in this class: the identity comes from the authenticated caller, the
+   * task owner is checked before anything is read, and an id this deployment cannot
+   * prove belongs to the caller is answered as absent so the reply cannot be used
+   * to discover other tasks.
+   *
+   * The chain of checks, all refusals:
+   *
+   *  1. the task exists and belongs to the deciding connection (a foreign task is
+   *     `JOB_TASK_NOT_FOUND`, identical to an unknown one);
+   *  2. delegation is still authorized and this task's own authorization is still
+   *     valid (a switch turned off or a revoked grant stops the decision);
+   *  3. the task is live and has a bridge with an outstanding request;
+   *  4. the bridge decides the request — still pending, not past its deadline, and
+   *     the fingerprint (when supplied) matching the bound operation exactly;
+   *  5. only then does the outcome travel to the paused native tool call.
+   *
+   * The decision is NOT acceptance and NOT a standing grant: the task keeps
+   * running afterwards, `selfApproved` stays false, and the Session's sandbox mode
+   * is untouched.
+   * @param {object} request - `taskId`, `requestId`, `decision`, optional `reason`,
+   *   optional `fingerprint`, and the authenticated `connectionId` (supplied by the
+   *   plane, never by the caller's body).
+   * @returns {object} bounded result: `{ task, permission, hostAcceptance: null }`.
+   * @throws {JobError} on any refusal.
+   */
+  decidePermission(request) {
+    const connectionId = typeof request?.connectionId === 'string' ? request.connectionId : null;
+    if (connectionId === null) {
+      // No verified identity means no ownership proof, which is the same answer an
+      // unknown task gets — never a discovery oracle.
+      throw new JobError(JOB_CODES.taskNotFound, 'no such task for this connection', {});
+    }
+    const taskId = typeof request?.taskId === 'string' ? request.taskId.trim() : '';
+    if (taskId === '') {
+      throw new JobError(PERMISSION_CODES.invalid, 'taskId is required', { field: 'taskId' });
+    }
+    const task = this.tasks.get(taskId);
+    if (task === undefined || task.connectionId !== connectionId) {
+      throw new JobError(JOB_CODES.taskNotFound, 'no such task for this connection', { taskId });
+    }
+    if (TERMINAL.has(task.state)) {
+      throw new JobError(PERMISSION_CODES.notPending, 'this task has already ended; its pending request is history only', {
+        taskId,
+        state: task.state,
+      });
+    }
+    // The authorization is re-checked at the decision, not only at submission: an
+    // operator who closed the switch or revoked the authorization between the ask
+    // and the decision must not have a live decision applied afterwards.
+    if (this.posture().authorized !== true) {
+      throw new JobError(JOB_CODES.notAuthorized, 'delegation is no longer authorized, so no decision may be applied', {});
+    }
+    this.assertLive(task, 'permission-decide');
+    const bridge = task.permission.bridge;
+    if (bridge === null || bridge === undefined || typeof bridge.decide !== 'function') {
+      throw new JobError(PERMISSION_CODES.notFound, 'this task has no pending permission request', { taskId });
+    }
+    let settled;
+    try {
+      settled = bridge.decide({
+        requestId: request?.requestId,
+        decision: request?.decision,
+        reason: request?.reason,
+        ...(request?.fingerprint === undefined ? {} : { fingerprint: request.fingerprint }),
+      });
+    } catch (error) {
+      if (error instanceof PermissionError) {
+        throw new JobError(error.code, error.message, error.details);
+      }
+      throw error;
+    }
+    return { task: this.view(task), permission: settled, hostAcceptance: null };
+  }
+
+  /**
+   * Stop every outstanding request of one task and disarm its bridge.
+   *
+   * Called from every path that ends a run — a terminal state, cancellation,
+   * switch-off, revocation, disposal — so a paused native tool call is released
+   * instead of outliving the reason it was paused. The bridge is disposed LAST, so
+   * the outstanding request is first settled with the right cause (`cancelled` for
+   * a stop, `unavailable` for a disposal) and only then does the answerer go away.
+   * @param {object} task - task record.
+   * @param {string} [cause] - `stop` (default) or `dispose`.
+   * @returns {void}
+   */
+  releasePermissionBridge(task, cause = 'stop') {
+    const bridge = task.permission?.bridge ?? null;
+    if (bridge === null || bridge === undefined) return;
+    try {
+      if (cause === 'dispose') bridge.dispose?.();
+      else bridge.stop?.();
+    } catch (error) {
+      this.deps?.logger?.warn?.('dsh-delegate: the permission bridge could not be stopped', String(error?.code ?? ''));
+    }
+    if (task.permission.pending !== null) task.permission.pending = null;
+    task.permission.pausedAt = null;
+    if (cause === 'dispose') task.permission.bridge = null;
+  }
+
+  /**
+   * The bounded, public permission block of one task.
+   *
+   * `pending` is the request the commander has to decide (or `null`), `evidence` is
+   * the settled trail, and `bridged`/`waiting` are stated so a client never has to
+   * infer them from a phase string. `pausedExecutionMs` is reported because it is
+   * the time that was NOT charged to the execution budget — an operator reading a
+   * long run should be able to see how much of it was spent waiting for a decision.
+   * @param {object} task - task record.
+   * @returns {object} redacted permission view.
+   */
+  permissionView(task) {
+    const pending = task.permission?.pending ?? null;
+    return {
+      bridged: task.permission?.bridge !== null && task.permission?.bridge !== undefined,
+      waiting: pending !== null,
+      pending,
+      evidence: Array.isArray(task.permission?.evidence) ? task.permission.evidence : [],
+      pausedExecutionMs: task.permission?.pausedExecutionMs ?? 0,
+      // Stated on every view, because it is the property the whole feature turns
+      // on: a decision applies to one call and never to the standing policy.
+      standingSandboxMode: DELEGATE_SANDBOX_MODE,
+      grantScope: 'single-call',
+    };
+  }
+
+  /**
    * Request cancellation of one live task and record why.
+   *
+   * The task's outstanding permission request is withdrawn FIRST (if it has one),
+   * so the paused native tool call observes a cancelled question instead of a
+   * controller abort it would learn about only after the tool returned. The
+   * workspace lock, the concurrency slot and the provider lease are untouched here:
+   * they are released by {@link finalize}, and only once the executor confirms it
+   * stopped — a wait that was interrupted by a cancel is still a live executor.
    * @param {object} task - task record.
    * @param {string} reason - recorded provenance.
    * @returns {void}
    */
   abortTask(task, reason) {
     if (TERMINAL.has(task.state)) return;
+    // The CAUSE decides how the outstanding request is settled, and only the
+    // dispose path reports the channel as unusable: a plugin teardown must not be
+    // dressed up as "the operator withdrew the question". A later explicit
+    // `releasePermissionBridge(task, 'dispose')` is idempotent, so disposing here
+    // does not double-settle.
+    this.releasePermissionBridge(task, reason === 'dispose' ? 'dispose' : 'stop');
     task.cancelRequested = true;
     task.cancelledBy = task.cancelledBy ?? reason;
     try {
@@ -1676,6 +2245,9 @@ export class JobEngine {
    */
   async failAdmission(task, error) {
     this.clearPreflightDeadline(task);
+    // Admission never created an executor, so any bridge it did create (it is
+    // created just before the runner call, so normally none) is disposed here too.
+    this.releasePermissionBridge(task, 'dispose');
     task.endedAt = task.endedAt ?? Date.now();
     // A preflight that ran out of budget is a timeout, not a cancellation: it is
     // the same budget the run itself would have failed on, and reporting it as
@@ -1826,6 +2398,14 @@ export class JobEngine {
       // was ever created" from "an executor may still be writing to the
       // workspace". Nothing below may release a lease or the slot before the
       // matching `settled` is true.
+      //
+      // The permission bridge is created BEFORE the executor exists (it is bound
+      // in the run's setup, so the runtime also sees it) and is the answerer the
+      // policy stance is installed for. A bridge is offered only when this
+      // deployment can surface its requests to a commander at all; when it cannot,
+      // the run keeps the fail-closed `never` stance and nothing about it changes.
+      const bridge = this.createPermissionBridge(task);
+      task.permission.bridge = bridge;
       task.native.started = true;
       const pending = runAgent(this.deps, {
         prompt,
@@ -1842,11 +2422,26 @@ export class JobEngine {
         taskId: task.taskId,
         connectionId: task.connectionId,
         sourcePath: task.sourcePath,
+        // Worker sessions are writable only inside their current DSH workspace.
+        // Wider sandbox requests are refused when no bridge is armed, and decided
+        // per call by the commander when one is. The services that own both facts
+        // are read live through `deps.policyServices`, so the runner verifies the
+        // resolved policy before it prompts.
+        delegated: true,
+        // The per-call approval answerer for THIS task's own Agent: armed in the
+        // run's setup, scanned by the engine before it is offered here, and
+        // disposed when the run ends. `null` keeps the deterministic `never` stance.
+        ...(bridge === null ? {} : { permissionBridge: bridge }),
+        configureDelegatedSession: this.deps.configureDelegatedSession,
+        policyServices: this.deps.policyServices,
         // The engine is the authority for "may this chain be joined": a parent it
         // still holds is judged live here, and a parent recovered from the persisted
         // map is judged by the same rule through this hook.
         assertAdmissible: (parentTaskId) => this.assertAdmissible(parentTaskId, {
           sourcePath: task.sourcePath,
+          // The directory this run actually executes in: the parent's own managed tree
+          // when this task continues an isolated chain, the source checkout otherwise.
+          executionPath: task.executionPath,
           connectionId: task.connectionId,
           selfTaskId: task.taskId,
         }),
@@ -1875,6 +2470,10 @@ export class JobEngine {
         // be answerable from the task record.
         selection: run.selection ?? null,
         maxTokens: run.maxTokens ?? null,
+        // The approval stance this run installed and read back, plus whether an
+        // armed bridge was the answerer behind it. Recorded per run so "did this
+        // task ask, or did it reject without asking" is answerable from the record.
+        approval: run.approval ?? null,
         // Where the conversation landed. Reported per run so an operator can tell a
         // fresh session from a continued one, and which Workspace group it is in.
         conversation: run.conversation ?? null,
@@ -2022,6 +2621,10 @@ export class JobEngine {
   async finishTask(task) {
     task.hostAcceptance = null;
     this.clearPreflightDeadline(task);
+    // The run is over, so its answerer must go: an outstanding request is released
+    // (the worker's paused tool call resumes `unavailable`) and the bridge can never
+    // answer a request that outlived the run it belonged to.
+    this.releasePermissionBridge(task, 'dispose');
     await this.finalize(task);
     await this.persistHistory(task);
     task.settle();
@@ -2370,6 +2973,14 @@ export class JobEngine {
       review: task.review,
       error: task.error,
       cancelledBy: task.cancelledBy,
+      // The per-call permission surface of this run: whether it was bridged, the
+      // request the commander may still decide (redacted), the settled trail, and
+      // the standing mode the decision did NOT change. Present on every task, so a
+      // reader never has to infer "no bridge" from a missing field.
+      permission: this.permissionView(task),
+      // The approval stance the run installed and read back (`never` without a
+      // bridge, `ask` with an armed one), recorded from the run itself.
+      approval: task.execution?.approval ?? null,
       hostAcceptance: task.hostAcceptance,
       // Stated explicitly so no consumer can read `awaiting-host-review` as
       // "done and approved".
@@ -2405,8 +3016,16 @@ export class JobEngine {
     this.stopListening();
     let count = 0;
     for (const task of this.tasks.values()) {
-      if (TERMINAL.has(task.state)) continue;
+      if (TERMINAL.has(task.state)) {
+        // A terminal task may still hold a bridge if its own teardown has not run
+        // yet; disposing is idempotent and cannot answer anything after this point.
+        this.releasePermissionBridge(task, 'dispose');
+        continue;
+      }
       this.abortTask(task, 'dispose');
+      // Teardown is not a cancel: the answerer goes away, so the worker's paused
+      // call must be told the channel is gone rather than that it was withdrawn.
+      this.releasePermissionBridge(task, 'dispose');
       count += 1;
     }
     await Promise.race([
@@ -2466,6 +3085,31 @@ function samePath(a, b) {
     return process.platform === 'win32' ? trimmed.toLowerCase() : trimmed;
   };
   return normalize(a) === normalize(b);
+}
+
+/**
+ * The placeholder a redacted path segment is rewritten to.
+ */
+const PATH_MASK_SEGMENT = 'masks-user-profile-segment';
+
+/**
+ * Whether a persisted path cannot prove which directory it names.
+ *
+ * Durable documents are projected through redaction, which replaces an
+ * account-identifying directory name with the placeholder above. A path carrying that
+ * placeholder is a shortened spelling: nothing can prove which directory stood there,
+ * so it is never compared into a match and is treated exactly like a missing path — the
+ * mask only ever causes a refusal, it never stands for equality. A real directory whose
+ * name merely *starts with* the placeholder is still its own directory, which is why the
+ * test is for the whole segment.
+ * @param {unknown} value - candidate path.
+ * @returns {boolean} true when the path was rewritten and can only be refused.
+ */
+function recordedPathIsMasked(value) {
+  if (typeof value !== 'string') return false;
+  return value
+    .split(/[\\/]+/)
+    .some((part) => part.trim() === PATH_MASK_SEGMENT);
 }
 
 /**

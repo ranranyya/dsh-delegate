@@ -6,9 +6,9 @@ DeepSeek Harness（DSH）的委托插件：让 MCP 宿主在你开启本机总�
 新安装时本机调用总开关默认关闭。开关状态会保存在插件设置中，重启后恢复保存值；
 关闭时拒绝新的委派任务，并请求停止正在运行的任务。
 
-> **发布状态：尚未发布。** 目前没有 GitHub 仓库、没有 npm 发布版本、没有官方渠道的
-> `.tgz` 下载地址。本文件描述的是本仓库当前源码的行为；`npm pack` 生成的包只能自建
-> 并使用，或在本地/临时 profile 中验证。
+> **发布状态：`1.0.0` 正式版。** 源码仓库和可下载的 Release 位于
+> [GitHub](https://github.com/ranranyya/dsh-delegate)。npm 尚未作为安装渠道发布；
+> GitHub Release 附带的 `.tgz` 是推荐的安装包。
 
 ---
 
@@ -16,7 +16,7 @@ DeepSeek Harness（DSH）的委托插件：让 MCP 宿主在你开启本机总�
 
 | 项 | 要求 | 说明 |
 | --- | --- | --- |
-| DSH | `0.2.0-rc.2` / `0.2.1-rc.2` / `0.2.1-rc.3` | `peerDependencies` 精确声明这三个版本的范围（`0.2.0-rc.2 \|\| 0.2.1-rc.2 \|\| 0.2.1-rc.3`）；DSH 启动时会用 `semver` 加 `includePrerelease` 校验 `@deepseek-ai/dsh-*` 的 peer 范围，不匹配的插件行会被拒绝加载（`skippedBundles` / denied row）。`0.2.0-rc.2` 是开发与自动测试所用版本；`0.2.1-rc.2` 在**隔离 profile** 中完成验收（未写入正式 profile）；`0.2.1-rc.3` 为宿主当前版本（声明兼容，运行时验证进行中）。其他 DSH 版本**未经验证**，请不要假定可用。 |
+| DSH | `0.2.0-rc.2` / `0.2.1-rc.2` / `0.2.1-rc.3` / `0.2.2-rc.1` | `peerDependencies` 精确声明这四个版本的范围（`0.2.0-rc.2 \|\| 0.2.1-rc.2 \|\| 0.2.1-rc.3 \|\| 0.2.2-rc.1`）；DSH 启动时会用 `semver` 加 `includePrerelease` 校验 `@deepseek-ai/dsh-*` 的 peer 范围，不匹配的插件行会被拒绝加载（`skippedBundles` / denied row）。`0.2.0-rc.2` 是开发与自动测试所用版本；`0.2.1-rc.2` 在**隔离 profile** 中完成验收（未写入正式 profile）；`0.2.1-rc.3` 为上一宿主版本（本次没有在它上面重新做原生全量验证）；`0.2.2-rc.1` 是本次新增支持的 DSH Desktop 原生运行时（原生源码已审计；原生 base+web+delegate 全量 profile 加载、stdio MCP、runner 模型路由回读、沙箱策略回读均已在隔离夹具中通过；但**没有真实模型调用、没有实际沙箱命令、没有生产 Desktop 安装**）。之前声明过的版本一个都没有移除。其他 DSH 版本**未经验证**，请不要假定可用。逐版本状态见 [`docs/runtime-compatibility.md`](./docs/runtime-compatibility.md)。 |
 | Node.js | `>= 24` | 与 DSH `0.2.0-rc.2` / `0.2.1-rc.2` 运行时一致；使用了原生 ESM、`AbortSignal.timeout`、`node --test`。 |
 | 操作系统 | Windows / Linux / macOS | 自动测试在 Windows + Node 24 上运行；需要 git 的工作树隔离在缺少 git 时会被显式拒绝，而不是静默降级。 |
 
@@ -39,7 +39,7 @@ Desktop 侧的包操作只能交给应用完成——不要在 Desktop 的正式
 
    ```bash
    npm pack
-   #    → dsh-delegate-0.1.10.tgz
+   #    → dsh-delegate-1.0.0.tgz
    ```
 
 2. 打开 Desktop 的 **Plugins manager**，用它的 add-plugin（添加插件）入口选择上一步生成的
@@ -54,7 +54,7 @@ Desktop 侧的包操作只能交给应用完成——不要在 Desktop 的正式
 
 ```bash
 # 装进一个 profile（例：web）
-dsh plugin --profile web add ./dsh-delegate-0.1.10.tgz && dsh plugin --profile web why dsh-delegate
+dsh plugin --profile web add ./dsh-delegate-1.0.0.tgz && dsh plugin --profile web why dsh-delegate
 
 # 启动（首次启动会自动把插件 bundle 追加到 dsh.profile.bundles）
 dsh --profile web
@@ -67,7 +67,7 @@ dsh --profile web
 ### 说明与注意
 
 - **不要装进你正在用的正式 profile 做试验。** 建议先用一次性 profile：
-  `dsh plugin --profile dsh-delegate-try add ./dsh-delegate-0.1.10.tgz`，再把
+  `dsh plugin --profile dsh-delegate-try add ./dsh-delegate-1.0.0.tgz`，再把
   `DSH_HOME` 指向临时目录做隔离验证。该命令同样只用于 CLI profile。
 - 该包声明了 `@deepseek-ai/dsh-*` 的 peer，若你的包管理器默认自动安装 peer，
   安装过程会尝试解析这些版本。可显式关闭：`npm_config_auto_install_peers=false`
@@ -131,9 +131,13 @@ dsh --profile web
 
 ## 6. MCP（stdio）接入
 
-包内可执行文件 `bin/dsh-delegate-mcp.js`（bin 名 `dsh-delegate-mcp`）实现了五个工具：
-`delegate_status` / `delegate_preflight` / `delegate_submit` / `delegate_result` / `delegate_cancel`。
-它**不提供**授权、配置写入或凭据读写工具。
+包内可执行文件 `bin/dsh-delegate-mcp.js`（bin 名 `dsh-delegate-mcp`）实现了六个工具：
+`delegate_status` / `delegate_preflight` / `delegate_submit` / `delegate_result` / `delegate_cancel` /
+`delegate_permission_decide`。
+它**不提供**授权、配置写入或凭据读写工具。`delegate_permission_decide` 是唯一一条窄例外：
+它只能回答一个**已经挂起**的「单次调用授权请求」，给 `allow-once`（仅这一次调用可继续）或
+`reject`。它不能创建或扩大任何**长期有效**的授权，不能修改设置、凭据、本机开关、提供方/模型或隔离方式，
+也不能预先批准后续调用。
 
 在需要调用委派工具的 MCP 宿主中添加 stdio server（以下为通用配置示意；Codex 用见 6.1，
 插件会替你写这条并给出正确路径）：
@@ -154,9 +158,11 @@ dsh --profile web
   每次工具调用前都会重新读取，因此 DSH 重启并更换端口后无需改 Codex 配置。
 - 默认发现路径使用 `DSH_HOME`，未设置时为 `~/.dsh`。若 DSH 和 MCP 宿主使用不同的 DSH_HOME，
   可通过 `DSH_DELEGATE_DISCOVERY_FILE` 指向该发现文件。`DSH_DELEGATE_BASE_URL` 仅作为手动固定地址覆盖。
-- 工具为 `delegate_status`、`delegate_preflight`、`delegate_submit`、`delegate_result` 和 `delegate_cancel`。
-- 开关关闭时，`delegate_submit` 返回 `DELEGATION_DISABLED`；状态、预检、结果和取消工具仍可使用。
-  `delegate_preflight` 只读取工作区事实，不创建任何东西，因此不受开关和并发上限限制。
+- 工具为 `delegate_status`、`delegate_preflight`、`delegate_submit`、`delegate_result`、
+  `delegate_cancel` 和 `delegate_permission_decide`。
+- 开关关闭时，`delegate_submit` 与 `delegate_permission_decide` 返回 `DELEGATION_DISABLED`；状态、
+  预检、结果和取消工具仍可使用。`delegate_preflight` 只读取工作区事实，不创建任何东西，因此不受
+  开关和并发上限限制。
 
 **任务会话与跟进（`continueFromTaskId`）**：`delegate_submit` 有一个可选字段
 `continueFromTaskId`。
@@ -166,9 +172,25 @@ dsh --profile web
 - **填写**：声明本次提交是某个先前任务的跟进，必须续接**那一条**任务会话（同 Workspace、同
   Session）。只用于属于同一任务的修改、纠正或重试；无关任务一律省略，不要"为了保留上下文"
   随手复用 id。
-- 续接是**失败即拒绝**：未知/已被清理的父任务、仍在运行的父任务、没有产生对话的失败任务、
+- **续接必须由同一已验证 `connectionId` 发起。** 连接身份取自本次请求认证后的连接记录，不是
+  请求体里自称的值；父任务一侧的身份也必须是被证明过的。不同连接**禁止接管**别人的任务：
+  按 task id 续接别的连接的任务会被当作不存在（`JOB_TASK_NOT_FOUND`，与"没有这个任务"不可区分，
+  因此不能用来探测别的连接有哪些 task id），**不存在** permission handoff，也**不**按连接
+  label 或任何其他可见名字做匹配。
+- **同一进程用 live 记录，重启后用持久记录互证。** 父任务仍在内存里时，归属由那条 live 记录
+  自己的 `connectionId` 直接比对；进程重启后内存已空，持久化的"任务→会话"映射只说明会话在
+  哪里，从不说它属于谁、也不说那次运行如何结束，因此必须再读一份持久 job history
+  （`HistoryStore`）作为第二权威：那条记录说出**同一个** owner、一个**可续接的终态**，以及
+  相同的源仓库与执行目录。缺一边就不能证明归属，一律拒绝。
+- **缺失、损坏、被淘汰或不能证明的，一律拒绝。** 未知的 task id、已超出保留上限被淘汰的
+  记录、读不出的历史、被截断（`truncation` 非空）而不能当作完整证据的记录、未记录的终态、
+  重启中断留下的 `interrupted`、仍在 `pending`/`running` 的父任务、没有产生过对话的失败任务、
   不同源仓库、不同执行目录、已删除或身份不符的工作树、已不存在的 Session，都会被拒绝
-  （`JOB_CONTINUATION_REFUSED`，具体原因在 `error.details.session`），**不会**悄悄改成新开会话。
+  （`JOB_CONTINUATION_REFUSED`，`error.details.session` 给出具体原因），**不会**悄悄改成新开会话。
+- **`local-mcp` 是一个明确固定的身份，不是通配符。** 本机开关这条路径下，连接身份固定为
+  `local-mcp` 并和其他连接一样**精确比对**；它既不等于"null"，也不代表"所有远程连接"。
+  没有经过验证的连接身份的请求不能证明自己拥有任何一个持久化父任务，因此被拒绝，而不会被
+  当成"任意归属"放行。
 - 工作区状态会被保留：共享模式的任务在原目录继续；隔离工作树的跟进任务仍使用父任务的原始
   `workspacePath` 做授权和预检，由插件内部恢复**同一棵**受管工作树继续上一次未提交的改动。
   不要把内部 `execution.workspacePath` 当成新的授权路径，也不要切换隔离模式；同一任务链由工作区锁串行化。
@@ -201,7 +223,8 @@ Codex 是唯一支持的宿主。**「Codex 集成」**分页提供一个明确�
    时为 `%USERPROFILE%\.codex\agents\dsh-delegate.toml`）；
 2. 在 `CODEX_HOME/config.toml` 里登记本包自带的 stdio MCP 服务
    `mcp_servers.dsh-delegate`，让子智能体可以使用 `delegate_status` /
-   `delegate_preflight` / `delegate_submit` / `delegate_result` / `delegate_cancel`。
+   `delegate_preflight` / `delegate_submit` / `delegate_result` / `delegate_cancel` /
+   `delegate_permission_decide`。
 
 需要说明的边界（分页里也有同样的提示）：
 
@@ -209,7 +232,9 @@ Codex 是唯一支持的宿主。**「Codex 集成」**分页提供一个明确�
   新建 agent、登记或迁移 `config.toml` 条目、移除托管项都只能通过「安装 / 更新 Codex 集成」
   「仅修复 MCP 配置」「移除插件托管项」三个按钮。唯一的例外是**插件启动时的一次受限迁移**：
   只有当 `agents/dsh-delegate.toml` 与某个**已发布版本的模板逐字节相同**（枚举的摘要表）时，
-  才会把它刷新为当前版本；它**不会**创建缺失的 agent、不会创建 `agents/` 目录、不会写
+  才会把它刷新为当前版本；比较的是**原始字节**，插件不会把 CRLF 归一化成 LF 再比，也不会改写
+  你文件的行尾。已发布版本若同时存在打包的 CRLF 与 LF 文本两种字节形态，摘要表会为两种形态各列
+  一条，两条都是精确的已发布身份。它**不会**创建缺失的 agent、不会创建 `agents/` 目录、不会写
   `config.toml`，正文被改过或来源不明的文件一律不动。「刷新状态」和分页打开时的读取都只是只读诊断。
 - **不覆盖、不删除你写的文件。** 同名但内容不同的 `agents/dsh-delegate.toml` 会被保留，
   界面报告为「不属于已知版本」；只有与**某个已发布版本逐字节相同**的托管文件才会被更新或删除，
@@ -280,6 +305,76 @@ node bin/dsh-delegate-codex-agent.js remove    # 只删除插件托管项
 - provider、地址和密钥由 DSH 自己管理；插件通过 DSH 原生 provider 调用现有配置。
 - 插件配置和任务结果不复制或返回 DSH 的密钥。导出配置只含非敏感选择与执行设置。
 
+## 7.1 Worker 会话权限（0.1.12 起适配 DSH 0.2.2）
+
+受委派的 worker 任务由插件在**投递提示词之前**装入 DSH 原生的会话权限，并通过 DSH 自己的
+服务读回：
+
+- 沙箱模式固定为 `workspace-write`。审批策略有两个值，且**只有一种情况**是 `ask`：
+  本次运行带着一个**已武装、且绑定到该 Agent** 的逐次授权桥。其余所有运行（没有桥、桥未武装、
+  桥已释放、桥绑在别的 Agent 上）都保持 `never`。`never` 是**确定性拒绝**，不是自动批准：
+  提权请求会被直接拒绝，不会停留在等待一个本插件无法回答的审批框。
+- 写入策略与审批策略各写一次 Session 事件（`sandbox/mode`、`approval/policy`），随后必须由
+  `ctx.sandboxPolicy.resolve({ session })` 与 `ctx.approval.effectivePolicy(session)` **读回**，
+  且读回的模式、审批立场、工作区根目录都要与写入值和该会话自身目录一致；任一项缺失、拒绝回答
+  或读回不符，任务在投递提示词前就以 `RUN_SANDBOX_POLICY_UNAVAILABLE` 失败；桥无法武装时以
+  `RUN_PERMISSION_BRIDGE_UNAVAILABLE` 失败。不会以“看起来受限”的状态运行。
+- 每轮（包括 `continueFromTaskId` 的跟进）都会重新应用一次，因此续接的会话收敛到当前契约，
+  不会沿用更早、可能是交互式的策略。
+- **附加审查与普通会话不受影响**：只读审查使用它自己的只读工具与工作区组合，不进入上面的
+  worker 沙箱流程，也不会拿到逐次授权桥；插件的审批应答器只注册在本次 worker 运行自己的
+  Agent 作用域上，对其他会话的请求一律放行给它原本的应答者。
+- 系统临时区（`tmpdir()`）是 DSH 原生平台层的例外，不是本插件授予的写权限。
+- **DSH 0.2.2 起**：判定模型路线走原生的 `agent.model.select()` / `agent.model.current()`
+  （持久化的 `model/selection` 事件），工作者的策略读回也在原生服务完成异步初始化之后按轮进行。
+  插件不按版本号分支，而是按**实际探测到的能力**分支：能力存在的运行时走现代路径，能力缺失的
+  运行时走旧路径；读回失败在任何路径上都是投递提示词之前的严格失败，不会以“未声明的路线”运行。
+  细节与逐版本对照见 [`docs/runtime-compatibility.md`](./docs/runtime-compatibility.md)。
+- 续接的会话身份规则见第 6 节（同一已验证 `connectionId`、重启后与持久 history 互证）。这条
+  能力在本轮候选构建里实现，验收由 Codex 另行出报告；本文件**不声称** DSH Desktop 真实安装
+  已通过，也不声称做过真实攻击复现。
+- 其余未完成项：DSH Desktop 正式版本上的真实安装验收尚未完成；`0.2.2-rc.1` 上的插件全量加载
+  与真实模型执行也尚未完成。不要把它们当作已验证。
+
+详见 `docs/worker-permissions.md`。
+
+## 7.2 逐次调用授权桥（1.0.0）
+
+> **状态：** 本项目内测试通过，但**生产验收尚未完成**。安装后必须在 Desktop 插件管理器中升级本插件，
+> 再重连 MCP 或开启新会话，才能看到 `delegate_permission_decide`；真实的 provider → 指挥官 → 恢复执行
+> 端到端验收仍需在目标 Desktop profile 中完成。任何单元测试数量或 mock 都不能替代那次验收。
+
+worker 请求把**某一次调用**的沙箱权限提升时，那次调用会暂停执行，请求出现在
+`delegate_result` 的 `permission.pending` 里：任务状态仍是 `running`，阶段为
+`awaiting-permission` —— 既不失败，也不算执行完成，工作区锁与并发槽位仍归该任务。本机指挥官
+通过 `delegate_permission_decide` 给出 `allow-once`（仅这一次调用可继续）或 `reject`。
+
+- **绑定**：任务、Session、工具名、一次性 `requestId`、原生 `callId`，以及对**真实参数**的
+  精确指纹。真实参数从 Session 日志的 `tool/call` 事件按 `callId` 读取，**不是** worker 自己
+  写的理由；那段理由会作为「工作进程的说法」单独标注，不参与决定。
+- **不是授权扩张**：它不能创建或扩大任何账号/工作区/会话授权，不能修改设置、凭据、本机开关、
+  提供方、模型、推理强度或隔离方式，也不能预先批准后续调用。`allow-once` 只对那一次调用有效，
+  下一次提权要重新请求；会话的常规沙箱模式始终是 `workspace-write`。
+- **不是自动放行、不是第二个模型审查、不依赖人工点击**：决定者是当前的本机指挥官。
+- **允许的代价**：`allow-once` 必须同时满足——报出该请求的精确 `fingerprint`；发布的参数是
+  **完整**的（`permission.pending.completeness` 为 `complete`，没有被任何上限截断）；决定时
+  重新读取 Session 日志中同一位置的 `tool/call` 且内容逐字节一致；该调用所在回合仍然打开。
+  任一项不满足就拒绝这次允许（`PERMISSION_EVIDENCE_INCOMPLETE` / `PERMISSION_REQUEST_CHANGED`）。
+  `reject` 不需要指纹也不需要完整证据，因为拒绝永远安全。
+- **诚实的边界**：该工具**不在** worker 原生声明的工具目录里，所以 worker 的模型不会被交给它
+  ——这是一条**工具面限制**。它**不代表**同一操作系统用户下的任意 shell 进程无法直接调用那个
+  共享的本地 MCP 端点。开关模式刻意只用一个共享的 `local-mcp` 身份、不签发用户令牌，因此本机
+  进程可以自称指挥官；本契约不依赖任何调用方自称的角色。
+- **等待不占用执行超时**：等待期间执行截止时间被**真正暂停**（计时器解除、已用时间结算），所以
+  一次比剩余预算更长的等待不会让任务超时；恢复后按剩余预算重新计时。请求自己另有固定上限
+  （默认 10 分钟，上限 30 分钟）。取消、关闭开关、撤销、Agent 释放、插件卸载和该上限都会结算等待
+  并把计时器/监听器复原；重启后不会把任何已存的决定重放成新的允许。
+- **诚实的限制**：开关模式刻意使用同一个 `local-mcp` 连接身份，所以本插件**不**声称能对抗同一
+  操作系统用户下的任意本地代码。决定只作用于调用者自己这个连接名下的任务（别人的任务按
+  「不存在」处理），但这不构成进程级安全边界。
+
+细节与原生 API 依据见 `docs/worker-permissions.md`。
+
 ## 8. 升级 / 导出 / 卸载 / 回滚
 
 ```bash
@@ -288,7 +383,7 @@ node bin/dsh-delegate-codex-agent.js remove    # 只删除插件托管项
 # 不要在 Desktop 的正式 profile 下执行下面的 CLI 命令。
 
 # CLI web profile 的升级：换成本地新包或（将来）新版本
-dsh plugin --profile web add ./dsh-delegate-0.1.10.tgz
+dsh plugin --profile web add ./dsh-delegate-1.0.0.tgz
 
 # 导出：界面里"导出非敏感配置"按钮，或用只读 API
 #   GET /api/dsh-delegate/settings
@@ -311,12 +406,28 @@ dsh plugin --profile web remove dsh-delegate
 
 ## 9. 限制（请如实理解）
 
-- **没有发布渠道**：无 GitHub 仓库、无 npm 版本、无签名产物、无自动更新。
-- **DSH 版本锁定**：只验证了 `0.2.0-rc.2` 与 `0.2.1-rc.2` 两个版本；其中 `0.2.1-rc.2`
-  的验收在**隔离 profile** 中完成。`0.2.1-rc.3` 是当前宿主版本，peer 范围已声明，
-  但**尚未完成运行时验证**。其他版本会被 peer 门禁拒绝，或行为未知。
+- **发布渠道**：当前通过 GitHub Release 分发；尚未发布到 npm，也没有签名产物或自动更新。
+- **DSH 版本锁定**：`peerDependencies` 与 `engines.dsh` 精确声明四个版本（`0.2.0-rc.2`、
+  `0.2.1-rc.2`、`0.2.1-rc.3`、`0.2.2-rc.1`），其余版本会被 peer 门禁拒绝。其中
+  `0.2.0-rc.2` 是开发与自动测试版本，`0.2.1-rc.2` 的验收在**隔离 profile** 中完成，
+  `0.2.1-rc.3` 为上一宿主版本（本次未在它上面重新做原生全量验证），`0.2.2-rc.1` 是本次新增支持的原生
+  运行时——原生源码已审计，原生 base+web+delegate 全量 profile 加载、stdio MCP、runner 模型路由
+  回读与沙箱策略回读均已在隔离夹具中通过，但**没有真实模型调用**、**没有实际沙箱命令**，
+  也**没有**在生产 Desktop profile 上做端到端安装运行。逐版本状态见
+  [`docs/runtime-compatibility.md`](./docs/runtime-compatibility.md)。
+- **更早的插件版本会被新宿主的门禁跳过**：`0.2.2-rc.1` 宿主不会加载未声明该版本的旧插件
+  （即上一版与更早的构建），而是报 `skippedBundles` / denied row。想在新宿主上使用本插件的
+  行为，需要升级插件，而不是放宽门禁。
 - **本机开关不是进程身份认证**：开关开启时，能连接本机 DSH 端口的同机进程可以提交任务。
   不要在不可信的本机环境中开启；它不能防御同账号的恶意进程。
+- **逐次授权桥同样不是进程级边界**：开关模式刻意只用一个 `local-mcp` 连接身份，所以
+  `delegate_permission_decide` 的调用者身份就是那个共享身份。决定只会作用于**调用者自己这个
+  连接名下的任务**（别人的任务按"不存在"处理，无法借此试探其他任务），但本插件**不声称**能
+  对抗同一操作系统用户下的任意本地代码。桥不引入新的令牌、签名或角色标签。
+- **逐次授权桥只决定一次调用**：`allow-once` 只对那一次原生工具调用有效，会话的常规沙箱模式
+  仍是 `workspace-write`；它不能创建或扩大任何账号/工作区/会话授权，不能改设置/凭据/开关/
+  提供方/模型/隔离，也不能预先批准后续调用。它是本机指挥官的决定，不是自动放行规则、不是
+  第二个模型审查、也不依赖人工点击。
 - **工作树隔离需要 git**：默认 `worktree` 隔离要求源目录是已提交的 git 仓库；
   否则显式拒绝。`shared` 模式不是隔离，界面会如实标注。
 - **审查不是批准**：附加审查只产出发现，不代表宿主验收；任务完成状态是
@@ -340,7 +451,7 @@ dsh plugin --profile web remove dsh-delegate
 
 ```bash
 npm install          # 安装开发依赖（仅本仓库内）
-npm test             # node --test --test-concurrency=1 tests/*.test.js（当前 794 项）
+npm test             # node --test --test-concurrency=1 tests/*.test.js
 npm run check:client # scripts/build-client.mjs --check，校验 lib/client.js 与源码一致
 npm run build:client # 由 src/client/index.jsx 重建 lib/client.js
 npm run pack:dry     # npm pack --dry-run
@@ -356,7 +467,7 @@ Codex 集成相关的自动化测试（全部在临时 `CODEX_HOME` 中运行，
 | 文件 | 覆盖 |
 | --- | --- |
 | `tests/codex-toml.test.js` | TOML 定位/最小行区间编辑：注释、多行数组、内联表、Windows 路径、拒绝畸形文档 |
-| `tests/codex-integration.test.js` | 路径与可执行文件推导（普通 Node / Electron / 随包 Node / 环境变量 / 失败即拒绝）、幂等安装、用户文件保留、MCP 冲突拒绝、写入保真、路由契约、只读 status |
+| `tests/codex-integration.test.js` | 路径与可执行文件推导（普通 Node / Electron / 随包 Node / 环境变量 / 失败即拒绝）、幂等安装、用户文件保留、MCP 冲突拒绝、写入保真、路由契约、只读 status、已发布模板迁移（上一版与更早版本、同一版本的 LF 与 CRLF 两种字节，逐字节比对且不归一化行尾） |
 | `tests/codex-agent.test.js` | 本版本之前的 `manageCodexAgent` 兼容入口 |
 | `tests/codex-ui.test.js` | 设置页流程：`init` 只读、每个动作恰好一次 POST、三种状态分离、构建产物含面板与限制说明 |
 

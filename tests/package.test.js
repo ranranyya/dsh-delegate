@@ -37,10 +37,12 @@ const MANIFEST = JSON.parse(readFileSync(join(ROOT, 'package.json'), 'utf8'));
 
 /**
  * The DSH runtimes that were actually verified. `0.2.0-rc.2` is the development
- * runtime; `0.2.1-rc.2` was accepted in an isolated profile and `0.2.1-rc.3` is
- * the current host runtime. Nothing else has been exercised.
+ * runtime; `0.2.1-rc.2` was accepted in an isolated profile and `0.2.1-rc.3` was the
+ * previous host runtime. `0.2.2-rc.1` is the DSH Desktop native runtime this release
+ * adds: its agent/model-selection and sandbox/approval sources were audited and its
+ * native base+web bootstrap was verified independently. Nothing else has been exercised.
  */
-const SUPPORTED_DSH_VERSIONS = ['0.2.0-rc.2', '0.2.1-rc.2', '0.2.1-rc.3'];
+const SUPPORTED_DSH_VERSIONS = ['0.2.0-rc.2', '0.2.1-rc.2', '0.2.1-rc.3', '0.2.2-rc.1'];
 
 /**
  * The exact union range that admits precisely {@link SUPPORTED_DSH_VERSIONS}.
@@ -51,15 +53,41 @@ const SUPPORTED_DSH_RANGE = SUPPORTED_DSH_VERSIONS.join(' || ');
  * The package version this build must declare everywhere a human writes it.
  *
  * Pinned rather than derived: `MANIFEST.version` is one of the places checked below,
- * so asserting it against itself would pass for any value. `0.1.10` fixes the
- * known-template migration for Codex agent files and refreshes them at plugin
- * startup, following the late-bound controller fix in 0.1.9.
+ * so asserting itself would pass for any value. `1.0.0` is the first formal release;
+ * it carries the commander's per-call
+ * permission decision to the installable plugin (the sixth MCP tool
+ * `delegate_permission_decide`), updates the managed Codex companion with the per-call
+ * decision rules while keeping its activation, explicit-continuation, route-from-DSH and
+ * source-path rules unchanged, and enumerates the published `0.1.13` agent template so an
+ * unchanged `0.1.13` file is refreshed while a user-edited one never is. It follows the
+ * `0.1.13` DSH 0.2.2 compatibility build.
  */
-const DELIVERABLE_VERSION = '0.1.10';
+const DELIVERABLE_VERSION = '1.0.0';
+
+/**
+ * The published build this release upgrades *from*.
+ *
+ * Kept as its own constant because the release assertions below are relative: the
+ * current version must be exactly one patch above this baseline, and the two are
+ * different versions by construction.
+ */
+const PREVIOUS_VERSION = '0.1.14';
 
 // Published prior builds are retained only where the migration/ownership contract
 // names them. Other operator-facing and shipped code must not carry stale versions.
-const HISTORICAL_VERSION_PATHS = new Set(['src/codex/installer.js', 'docs/codex-integration.md']);
+const HISTORICAL_VERSION_PATHS = new Set([
+  'src/codex/installer.js',
+  'docs/codex-integration.md',
+  'docs/runtime-compatibility.md',
+]);
+
+/**
+ * Every release whose agent-template digest `KNOWN_AGENT_TEMPLATES` enumerates.
+ *
+ * A published build may only be named next to a historical-contract document when its
+ * bytes are still recognized by the migrator; otherwise the mention is a stale label.
+ */
+const MIGRATABLE_AGENT_VERSIONS = ['0.1.6', '0.1.7', '0.1.8', '0.1.9', '0.1.10', '0.1.11', '0.1.12', '0.1.13', '0.1.14'];
 
 /** A semver value: `MAJOR.MINOR.PATCH` with an optional prerelease suffix. */
 const SEMVER = /^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)(?:-[0-9A-Za-z.-]+)?$/u;
@@ -538,7 +566,11 @@ test('the release metadata is one version everywhere it is written by hand', () 
 
   assert.match(runtimeFacts, new RegExp(`const PLUGIN_VERSION = '${escape(MANIFEST.version)}';`, 'u'));
   assert.match(mcpServer, new RegExp(`version: '${escape(MANIFEST.version)}'`, 'u'));
-  assert.match(discovery, new RegExp(`dsh-delegate ${escape(MANIFEST.version)}`, 'u'));
+  // The discovery refusal deliberately does *not* restate a release version: it names
+  // the plugin and the recovery path instead. That is asserted below and in the
+  // dedicated message tests, so it is not turned back into a version literal here.
+  assert.match(discovery, /dsh-delegate build/u, 'the discovery refusal must name the plugin build');
+  assert.doesNotMatch(discovery, /\b0\.1\.\d+\b/u, 'the discovery refusal must not pin a release version');
   assert.match(readme, new RegExp(`dsh-delegate-${escape(MANIFEST.version)}\\.tgz`, 'u'));
   // Every *release* literal in the package is this version. The 0.2.x references are
   // DSH runtime versions quoted in comments, not this package's own version.
@@ -551,19 +583,20 @@ test('the release metadata is one version everywhere it is written by hand', () 
   }
 });
 
-test('the release is 0.1.10, one semver step above the shipped 0.1.9 baseline', () => {
-  // Pinned, not derived: the late-bound controller fix is a new release, and a
-  // manifest that still advertises 0.1.9 would label the previous build as current.
-  // `package.json`, the lockfile (both fields), the agent template and the two
-  // documents an operator reads must agree.
+test(`the release is ${DELIVERABLE_VERSION}, the first formal major release after ${PREVIOUS_VERSION}`, () => {
+  // Pinned, not derived: the worker permission build is a new release, and a
+  // manifest that still advertised the previous version would label that build as
+  // current. `package.json`, the lockfile (both fields), the agent template and the
+  // two documents an operator reads must agree.
   assert.match(MANIFEST.version, SEMVER);
   assert.equal(MANIFEST.version, DELIVERABLE_VERSION, 'package.json must declare the released version');
+  assert.notEqual(DELIVERABLE_VERSION, PREVIOUS_VERSION, 'a baseline equal to the release asserts nothing');
 
-  const previous = semverParts('0.1.9');
+  const previous = semverParts(PREVIOUS_VERSION);
   const current = semverParts(MANIFEST.version);
-  assert.equal(current.major, previous.major, 'a defect fix is a patch release: the major version may not move');
-  assert.equal(current.minor, previous.minor, 'a defect fix is a patch release: the minor version may not move');
-  assert.equal(current.patch, previous.patch + 1, 'the release must be exactly one patch above 0.1.9');
+  assert.equal(current.major, previous.major + 1, `the formal release must advance the major version after ${PREVIOUS_VERSION}`);
+  assert.equal(current.minor, 0, 'the first formal release must reset the minor version');
+  assert.equal(current.patch, 0, 'the first formal release must reset the patch version');
 
   const lock = JSON.parse(readFileSync(join(ROOT, 'package-lock.json'), 'utf8'));
   assert.equal(lock.version, DELIVERABLE_VERSION, 'package-lock.json#version must match package.json');
@@ -579,16 +612,72 @@ test('the release is 0.1.10, one semver step above the shipped 0.1.9 baseline', 
   assert.match(contract, new RegExp(`"packageVersion": "${escape(DELIVERABLE_VERSION)}"`, 'u'));
   assert.match(contract, /bundled runtime/u, 'the contract must document where the executable comes from');
 
+  // The runtime-compatibility note is the third place a release is named, and it is
+  // the one an operator reads to decide whether their DSH can load this build.
+  const compatibility = readFileSync(join(ROOT, 'docs', 'runtime-compatibility.md'), 'utf8');
+  assert.ok(PACKED.includes('docs/runtime-compatibility.md'), 'the compatibility note must be published');
+  assert.match(compatibility, new RegExp(escape(DELIVERABLE_VERSION), 'gu'), 'the compatibility note names this release');
+  for (const version of SUPPORTED_DSH_VERSIONS) {
+    assert.ok(compatibility.includes(version), `the compatibility note must list DSH ${version}`);
+  }
+
   // No stale release literal may survive in code or in the documents an operator
-  // reads, except for the two explicit historical-contract locations that identify
-  // the previous build whose bytes and migration shape are being handled.
-  for (const path of ['README.md', 'docs/codex-integration.md', ...PACKED.filter((entry) => entry.startsWith('src/') && entry.endsWith('.js'))]) {
-    const text = readFileSync(join(ROOT, path), 'utf8');
+  // reads, except for the explicit historical-contract locations that identify the
+  // previous builds whose bytes and migration shape are being handled.
+  //
+  // `README.md` gets one narrow exemption and no more: its section heading
+  // `Worker 会话权限（0.1.12 起适配 DSH 0.2.2）` states when that behaviour was
+  // introduced, which is a historical fact and must not be relabelled to this release.
+  // Only that exact heading is excluded from the scan; every other older literal in
+  // the README still fails, and the current `.tgz` filename check above stays strict.
+  const README_HISTORICAL_HEADINGS = ['Worker 会话权限（0.1.12 起适配 DSH 0.2.2）'];
+  for (const path of [...HISTORICAL_VERSION_PATHS, 'README.md', 'CHANGELOG.md', ...PACKED.filter((entry) => entry.startsWith('src/') && entry.endsWith('.js'))]) {
+    let text = readFileSync(join(ROOT, path), 'utf8');
+    if (path === 'README.md') {
+      for (const heading of README_HISTORICAL_HEADINGS) {
+        // Each excluded heading must really be present, so the exemption cannot rot
+        // into a silent blanket allowance.
+        assert.ok(text.includes(heading), `the README historical heading must still be present: ${heading}`);
+        text = text.replace(heading, '');
+      }
+    }
     for (const literal of new Set(text.match(/\b0\.1\.\d+\b/gu) ?? [])) {
-      const historical = ['0.1.6', '0.1.7', '0.1.8', '0.1.9'].includes(literal) && HISTORICAL_VERSION_PATHS.has(path);
-      assert.ok(literal === DELIVERABLE_VERSION || historical, `${path} still mentions ${literal} as if it were current`);
+      const historical = MIGRATABLE_AGENT_VERSIONS.includes(literal) && HISTORICAL_VERSION_PATHS.has(path);
+      // The changelog is history by definition: every earlier release may appear there.
+      const changelog = path === 'CHANGELOG.md';
+      assert.ok(
+        literal === DELIVERABLE_VERSION || historical || changelog,
+        `${path} still mentions ${literal} as if it were current`,
+      );
     }
   }
+});
+
+test('the supported-version table is the one the manifest admits', () => {
+  // Compatibility is a claim made in two places at once: the manifest range an
+  // installer checks, and the table an operator reads. A release that widened one and
+  // forgot the other is exactly how an untested runtime gets advertised.
+  const compatibility = readFileSync(join(ROOT, 'docs', 'runtime-compatibility.md'), 'utf8');
+  const tableRows = compatibility
+    .split('\n')
+    .filter((line) => /^\|\s*`?\d+\.\d+\.\d+-rc\.\d+`?\s*\|/u.test(line.trim()))
+    .map((line) => line.split('|')[1].trim().replace(/`/gu, ''));
+  for (const version of SUPPORTED_DSH_VERSIONS) {
+    assert.ok(tableRows.includes(version), `the supported-version table does not list ${version}`);
+    assert.ok(MANIFEST.engines.dsh.includes(version), `engines.dsh does not admit ${version}`);
+    for (const [name, range] of Object.entries(MANIFEST.peerDependencies)) {
+      if (!name.startsWith('@deepseek-ai/dsh')) continue;
+      assert.ok(range.includes(version), `${name} does not admit ${version}`);
+    }
+  }
+  // The table may not advertise a runtime the manifest refuses.
+  for (const row of tableRows) {
+    assert.ok(SUPPORTED_DSH_VERSIONS.includes(row), `the table lists an unverified runtime: ${row}`);
+  }
+  // 0.1.11 is skipped by the native engine gate and must be described as such rather
+  // than silently omitted: an operator on that build needs to know why it refuses.
+  assert.match(compatibility, /0\.1\.11/u, 'the note must mention the plugin build whose native gate refuses 0.2.2');
+  assert.match(compatibility, /skipped|refus/iu, 'the note must say what happens to an older plugin build');
 });
 
 test('the Codex MCP command resolves a Node.js runtime, never the desktop executable', () => {
@@ -660,6 +749,8 @@ test('the archive publishes the operator-facing contracts, not internal notes', 
     'docs/conversation-placement.md',
     'docs/contracts-stage-b.md',
     'docs/redaction-contract.md',
+    'docs/runtime-compatibility.md',
+    'docs/worker-permissions.md',
     'docs/workspace-contract.md',
   ]) {
     assert.ok(PACKED.includes(path), `missing doc: ${path}`);

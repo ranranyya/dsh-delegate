@@ -34,6 +34,44 @@ credentials, registry, startup entries or live host registrations.
    it; the switch is an operator control, not per-process authentication or a
    same-user security boundary. Browser control writes remain protected by the
    native DSH session and origin fence.
+
+   **Narrow, explicit exception — per-call permission decisions.** The rule above
+   forbids the external surface from widening a grant. One tool is authorized to
+   answer a permission question, and only this way: while a delegated worker is
+   actively followed, a native DSH approval request pauses *that exact tool call*;
+   the request is exposed through the existing `delegate_result` view; and the
+   bounded tool `delegate_permission_decide` answers it `allow-once` or `reject`.
+   That tool:
+
+   - consumes an **already pending** per-call request only — it cannot create a
+     request, and with nothing pending it refuses;
+   - applies to **one** native tool call, identified by task, Session, tool name,
+     a non-reusable request id, the native `callId`, and an exact fingerprint of
+     the real tool arguments read from the Session log (never from the worker's
+     prose);
+   - is **single-use**: the decision settles the request, a duplicate or late
+     decision is refused, and the next escalation asks again;
+   - **cannot** create or widen an account/workspace/session grant, change
+     settings, credentials, the local-call switch, the provider/model, the
+     reasoning effort or the isolation, and cannot approve any future operation;
+   - is **not** an automatic allow-all rule, an LLM/API reviewer, or a
+     human-click workflow. The current commander decides; there is no second
+     model in the loop and no required click;
+   - leaves the worker's standing sandbox mode at `workspace-write` for the whole
+     run and never writes `danger-full-access` into a Session;
+   - is **not part of the native worker's preset tool surface**, so the worker's model is
+     never handed it. That is a *tool-surface restriction*, **not** a hard boundary
+     against arbitrary code running as the same OS user: switch mode deliberately uses
+     one shared `local-mcp` identity with no user-managed token, and this exception
+     does not turn that into a per-process boundary. Nothing here relies on a
+     caller-supplied role label.
+
+   A run with **no** armed bridge keeps the deterministic `never` approval
+   stance: its escalation is rejected without waiting, exactly as before. What
+   this exception does *not* claim is process authentication against arbitrary
+   code running as the same local user — switch mode deliberately uses one shared
+   `local-mcp` connection identity, and this tool does not turn that into a
+   per-process boundary.
 4. Provider selection comes from DSH's registered provider list. Model and
    reasoning-effort choices come from exact DSH model metadata; the plugin does
    not ask users to copy API endpoints or credentials. It never returns DSH
@@ -63,6 +101,17 @@ credentials, registry, startup entries or live host registrations.
    must NOT mean host acceptance; host acceptance is a distinct explicit action
    or is left to Codex and labeled honestly. Cancel and explicit retry supported;
    a retry requires the local switch to be ON and never silently resubmits work.
+
+   A task waiting for a per-call permission decision is **still `running`**, with
+   phase `awaiting-permission` and a `permission.pending` block in its view. It is
+   neither failed nor execution-complete, it keeps its workspace lock and
+   concurrency slot until the native executor actually settles, and the approval
+   wait is charged to a separate, bounded request deadline (fixed default 10
+   minutes) instead of the worker's execution timeout. Cancellation, switch-off,
+   revocation, agent disposal, plugin teardown and that deadline all settle the
+   outstanding wait with a refusal and restore the timers; a restart begins with
+   no bridge and no request, so an interrupted request is history only and is
+   never replayed as an allow.
 9. Connectivity checks: separate HTTP/auth/catalog success from an actual model
    response. Allow a practical token budget, recognize reasoning-only responses,
    return bounded redacted diagnostics; do not repeat the maxTokens=1 false timeout.

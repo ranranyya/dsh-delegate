@@ -57,6 +57,9 @@ import { SessionStore, liveControllerAccessor } from './runtime/session-placemen
 import { publishRuntimeEndpoint, resolveDefaultEndpointDiscoveryPath } from './runtime/endpoint-discovery.js';
 import { resolveCodexActionSeam } from './codex/seam.js';
 import { ReviewPreset } from './review/preset.js';
+import { configureDelegatedSession, policyServicesOf } from './runtime/sandbox.js';
+import { PermissionBridge, PERMISSION_DEFAULT_TIMEOUT_MS } from './runtime/permissions.js';
+import { redactText, isSecretKey } from './config/redact.js';
 
 /** Stable Cordis plugin name; also the settings/document namespace. */
 export const name = 'dsh-delegate';
@@ -228,6 +231,24 @@ export async function apply(ctx, config = {}) {
     // Startup only refreshes an agent file whose bytes match a shipped template.
     // Agent creation and MCP registration remain explicit settings-page actions.
     codex: resolveCodexActionSeam({ version: PLUGIN_VERSION }),
+    // The runner calls this only for worker jobs. Reviews intentionally use their
+    // own read-only tool policy and are not put into a delegated worker sandbox.
+    configureDelegatedSession,
+    // `ctx.sandboxPolicy` and `ctx.approval` own the two facts the delegated
+    // policy writes, so the runner reads them back through these live services
+    // and refuses the run when either cannot answer. Read per run, never at
+    // activation: a service composed later must still be observed.
+    policyServices: () => policyServicesOf(ctx),
+    // The per-call permission bridge factory. It produces a bridge only when this
+    // harness can actually service an approval request: a live `ctx.approval` with
+    // a callable `request()`, which is the seam the native tools ask through. When
+    // that seam is absent the factory returns null, the engine offers no bridge,
+    // and every worker run keeps the original fail-closed `never` stance — this
+    // plugin must never install an `ask` it cannot answer.
+    permissionBridge: createPermissionBridgeFactory({
+      getApprovalService: () => readOptionalApprovalService(ctx),
+      logger,
+    }),
   };
 
   try {
@@ -457,7 +478,75 @@ export async function apply(ctx, config = {}) {
 }
 
 /** Version reported by the runtime facts block. Mirrors `package.json`. */
-const PLUGIN_VERSION = '0.1.10';
+const PLUGIN_VERSION = '1.0.0';
+
+/**
+ * Read the native approval service without turning absence into a throw.
+ *
+ * The bridge is offered only when this service exists AND exposes `request()`,
+ * because that call is the seam a native tool uses to ask. A service that is
+ * present but cannot be asked through (a half-composed or replaced approval
+ * runtime) is treated as absent, so the run keeps the deterministic `never`
+ * stance instead of installing an `ask` nobody services.
+ * @param {object} ctx - plugin context.
+ * @returns {object | null} the approval service, or null.
+ */
+function readOptionalApprovalService(ctx) {
+  if (ctx === null || ctx === undefined || typeof ctx.get !== 'function') return null;
+  let service;
+  try {
+    service = ctx.get('approval', false) ?? null;
+  } catch {
+    return null;
+  }
+  if (service === null || typeof service !== 'object' || typeof service.request !== 'function') return null;
+  return service;
+}
+
+/**
+ * Build the per-run permission bridge factory the job engine calls.
+ *
+ * The factory returns a bridge ONLY when the deployment can service the request it
+ * would surface: the native approval seam must be composed and askable. It returns
+ * `null` otherwise, which the engine treats as "this run is not bridged" — the
+ * stance stays `never` and nothing about the run changes.
+ *
+ * The bridge it returns carries:
+ *
+ *  * the task and connection identity the commander's decision is checked against;
+ *  * the deployment's own redaction (`redactText`), so no argument value or asker
+ *    claim can publish a credential;
+ *  * a per-request deadline of {@link PERMISSION_DEFAULT_TIMEOUT_MS} — a fixed,
+ *    documented bound, never an infinite wait;
+ *  * the observers the ENGINE owns (it records the phase and accounts the wait),
+ *    supplied by the engine's own call so this factory holds no task state.
+ * @param {object} options - `getApprovalService` (live accessor), `logger`.
+ * @returns {(request: object) => object | null} factory.
+ */
+function createPermissionBridgeFactory(options) {
+  return function permissionBridge(request) {
+    const approval = typeof options?.getApprovalService === 'function' ? options.getApprovalService() : null;
+    if (approval === null) return null;
+    try {
+      return new PermissionBridge({
+        taskId: request?.taskId,
+        connectionId: request?.connectionId,
+        timeoutMs: PERMISSION_DEFAULT_TIMEOUT_MS,
+        // BOTH halves of redaction: the scalar patterns AND the key-aware predicate.
+        // The second one is what stops `{"apiKey":"…"}` being published verbatim,
+        // because that secret carries no credential-shaped TEXT at all.
+        redact: (text) => redactText(text),
+        isSecretKey,
+        onPending: request?.onPending,
+        onSettled: request?.onSettled,
+        logger: options?.logger ?? null,
+      });
+    } catch (error) {
+      options?.logger?.warn?.('dsh-delegate: the permission bridge could not be constructed', String(error?.code ?? ''));
+      return null;
+    }
+  };
+}
 
 /**
  * Resolve the plugin's own data directory.

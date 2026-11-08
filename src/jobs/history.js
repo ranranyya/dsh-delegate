@@ -115,6 +115,9 @@ const ARRAY_PATHS = [
   ['diff', 'sensitivePaths'],
   ['baseline', 'preexistingPaths'],
   ['review', 'denials'],
+  ['permission', 'evidence'],
+  ['permission', 'pending', 'boundsApplied'],
+  ['permission', 'pending', 'argumentKeys'],
 ];
 
 /** Whole blocks dropped, in order, only when an entry still does not fit. */
@@ -128,9 +131,19 @@ const DROP_PATHS = [
   ['execution', 'turnEnd'],
   ['review', 'selection'],
   ['effective', 'provenance'],
+  ['permission', 'evidence'],
 ];
 
 const FORBIDDEN_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
+
+/**
+ * How many settled permission decisions one stored task record keeps.
+ *
+ * Small on purpose: this is human evidence ("what did the commander decide, and
+ * why"), not an audit log, and an unbounded trail would let one noisy run push
+ * every other field out of the entry budget.
+ */
+const MAX_PERMISSION_EVIDENCE = 8;
 
 /**
  * One bounded, versioned job history document.
@@ -213,8 +226,17 @@ export class HistoryStore {
       const base = await this.ensureLoaded();
       const draft = base.map((job) => structuredClone(job));
       const index = draft.findIndex((job) => job.taskId === entry.taskId);
-      if (index >= 0) draft[index] = entry;
-      else draft.push(entry);
+      if (index >= 0) {
+        // A LIVE snapshot may never roll a TERMINAL record back. The engine writes a
+        // checkpoint while a task waits for a decision, and that write can land after
+        // the run has already finished (or been interrupted at load time). Losing that
+        // race must not resurrect a finished task as `running`, so the terminal record
+        // wins and the stale checkpoint is discarded instead of stored.
+        if (isTerminal(draft[index].state) && !isTerminal(entry.state)) return structuredClone(draft[index]);
+        draft[index] = entry;
+      } else {
+        draft.push(entry);
+      }
       draft.sort(compareStored);
       const now = Date.now();
       this.enforceLimits(draft, entry.taskId, now);
@@ -497,6 +519,12 @@ function projectView(view, maxEntryBytes) {
     diff: diffView(view.diff, ctx),
     execution: executionView(view.execution, ctx),
     review: reviewView(view.review, ctx),
+    // The per-call permission evidence. Persisted so a restart can show WHY a call
+    // was allowed or refused, and so an interrupted wait is visible as history
+    // instead of vanishing. Every field is re-projected here from an allow-list and
+    // then re-redacted, so a stored record inherits the same masking the live view
+    // had — including key-aware masking of anything credential-named.
+    permission: permissionView(view.permission, ctx),
     error: errorView(view.error, ctx),
     cancelledBy: label(view.cancelledBy),
     hostAcceptance: acceptanceView(view.hostAcceptance),
@@ -531,6 +559,9 @@ function markInterrupted(entry, now) {
     message: 'the job was still live when the plugin restarted; it was not resubmitted',
     details: { previousState: entry.interruptedFrom },
   };
+  // A permission wait that was open when the process stopped is part of the same
+  // fact: the request is history only and can never be decided or replayed.
+  markPermissionInterrupted(entry);
   return entry;
 }
 
@@ -737,6 +768,151 @@ function reviewView(value, ctx) {
     denials: stringList(value.denials, ctx, 'review.denials'),
     denialsDelivered: count(value.denialsDelivered),
   };
+}
+
+/**
+ * Bounded projection of one per-call permission request.
+ *
+ * The allow-list is deliberate and narrow: identifiers, the redacted argument
+ * rendering, the completeness facts, the timestamps, and the decision evidence.
+ * What is NOT stored: the exact private fingerprint (it binds one live call and is
+ * meaningless after a restart, where the call it named is gone), the exact argument
+ * text, and the internal timer/signal handles. A restarted record therefore cannot
+ * be used to replay or re-authorise anything — it is evidence, not a capability.
+ * @param {unknown} value - one pending or settled permission view.
+ * @param {object} ctx - cut context.
+ * @param {string} field - path prefix for truncation markers.
+ * @returns {object | null} bounded copy.
+ */
+function permissionEntryView(value, ctx, field) {
+  if (!isPlainObject(value)) return null;
+  const access = isPlainObject(value.requestedAccess) ? value.requestedAccess : {};
+  const verified = isPlainObject(value.verified) ? value.verified : null;
+  const grant = isPlainObject(value.grant) ? value.grant : null;
+  return {
+    requestId: label(value.requestId),
+    taskId: label(value.taskId),
+    sessionId: label(value.sessionId),
+    toolName: label(value.toolName),
+    callId: label(value.callId),
+    turn: count(value.turn),
+    step: count(value.step),
+    state: label(value.state),
+    // The asker's own claim, still labelled as one.
+    reason: label(value.reason),
+    reasonSource: label(value.reasonSource),
+    requestedAccess: { kind: label(access.kind), mode: label(access.mode) },
+    argumentKeys: stringList(value.argumentKeys, ctx, `${field}.argumentKeys`),
+    // The redacted, bounded rendering of the real arguments. Already redacted by the
+    // bridge; `redactDeep` runs again over the whole entry below, so a stored record
+    // is masked twice rather than trusted once.
+    arguments: text(value.arguments, ctx, `${field}.arguments`, MAX_DETAIL_STRING_CHARS * 8),
+    argumentsRedacted: value.argumentsRedacted === true,
+    completeness: label(value.completeness),
+    argumentsComplete: value.argumentsComplete === true,
+    boundsApplied: stringList(value.boundsApplied, ctx, `${field}.boundsApplied`),
+    omitted: isPlainObject(value.omitted)
+      ? {
+        valueChars: count(value.omitted.valueChars),
+        keys: count(value.omitted.keys),
+        depth: count(value.omitted.depth),
+        items: count(value.omitted.items),
+      }
+      : null,
+    allowBlocked: label(value.allowBlocked),
+    createdAt: time(value.createdAt),
+    deadlineAt: time(value.deadlineAt),
+    decision: label(value.decision),
+    decidedAt: time(value.decidedAt),
+    decidedBy: label(value.decidedBy),
+    decisionReason: label(value.decisionReason),
+    outcome: label(value.outcome),
+    verified: verified === null
+      ? null
+      : {
+        fingerprintQuoted: verified.fingerprintQuoted === true,
+        argumentsComplete: verified.argumentsComplete === true,
+        callReread: verified.callReread === true,
+        turnOpen: verified.turnOpen === true,
+        boundsApplied: stringList(verified.boundsApplied, ctx, `${field}.verified.boundsApplied`),
+      },
+    grant: grant === null
+      ? null
+      : {
+        kind: label(grant.kind),
+        appliesTo: label(grant.appliesTo),
+        callId: label(grant.callId),
+        reusable: grant.reusable === true,
+      },
+    standingModeUnchanged: value.standingModeUnchanged === true,
+  };
+}
+
+/**
+ * Bounded projection of a task's whole permission block.
+ *
+ * The settled trail is stored oldest-last-first and cut to a small bound, because
+ * it is evidence an operator reads rather than machine state. `pending` is stored
+ * too: after a restart it is what proves the task was WAITING when the process
+ * stopped, and it is written with the same allow-list, so it cannot be replayed.
+ * @param {unknown} value - task `permission` block.
+ * @param {object} ctx - cut context.
+ * @returns {object | null} bounded copy.
+ */
+function permissionView(value, ctx) {
+  if (!isPlainObject(value)) return null;
+  const evidence = Array.isArray(value.evidence) ? value.evidence : [];
+  const pending = permissionEntryView(value.pending, ctx, 'permission.pending');
+  return {
+    bridged: value.bridged === true,
+    waiting: value.waiting === true,
+    pending,
+    evidence: evidence
+      .slice(-MAX_PERMISSION_EVIDENCE)
+      .map((entry, index) => permissionEntryView(entry, ctx, `permission.evidence[${index}]`))
+      .filter((entry) => entry !== null),
+    pausedExecutionMs: count(value.pausedExecutionMs),
+    standingSandboxMode: label(value.standingSandboxMode),
+    grantScope: label(value.grantScope),
+  };
+}
+
+/**
+ * Mark a live task's outstanding request as interrupted on load.
+ *
+ * A request that was pending when the process stopped can never be decided: the
+ * bridge, the Agent and the paused native tool call all died with the process, and
+ * `markInterrupted` has already made the task non-live. This rewrites only the
+ * PENDING record so the stored history says "this wait did not survive", instead of
+ * leaving a record a reader could mistake for a still-decidable request.
+ * @param {object} entry - projected entry.
+ * @returns {object} the same entry.
+ */
+function markPermissionInterrupted(entry) {
+  const permission = entry?.permission;
+  if (!isPlainObject(permission)) return entry;
+  const pending = permission.pending;
+  if (!isPlainObject(pending)) {
+    if (permission.waiting === true) permission.waiting = false;
+    return entry;
+  }
+  // Already normalized to "cannot be decided" (a checkpoint that was written before
+  // the terminal record, or a re-load of one): state the interrupt fact as well, so
+  // every interrupted record says the same thing regardless of which write produced it.
+  if (pending.state !== 'pending') {
+    permission.waiting = false;
+    permission.interrupted = true;
+    return entry;
+  }
+  pending.state = 'unavailable';
+  pending.outcome = 'unavailable';
+  pending.decidedBy = 'restart';
+  pending.decidedAt = entry.endedAt ?? pending.decidedAt ?? null;
+  pending.decisionReason = 'the process stopped while this request was pending; it cannot be decided and was not replayed';
+  pending.allowBlocked = 'the process stopped while this request was pending';
+  permission.waiting = false;
+  permission.interrupted = true;
+  return entry;
 }
 
 /** @returns {object | null} bounded error record. */

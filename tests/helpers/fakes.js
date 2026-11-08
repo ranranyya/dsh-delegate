@@ -11,6 +11,70 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 /**
+ * The native services that own a delegated Session's policy.
+ *
+ * Loaded through the installed packages, not re-implemented, so the tests assert
+ * against the folds production code depends on:
+ *  - `ctx.approval.effectivePolicy(session)` reads the `approval/policy` override
+ *    from the Session log and otherwise falls back to its configured stance;
+ *  - `ctx.sandboxPolicy.resolve({ session })` folds the `sandbox/mode` override
+ *    through `ctx.sessionProjections` and pairs it with the Session's own cwd.
+ *
+ * They are constructed on a bare Cordis `Context`, which is all their read faces
+ * need: no host row is composed into it, so nothing here listens to live harness
+ * events, and the only state involved is the projection registry and the Session
+ * log these tests drive directly.
+ * @param {object} [services] - `sandboxProjections`, `sandboxPolicy`, `approval` native overrides.
+ * @returns {Promise<{ sandboxPolicy: object|null, approval: object|null }>} the policy services.
+ */
+export async function nativePolicyServices(services = {}) {
+  const [{ SandboxPolicyService }, { ApprovalService }, projections, { Context }] = await Promise.all([
+    import('@deepseek-ai/dsh-sandbox-policy'),
+    import('@deepseek-ai/dsh-user-approval'),
+    import('@deepseek-ai/dsh-session-projection'),
+    import('@deepseek-ai/cordis'),
+  ]);
+  const ctx = services.ctx ?? new Context();
+  const registry = services.sandboxProjections ?? new projections.SessionProjectionRegistry(ctx);
+  const sandboxPolicy = new SandboxPolicyService(
+    ctx,
+    // The deployment default is `read-only`, which is the fail-safe the delegate
+    // policy has to override: a test can therefore prove the override is what
+    // makes a worker writable, not a permissive default.
+    { mode: 'read-only', workspaceRoot: process.cwd() },
+  );
+  const approval = new ApprovalService(ctx, { policy: 'ask' });
+  return {
+    // `sessionProjections` is attached because it is the registry the sandbox
+    // service folds through, not a service the plugin itself consumes.
+    sessionProjections: registry,
+    sandboxPolicy: services.sandboxPolicy === undefined ? sandboxPolicy : services.sandboxPolicy,
+    approval: services.approval === undefined ? approval : services.approval,
+  };
+}
+
+/**
+ * The policy services a delegated run is given, with a seam for refusal cases.
+ *
+ * `missing` drops a service entirely (the capability-absence case) and `broken`
+ * replaces one with a stub that refuses to answer — the two ways the production
+ * policy can fail to be verifiable. Everything else is the native service, so a
+ * passing test states that the real fold read the real event.
+ * @param {object} [options] - `missing`: `'sandboxPolicy'|'approval'`; `broken`: `{ sandboxPolicy?, approval? }`.
+ * @returns {Promise<{ sandboxPolicy: object|null, approval: object|null }>} services.
+ */
+export async function policyServicesFor(options = {}) {
+  const native = await nativePolicyServices(options.native);
+  const services = { ...native };
+  if (options.missing !== undefined) services[options.missing] = null;
+  for (const name of ['sandboxPolicy', 'approval']) {
+    const replacement = options.broken?.[name];
+    if (replacement !== undefined) services[name] = replacement;
+  }
+  return services;
+}
+
+/**
  * Create a temporary directory that the caller removes with {@link cleanup}.
  * @returns {Promise<string>} absolute directory path.
  */
@@ -179,6 +243,65 @@ export function nativePresetRegistry(options = {}) {
 }
 
 /**
+ * A faithful stand-in for the native `Session` surface this plugin touches.
+ *
+ * Only the members the policy path reads are modelled, but each one behaves the
+ * way the installed `@deepseek-ai/dsh-session` does:
+ *  - `append(type, data)` validates the payload as lossless JSON (so a non-object
+ *    `data` is refused exactly where the native log refuses it), assigns the next
+ *    `seq`, records `time`, snapshots `data`, stores the event and returns it;
+ *  - `seq` is the log length, `eventAt(seq)` returns the event at that exact
+ *    position or `undefined`, and `snapshotEvents(from, to)` returns a frozen
+ *    half-open slice — the reads both `ctx.approval` and the projection registry
+ *    perform, so a service folding this log sees a session it can actually read;
+ *  - `header` carries the Session's own `id` and (when known) `cwd`.
+ *
+ * The log is the only state, so a service that folds it (the approval stance, the
+ * sandbox-mode override) observes exactly what the production code wrote, and a
+ * test can prove a policy took effect instead of proving an event was appended.
+ * @param {object} request - `id`, optional `cwd`.
+ * @returns {object} session with `log`, `append`, `eventAt`, `snapshotEvents`, `seq`, `header`.
+ */
+export function fakeSession(request) {
+  const id = request.id;
+  const log = [];
+  const session = {
+    log,
+    header: { id, ...(typeof request.cwd === 'string' ? { cwd: request.cwd } : {}) },
+    get seq() {
+      return log.length;
+    },
+    append(type, data) {
+      if (typeof type !== 'string' || type === '') throw new Error('session.append: type must be a non-empty string');
+      if (data === undefined || data === null || typeof data !== 'object' || Array.isArray(data)) {
+        throw new Error(`session event "${type}" carries non-JSON-serializable data`);
+      }
+      const snapshot = JSON.parse(JSON.stringify(data));
+      const event = Object.freeze({ type, seq: log.length, time: Date.now(), data: snapshot });
+      log.push(event);
+      return event;
+    },
+    eventAt(seq) {
+      return Number.isInteger(seq) && seq >= 0 && seq < log.length ? log[seq] : undefined;
+    },
+    snapshotEvents(fromSeq, toSeqExclusive) {
+      const from = Number.isInteger(fromSeq) ? Math.max(0, fromSeq) : 0;
+      const to = Number.isInteger(toSeqExclusive) ? Math.min(toSeqExclusive, log.length) : log.length;
+      return Object.freeze(log.slice(from, to));
+    },
+    /** Every event of one type, in log order. Read by assertions only. */
+    eventsOf(type) {
+      return log.filter((event) => event.type === type);
+    },
+    /** The last event of one type, or undefined. */
+    lastOf(type) {
+      return log.filter((event) => event.type === type).at(-1);
+    },
+  };
+  return session;
+}
+
+/**
  * Fake native agent registry.
  *
  * The handle exposes `agent.followup`, `agent.cancel`, `agent.whenIdle` and
@@ -193,6 +316,12 @@ export function nativePresetRegistry(options = {}) {
  * session's id. A create call that omits the identity therefore fails here with
  * the native message instead of quietly minting one, so a runner that forgot to
  * generate an identity cannot look healthy in tests.
+ *
+ * The Session is a real event log ({@link fakeSession}) and the setup callback
+ * receives `(agentCtx, agent)` — the two arguments `AgentSetup` is called with —
+ * so the delegated sandbox policy can be written and read back on this path
+ * exactly as it is in production. A create call whose setup forgets the agent
+ * therefore fails here, instead of looking healthy.
  *
  * `respond` models one turn the way the agent loop does it: the turn's events are
  * emitted *when the prompt is delivered*, and only then does the agent become
@@ -245,6 +374,10 @@ export function fakeAgents(options = {}) {
       if (typeof request?.meta?.cwd !== 'string') {
         throw new Error('agents.create: meta.cwd is required');
       }
+      const session = fakeSession({
+        id: request.sessionId,
+        ...(typeof request.meta.cwd === 'string' ? { cwd: request.meta.cwd } : {}),
+      });
       const record = {
         options: request.agentOptions ?? {},
         meta: request.meta,
@@ -263,7 +396,7 @@ export function fakeAgents(options = {}) {
       const agent = {
         // Entered by identity, exactly as `AgentRegistry.enter()` validates it.
         id: request.sessionId,
-        session: { id: request.sessionId },
+        session,
         followup(message) {
           record.followups.push(message);
           order.push('followup');
@@ -306,7 +439,10 @@ export function fakeAgents(options = {}) {
           },
         };
         record.agentCtx = agentCtx;
-        await request.setup(agentCtx);
+        // The native `AgentSetup` signature: `(agentCtx, agent)`. Both are passed
+        // because a policy that must write to the Session needs the agent, and a
+        // composition that must register scope services needs the context.
+        await request.setup(agentCtx, agent);
       }
       record.handle = handle;
 
@@ -677,6 +813,10 @@ export function fakeSessionController(options = {}) {
       }
       if (options.failResolve !== undefined) throw options.failResolve;
       const existing = agents.get(sessionId);
+      // A second resolve of one conversation returns the SAME live Agent, which is
+      // how "the conversation was continued" is told from "another conversation
+      // was created beside it". The identity of the returned object is what
+      // matters; `resolves` already recorded this call above.
       if (existing !== undefined) return { agent: existing };
       const agent = resolvedAgentFor(record, options.respond === undefined ? {} : { respond: options.respond });
       agents.set(sessionId, agent);
@@ -702,15 +842,21 @@ export function fakeSessionController(options = {}) {
  * deltas first, then the completed `assistant/message`, then `turn/end`. The reply
  * source is a shared array, so a `reuse` run visibly continues the SAME
  * conversation object — the property this whole feature exists for.
+ *
+ * The Session is a real event log ({@link fakeSession}) carrying the header `cwd`
+ * the placement validated, because that header is the workspace root the sandbox
+ * policy resolves and the subject `ctx.approval` folds: a Session faked without
+ * it would make the delegated policy look applied while nothing could read it.
  * @param {object} record - session record from {@link fakeSessionController}.
  * @param {object} [options] - `respond` plan (see {@link fakeAgents}).
  * @returns {object} agent with `listeners`, `followups`, `cancels` and `turns`.
  */
 export function resolvedAgentFor(record, options = {}) {
   const listeners = [];
+  const session = fakeSession({ id: record.sessionId, ...(record.cwd === undefined ? {} : { cwd: record.cwd }) });
   const agent = {
     id: record.sessionId,
-    session: { id: record.sessionId, header: { id: record.sessionId, cwd: record.cwd } },
+    session,
     listeners,
     ctx: {
       on(event, listener) {

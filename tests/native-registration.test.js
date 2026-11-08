@@ -34,7 +34,7 @@ import { createOpenAiAdapter } from '../src/model/openai-adapter.js';
 import { createProviderRegistry } from '../src/model/providers.js';
 import { describeCatalog, resolveRoute } from '../src/model/routing.js';
 import { WorkspaceLocks } from '../src/workspace/locks.js';
-import { cleanup, fakeAgents, fakeSessionController, fakeWorkspaceController, makeTempDir, validSettings } from './helpers/fakes.js';
+import { cleanup, fakeAgents, fakeSessionController, fakeWorkspaceController, makeTempDir, nativePolicyServices, validSettings } from './helpers/fakes.js';
 
 /**
  * A Cordis-shaped context good enough to construct a real `LlmRuntime`.
@@ -555,6 +555,11 @@ async function engineWire() {
   // tests would otherwise be measuring instead of native route registration.
   const workspaces = fakeWorkspaceController();
   const sessionController = fakeSessionController({ workspaces, respond: { text: 'done' } });
+  // The native policy services a delegated run verifies its sandbox policy
+  // through (`ctx.sandboxPolicy` / `ctx.approval`, read per call). Both fold each
+  // Session's own event log, so one pair per harness holds nothing to reset.
+  // Without them every dispatch is refused with `RUN_SANDBOX_POLICY_UNAVAILABLE`.
+  const policyServices = await nativePolicyServices();
   const deps = {
     agents,
     agentPresets: { async mount() { return { id: 'default' }; } },
@@ -564,6 +569,7 @@ async function engineWire() {
     sessions: { async flush() {} },
     workspaces,
     sessionController,
+    policyServices: () => policyServices,
     llm: wired.llm,
     settings,
     auth,

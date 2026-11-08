@@ -412,6 +412,52 @@ export const GRANT_KIND_LABELS = Object.freeze({
   session: '本连接会话（限时、可撤销）',
 });
 
+/**
+ * Chinese labels for the per-call permission states a task can report.
+ *
+ * The wording is deliberately about ONE call: a decision here never grants a
+ * standing permission, and the panel must not read like an approval workflow.
+ */
+export const PERMISSION_STATE_LABELS = Object.freeze({
+  pending: '等待本机指挥官决定（仅这一次调用）',
+  decided: '已决定',
+  expired: '已超时（未决定即为拒绝）',
+  cancelled: '已撤回',
+  unavailable: '无法建立请求身份（已按拒绝处理）',
+});
+
+/** Chinese labels for the two decisions the commander may take. */
+export const PERMISSION_DECISION_LABELS = Object.freeze({
+  'allow-once': '仅本次允许',
+  reject: '拒绝',
+});
+
+/** Chinese labels for the four closed native approval outcomes. */
+export const PERMISSION_OUTCOME_LABELS = Object.freeze({
+  'allowed-once': '仅本次允许',
+  rejected: '已拒绝',
+  cancelled: '已撤回',
+  unavailable: '无可用审批通道',
+});
+
+/** Chinese label for a task phase, falling back to the raw phase. */
+export const TASK_PHASE_LABELS = Object.freeze({
+  created: '已创建',
+  workspace: '解析工作区',
+  authorization: '校验授权',
+  settings: '读取设置',
+  providers: '确认提供方',
+  worktree: '准备工作树',
+  audit: '记录基线',
+  'before-create': '即将创建执行器',
+  execute: '执行中',
+  'awaiting-permission': '等待本次调用授权决定',
+  review: '附加审查中',
+  'awaiting-host-review': '等待宿主审查',
+  failed: '已失败',
+  cancelled: '已取消',
+});
+
 /** Task states, exactly as the engine reports them. */
 export const TASK_STATES = Object.freeze(['pending', 'running', 'awaiting-host-review', 'failed', 'cancelled']);
 
@@ -849,6 +895,83 @@ export function taskStateLabel(state) {
  */
 export function isCancellable(state) {
   return state === 'pending' || state === 'running';
+}
+
+/**
+ * Chinese label for a task phase, falling back to the raw value.
+ * @param {string} phase - engine phase.
+ * @returns {string} label.
+ */
+export function taskPhaseLabel(phase) {
+  if (typeof phase !== 'string' || phase === '') return '—';
+  return TASK_PHASE_LABELS[phase] ?? phase;
+}
+
+/**
+ * Whether a task is currently waiting for a per-call permission decision.
+ *
+ * Read from the task's own permission block when it is present and from the phase
+ * otherwise (an older host reports only the phase). It is a WAIT, not a failure and
+ * not an execution result, which is what the panel has to say.
+ * @param {object} task - task view.
+ * @returns {boolean} true when a decision is outstanding.
+ */
+export function isAwaitingPermission(task) {
+  if (task?.permission?.waiting === true) return true;
+  return task?.phase === 'awaiting-permission';
+}
+
+/**
+ * The pending per-call permission request of one task, or `null`.
+ * @param {object} task - task view.
+ * @returns {object | null} the pending request.
+ */
+export function pendingPermission(task) {
+  const pending = task?.permission?.pending ?? null;
+  return pending !== null && typeof pending === 'object' ? pending : null;
+}
+
+/**
+ * One-line, plain-Chinese summary of what a task's permission state means.
+ *
+ * It never says "已批准" for a task, because a decision covers one call and not the
+ * task: an `allow-once` is reported as "仅本次调用可继续", and a rejection as "该调用
+ * 被拒绝", with the task itself still running.
+ * @param {object} task - task view.
+ * @returns {{ waiting: boolean, label: string, note: string, detail: string }} summary.
+ */
+export function permissionSummary(task) {
+  const permission = task?.permission ?? null;
+  const waiting = isAwaitingPermission(task);
+  if (waiting) {
+    const pending = pendingPermission(task);
+    const tool = pending?.toolName ?? '未知工具';
+    const access = pending?.requestedAccess?.mode;
+    return {
+      waiting: true,
+      label: '等待本次调用授权决定',
+      note: access === null || access === undefined
+        ? `工作进程暂停在 ${tool} 这一次调用上，等待本机指挥官决定。任务仍在运行，未失败，也未完成。`
+        : `工作进程暂停在 ${tool} 这一次调用上，请求把该次调用的沙箱权限提升到 ${access}，等待本机指挥官决定。`
+          + '无论是否允许，会话的常规权限（workspace-write）保持不变。',
+      detail: `请求编号 ${pending?.requestId ?? '—'} · 调用 ${pending?.callId ?? '—'}`,
+    };
+  }
+  if (permission === null || permission === undefined) {
+    return { waiting: false, label: '未使用逐次授权桥', note: '本次任务未挂载逐次授权桥：工作进程的提权请求会被直接拒绝，不会等待。', detail: '' };
+  }
+  const evidence = Array.isArray(permission.evidence) ? permission.evidence : [];
+  if (evidence.length === 0) {
+    return { waiting: false, label: '本次任务尚无授权请求', note: '暂无。请求出现时，该次调用会暂停，并在这里显示。', detail: '' };
+  }
+  const last = evidence[evidence.length - 1];
+  const outcome = PERMISSION_OUTCOME_LABELS[last?.outcome] ?? last?.outcome ?? '未知结果';
+  return {
+    waiting: false,
+    label: '最近一次决定',
+    note: `最近一次调用授权请求：${outcome}。该决定只对那一次调用有效，不构成常规权限，也不会被后续调用复用。`,
+    detail: `请求编号 ${last?.requestId ?? '—'}（共 ${evidence.length} 条记录）`,
+  };
 }
 
 /**

@@ -37,6 +37,7 @@ import {
   fakeSessionController,
   fakeWorkspaceController,
   makeTempDir,
+  nativePolicyServices,
   validSettings,
 } from './helpers/fakes.js';
 
@@ -197,6 +198,9 @@ function controllerPair(handle, options = {}) {
  *
  * The session controller is given the agent registry's own turn plan: a placed run
  * drives the resolved Agent, so that is where the scripted reply has to exist.
+ * The two native policy services are published as well: every worker run the
+ * plugin starts is a delegated run, and it fails closed before its prompt unless
+ * `ctx.sandboxPolicy` and `ctx.approval` can resolve the policy it wrote.
  * @param {object} handle - the mount handle.
  * @param {object} agents - the fake agent registry the run will be dispatched with.
  * @param {object} [controllers] - an existing {@link controllerPair} to publish.
@@ -206,7 +210,23 @@ async function publishPair(handle, agents, controllers = null) {
   const pair = controllers ?? controllerPair(handle, { respond: agents.respondPlan ?? { text: 'ok' } });
   handle.publish('workspaceController', pair.workspaces);
   handle.publish('sessionController', pair.sessionController);
+  await publishPolicies(handle);
   return pair;
+}
+
+/**
+ * Publish the native services that own a delegated session's policy.
+ *
+ * They are the installed ones ({@link nativePolicyServices}), so a worker run in
+ * this file proves its policy through the real folds rather than through a stub.
+ * @param {object} handle - the mount handle.
+ * @returns {Promise<object>} the published services.
+ */
+async function publishPolicies(handle) {
+  const services = await nativePolicyServices();
+  handle.publish('sandboxPolicy', services.sandboxPolicy);
+  handle.publish('approval', services.approval);
+  return services;
 }
 
 /**
@@ -724,9 +744,13 @@ test('a follow-up naming an unknown task is refused, not started as a new conver
     engine.deps.runGit = fakeGit();
     const directory = await realDirectory(handle.directory, 'unknown-parent');
     await engine.deps.ensureRoutes(await handle.published.settings.read());
+    const resolvesBefore = sessionController.resolves.length;
 
-    // The task-to-conversation map is checked during admission, before a slot,
-    // worktree or Session can be created.
+    // Ownership is decided during admission, before a slot, worktree or Session can
+    // be created. An id this deployment cannot prove belongs to the caller is
+    // answered exactly like a task that never existed: one stable code and one
+    // message, with no Session or state reason attached, because naming a reason
+    // would confirm that some other task exists.
     await assert.rejects(
       () => engine.start({
         connectionId: 'local-mcp',
@@ -735,19 +759,25 @@ test('a follow-up naming an unknown task is refused, not started as a new conver
         continueFromTaskId: 'task-does-not-exist',
       }),
       (error) => {
-        assert.equal(error.code, 'JOB_CONTINUATION_REFUSED');
-        assert.equal(error.details.session, SESSION_CODES.continuationUnknown);
+        assert.equal(error.code, 'JOB_TASK_NOT_FOUND');
+        assert.equal(error.details?.session, undefined, 'an unknown parent names no Session reason');
+        assert.equal(error.details?.reason, undefined, 'an unknown parent names no diagnostic reason');
+        assert.equal(error.details?.continueFromTaskId, 'task-does-not-exist');
         return true;
       },
     );
     const refused = engine.list().find((task) => task.continueFromTaskId === 'task-does-not-exist');
     assert.ok(refused !== undefined);
     assert.equal(refused.state, 'failed', 'a refused continuation must not run as a new conversation');
-    assert.equal(refused.error.code, 'JOB_CONTINUATION_REFUSED');
-    assert.equal(refused.error.details.session, SESSION_CODES.continuationUnknown);
+    assert.equal(refused.error.code, 'JOB_TASK_NOT_FOUND');
+    assert.equal(refused.error.details.session, undefined, 'the recorded failure keeps no Session reason');
+    assert.equal(refused.error.details.reason, undefined, 'the recorded failure keeps no diagnostic reason');
+    // The id is echoed because the caller supplied it; it is the ONLY continuation
+    // fact this refusal carries, and it can never be another task's id.
     assert.equal(refused.error.details.continueFromTaskId, 'task-does-not-exist');
     assert.equal(refused.execution, null, 'the run never reached a conversation');
     assert.equal(sessionController.creates.length, 0, 'a refused continuation creates no conversation');
+    assert.equal(sessionController.resolves.length, resolvesBefore, 'and resolves no Session either');
   } finally {
     await handle.dispose();
   }

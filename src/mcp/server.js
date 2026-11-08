@@ -2,13 +2,27 @@
 //
 // Design rule taken from SPEC §10–11: an external MCP client may *exercise* an
 // authorization the operator already created, and may do nothing else. So this
-// server exposes five tools and maps each one onto one execution-plane route:
+// server exposes six tools and maps each one onto one execution-plane route:
 //
-//   delegate_status    → GET  /dsh-delegate/x/status
-//   delegate_submit    → POST /dsh-delegate/x/tasks
-//   delegate_result    → POST /dsh-delegate/x/tasks/get
-//   delegate_cancel    → POST /dsh-delegate/x/tasks/cancel
-//   delegate_preflight → POST /dsh-delegate/x/workspace/preflight
+//   delegate_status            → GET  /dsh-delegate/x/status
+//   delegate_submit            → POST /dsh-delegate/x/tasks
+//   delegate_result            → POST /dsh-delegate/x/tasks/get
+//   delegate_cancel            → POST /dsh-delegate/x/tasks/cancel
+//   delegate_permission_decide → POST /dsh-delegate/x/tasks/permission
+//   delegate_preflight         → POST /dsh-delegate/x/workspace/preflight
+//
+// `delegate_permission_decide` is the one NARROW EXCEPTION to the sentence above,
+// and it is narrow in exactly one way: it consumes an ALREADY PENDING per-call
+// permission request that a delegated worker raised, and it can answer only
+// `allow-once` or `reject` for that one exact tool call. It cannot create a
+// connection, cannot issue, widen or extend a grant, cannot change settings, the
+// switch, the provider/model or a credential, and cannot pre-approve any future
+// operation: the request is bound to one Session, one tool call id and an exact
+// fingerprint of the real arguments, and it is consumed by the decision. The
+// worker's standing sandbox mode is never changed by it. This tool is NOT part of the
+// native worker's declared tool catalog, so the worker's own model is never handed it —
+// a real tool-surface restriction, but NOT a claim that a process running as the same OS
+// user could not reach the shared local-MCP endpoint directly. See `runtime/permissions.js`.
 //
 // `delegate_preflight` is the one addition that is not an authorization at all: it
 // is a read-only measurement of a workspace, and it exists so a dispatcher can
@@ -18,11 +32,8 @@
 // gate it on the switch, so an answer is available while delegation is off.
 //
 // There is no tool that issues a connection, issues or widens a grant, changes
-// settings, or touches a credential. That is not an omission to be filled in
-// later: those actions live on the authenticated user plane, which is reachable
-// only from the operator's own browser session. A model driving this server
-// therefore cannot authorize itself, which is the property that makes exposing
-// delegation to a model defensible at all.
+// settings, or touches a credential. Those actions live on the authenticated user
+// plane, which is reachable only from the operator's own browser session.
 //
 // The connection token is read from the environment and is never placed in a
 // tool result, an error, or a log line. Every answer is bounded and is the
@@ -55,7 +66,7 @@ export const SUPPORTED_PROTOCOL_VERSIONS = Object.freeze([
 export const LATEST_PROTOCOL_VERSION = SUPPORTED_PROTOCOL_VERSIONS[0];
 
 /** Identifies this server in the handshake. */
-export const SERVER_INFO = Object.freeze({ name: 'dsh-delegate', version: '0.1.10' });
+export const SERVER_INFO = Object.freeze({ name: 'dsh-delegate', version: '1.0.0' });
 
 /** Bound on a tool result's text. A task view can be large; a model's context cannot. */
 export const MAX_TOOL_TEXT_CHARS = 20_000;
@@ -114,14 +125,31 @@ export const TOOLS = Object.freeze([
     description: 'Submit one prompt to run as a delegated task while the DSH delegation switch is enabled. '
       + 'Returns the task identity and state; '
       + 'it does not wait for the work to finish and it is not host approval. '
+      + 'workspacePath is the operator-authorized SOURCE repository or checkout the task runs against; '
+      + 'a source root may legitimately be a Git checkout or a Git worktree (subject to the usual preflight). '
+      + 'A follow-up keeps that same source path as the task it continues. '
       + 'Omit continueFromTaskId to start a NEW task conversation (always a fresh DSH session, even in a '
       + 'directory used before). Set it to the task id of the earlier delegated task this submission is a '
-      + 'follow-up to, to continue exactly that task thread (same DSH Workspace and Session); an unknown, '
-      + 'unfinished, removed or differently-pathed parent is refused rather than started as a new conversation.',
+      + 'follow-up to, to continue exactly that task thread (same DSH Workspace and Session): the plugin '
+      + 'reuses that task\u2019s recorded execution checkout and DSH Session internally, taking no execution '
+      + 'location from '
+      + 'the caller. An unknown, unfinished, removed or differently-sourced parent is refused rather than '
+      + 'started as a new conversation.',
     inputSchema: Object.freeze({
       type: 'object',
       properties: {
-        workspacePath: { type: 'string', description: 'Absolute path of the authorized workspace.' },
+        workspacePath: {
+          type: 'string',
+          description: 'Absolute path of the operator-authorized SOURCE repository or checkout \u2014 the path '
+            + 'the authorization names, not a location chosen while a task runs. A source root may itself be '
+            + 'a Git checkout or a Git worktree, which is not rejected for that reason; it still goes through '
+            + 'the same preflight as any other path. '
+            + 'For a continueFromTaskId follow-up, pass the SAME source path the parent task was submitted '
+            + 'with: the plugin reuses the parent\u2019s recorded execution checkout and DSH Session internally, so do not '
+            + 'send '
+            + 'an execution.workspacePath or any other internal execution location in its place, because a '
+            + 'different source path names a different repository and the continuation is refused.',
+        },
         prompt: { type: 'string', description: 'The task to perform.' },
         overrides: {
           type: 'object',
@@ -132,8 +160,12 @@ export const TOOLS = Object.freeze([
           type: 'string',
           description: 'Task id of the earlier delegated task this submission continues. '
             + 'Use it only for a follow-up change or retry that belongs to that same task; '
-            + 'omit it for an unrelated task. The follow-up must run in that task\'s own execution path '
-            + '(its worktree when it was isolated, its checkout when it was shared).',
+            + 'omit it for an unrelated task. It names a task thread, not a directory: keep passing the '
+            + 'parent\u2019s original authorized source repository in workspacePath and do not send the parent\u2019s '
+            + 'execution location, because the plugin reuses the parent\u2019s recorded execution checkout and DSH Session '
+            + 'internally and pins the follow-up to the parent\u2019s recorded isolation; do not select a new '
+            + 'isolation override either. An unknown, still-running, removed or differently-sourced parent is '
+            + 'refused, never replaced by a new conversation.',
         },
       },
       required: ['workspacePath', 'prompt'],
@@ -169,6 +201,46 @@ export const TOOLS = Object.freeze([
     }),
   }),
   Object.freeze({
+    name: 'delegate_permission_decide',
+    title: 'Decide a paused permission request',
+    description: 'Decide ONE per-call permission request that a delegated task is waiting on. '
+      + 'A delegated worker runs in its own workspace with a standing `workspace-write` sandbox; '
+      + 'when it asks to widen access for a single tool call, that call PAUSES and the request appears '
+      + 'in delegate_result as `permission.pending` (state stays `running`, phase `awaiting-permission`). '
+      + 'Read `permission.pending.arguments`/`argumentKeys` for the exact operation and `permission.pending.reason` '
+      + 'for the asker\u2019s claim — the claim is not the operation. Answer `allow-once` to let THAT ONE call '
+      + 'proceed, or `reject` to keep it denied; the worker then continues and a later escalation asks again. '
+      + 'This cannot grant an account, a workspace or a standing policy, cannot change settings, credentials, '
+      + 'the switch, the provider/model or the isolation, and cannot approve a future call. '
+      + '`allow-once` REQUIRES the pending request\u2019s `fingerprint` and is refused when `permission.pending.'
+      + 'completeness` is not `complete` (the operation was shortened by a bound, so an allow cannot be granted '
+      + 'on it). `reject` needs neither and is therefore always available.',
+    inputSchema: Object.freeze({
+      type: 'object',
+      properties: {
+        taskId: { type: 'string', description: 'Task identity returned by delegate_submit.' },
+        requestId: { type: 'string', description: 'The pending request\u2019s `requestId`, copied from delegate_result.' },
+        decision: {
+          type: 'string',
+          enum: ['allow-once', 'reject'],
+          description: 'allow-once permits exactly the paused call; reject keeps it denied.',
+        },
+        reason: {
+          type: 'string',
+          description: 'Optional bounded note recorded with the decision. It is evidence, never a grant.',
+        },
+        fingerprint: {
+          type: 'string',
+          description: 'The pending request\u2019s `fingerprint`. REQUIRED for `allow-once`: the decision must name '
+            + 'the exact operation it grants, and an allow that omits it is refused. Optional for `reject` (a '
+            + 'refusal is safe without it); when supplied, a request whose operation no longer matches is refused.',
+        },
+      },
+      required: ['taskId', 'requestId', 'decision'],
+      additionalProperties: false,
+    }),
+  }),
+  Object.freeze({
     name: 'delegate_preflight',
     title: 'Inspect workspace before dispatch',
     description: 'Read-only preflight of one absolute workspace path: whether it is a git repository with a commit, '
@@ -198,6 +270,7 @@ const TOOL_ROUTES = Object.freeze({
   delegate_submit: 'submit',
   delegate_result: 'result',
   delegate_cancel: 'cancel',
+  delegate_permission_decide: 'permission',
   delegate_preflight: 'preflight',
 });
 
@@ -542,6 +615,23 @@ function projectWithStage(value, stage, collect) {
     if (typeof target.reviewRouteError === 'string') {
       target.reviewRouteError = boundedText(target.reviewRouteError, stage.skeletonChars ?? 400, `${prefix}reviewRouteError`, collect);
     }
+    // The settled decision trail is HISTORY; the pending request is the thing the
+    // commander must act on NOW. Under a bound the history goes first, so a running
+    // task can never keep an outstanding request invisible behind old evidence.
+    const permission = target.permission;
+    if (permission !== null && typeof permission === 'object' && Array.isArray(permission.evidence)) {
+      const keep = Math.min(permission.evidence.length, stage.permissionEvidence);
+      if (permission.evidence.length > keep) {
+        collect.push(truncationRecord(`${prefix}permission.evidence`, {
+          total: permission.evidence.length,
+          omitted: permission.evidence.length - keep,
+          detail: 'the live pending request is prioritised over settled history',
+        }));
+        // `slice(-0)` keeps EVERY entry, so the zero-keep stage would claim a drop
+        // it did not perform and then still publish the history it said it removed.
+        permission.evidence = keep === 0 ? [] : permission.evidence.slice(-keep);
+      }
+    }
   }
   if (Array.isArray(projected.tasks) && projected.tasks.length > stage.lists) {
     collect.push(truncationRecord('tasks', { total: projected.tasks.length, omitted: projected.tasks.length - stage.lists }));
@@ -591,9 +681,75 @@ function skeletonize(task, path, cap, collect) {
       out[key] = value;
     }
   }
-  out.truncation = { path, field: 'result', detail: 'only identity, state, routing, refusal and acceptance fields are shown' };
+  // The LIVE pending permission request is the one thing a commander must keep when
+  // everything else is trimmed: without its `requestId`/`fingerprint`/operation the
+  // task stays `awaiting-permission` and nothing can be decided. It gets its OWN,
+  // generous caps rather than the skeleton's per-string cap, so the identity and the
+  // operation survive, and its completeness flags are carried VERBATIM so a shortened
+  // operation can never read as complete.
+  const pending = pendingPermissionsOf(task, path, collect);
+  if (pending !== undefined) out.permission = pending;
+  out.truncation = { path, field: 'result', detail: 'only identity, state, routing, refusal, acceptance and the live pending permission request are shown' };
   collect.push(out.truncation);
   return out;
+}
+
+/**
+ * The live pending permission request of one task, bounded but never skeletal.
+ *
+ * Only `state === 'pending'` qualifies: settled evidence is history and is the first
+ * thing the bound gives up, while an outstanding request is the decision surface
+ * itself. The per-field caps are fixed and generous (identity and fingerprint are
+ * never cut; the argument blobs get their own cap), and `completeness` /
+ * `argumentsComplete` / `allowBlocked` are copied unchanged so a shortened operation
+ * cannot be presented as reviewable.
+ *
+ * Only FINAL cuts are recorded. The generic walk applies a small per-string cap to
+ * every field, and then the decision surface is restored to its real value (or its
+ * own 4000-character blob cap). A walk cut on a restored field no longer describes
+ * the output — the walk once left `truncation.fields` naming a phantom cut on a
+ * fully restored 1500-character operation — so the walk collects into a scratch list
+ * and only the cuts that survive into the published block are reported.
+ * `argumentsComplete: false` / `allowBlocked` still come from the engine, so a
+ * genuinely shortened operation can never read as complete.
+ * @param {object} task - task view.
+ * @param {string} path - JSON path prefix for truncation records.
+ * @param {object[]} collect - truncation records.
+ * @returns {object | undefined} the bounded pending block, or undefined when none.
+ */
+function pendingPermissionsOf(task, path, collect) {
+  const permission = task?.permission;
+  if (permission === null || typeof permission !== 'object') return undefined;
+  const pending = permission.pending;
+  if (pending === null || typeof pending !== 'object' || pending.state !== 'pending') return undefined;
+  const prefix = `${path}.permission.pending`;
+  // Provisional cuts, discarded: every field they touch is restored or re-cut below.
+  const scratched = [];
+  const out = { ...boundValue(pending, prefix, 512, scratched) };
+  // Restore the decision surface EXACTLY after the generic walk.
+  for (const key of ['requestId', 'taskId', 'toolName', 'callId', 'fingerprint', 'sessionId']) {
+    if (pending[key] !== undefined) out[key] = pending[key];
+  }
+  for (const key of ['state', 'completeness', 'argumentsComplete', 'allowBlocked', 'reasonSource', 'boundsApplied', 'omitted', 'requestedAccess']) {
+    if (pending[key] !== undefined) out[key] = pending[key];
+  }
+  // The two blobs get their own cap, stated when it fires. This is the only cut for
+  // them, because the capped value is what is published.
+  for (const key of ['arguments', 'reason']) {
+    if (typeof pending[key] === 'string') out[key] = boundedText(pending[key], 4000, `${prefix}.${key}`, collect);
+  }
+  // One identified: the provisional cap still applies to it, so the scratch list
+  // holds no final cut to forward. Report the exception explicitly instead of a cut,
+  // so the record explains why an unexpected field may be shorter than the original.
+  if (scratched.length > 0) {
+    collect.push({
+      path: `${path}.permission.pending`,
+      field: 'detail',
+      keptChars: 512,
+      detail: 'fields other than the decision surface are bounded to 512 characters each',
+    });
+  }
+  return { bridged: permission.bridged === true, waiting: true, pending: out };
 }
 
 /**
@@ -646,12 +802,12 @@ function boundedJson(value) {
   if (fitsBound(value)) return { text: JSON.stringify(redactDeepStrings(value), null, 2), isError: false };
 
   const stages = [
-    { executionText: TRUNCATED_FIELD_CAPS.executionTextChars, reviewText: TRUNCATED_FIELD_CAPS.reviewTextChars, lists: 50 },
-    { executionText: 400, reviewText: 400, lists: 20 },
-    { executionText: 200, reviewText: 200, lists: 5 },
-    { executionText: 120, reviewText: 120, lists: 1 },
-    { executionText: 80, reviewText: 80, lists: 1, skeletonChars: 240 },
-    { executionText: 40, reviewText: 40, lists: 1, skeletonChars: 96 },
+    { executionText: TRUNCATED_FIELD_CAPS.executionTextChars, reviewText: TRUNCATED_FIELD_CAPS.reviewTextChars, lists: 50, permissionEvidence: 8 },
+    { executionText: 400, reviewText: 400, lists: 20, permissionEvidence: 4 },
+    { executionText: 200, reviewText: 200, lists: 5, permissionEvidence: 2 },
+    { executionText: 120, reviewText: 120, lists: 1, permissionEvidence: 1 },
+    { executionText: 80, reviewText: 80, lists: 1, permissionEvidence: 0, skeletonChars: 240 },
+    { executionText: 40, reviewText: 40, lists: 1, permissionEvidence: 0, skeletonChars: 96 },
   ];
   const apply = (stage) => {
     const records = [];
@@ -867,9 +1023,20 @@ export function createMcpServer(options) {
             serverInfo: SERVER_INFO,
             instructions: 'Delegated coding on the DSH host. Submission is allowed only while the operator '
               + 'has enabled the delegation switch in the authenticated DSH settings page. '
+              + 'For delegate_submit, workspacePath is the operator-authorized SOURCE repository or checkout '
+              + '(a Git checkout or an operator-authorized Git worktree are both legitimate), not a location a '
+              + 'task execution ran in; delegate_preflight is a separate read-only inspection of a path. '
               + 'Every submission starts a new task conversation unless it passes continueFromTaskId naming the '
               + 'earlier delegated task it is a follow-up to; that explicit id is the only way to continue an '
-              + 'existing task thread.',
+              + 'existing task thread. A follow-up continues the parent\u2019s DSH Workspace and Session and reuses '
+              + 'the parent\u2019s recorded execution checkout and DSH Session internally, so it passes the parent\u2019s original '
+              + 'source path again and never substitutes an internal execution location for it. A parent that '
+              + 'is unknown, still running, removed or belongs to another source repository is refused '
+              + 'instead of starting a new conversation. A worker that needs wider access for ONE tool call '
+              + 'pauses that call and reports it as `permission.pending` in delegate_result; while it waits the '
+              + 'task stays `running` with phase `awaiting-permission`. Answer exactly one such request with '
+              + 'delegate_permission_decide (`allow-once` or `reject`). That decision covers only that call, is '
+              + 'never a standing grant, and cannot approve anything else.',
           });
         }
         case 'notifications/initialized':

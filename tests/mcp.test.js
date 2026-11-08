@@ -47,6 +47,7 @@ import {
   fakeWorkspaceController,
   llmTable,
   makeTempDir,
+  nativePolicyServices,
   validSettings,
 } from './helpers/fakes.js';
 
@@ -73,16 +74,29 @@ function fixture(options = {}) {
  * The tool-name list, sorted, asserted as an exact closed set.
  *
  * `delegate_preflight` is included deliberately: it is a read-only workspace read,
- * not a fifth control-plane verb, so it belongs in the closed set rather than
- * beside it. Anything else appearing here must be a decision, not a diff.
+ * not a control-plane verb, so it belongs in the closed set rather than beside it.
+ *
+ * `delegate_permission_decide` is the ONE narrow exception to "the external surface
+ * can only exercise an authorization": it consumes an already pending per-call
+ * permission request raised by a delegated worker and answers it `allow-once` or
+ * `reject` for that single call. It cannot create or widen a grant, cannot change
+ * settings/the switch/the provider/the isolation, and cannot pre-approve anything.
+ * Anything else appearing here must be a decision, not a diff.
  */
-const EXPECTED_TOOLS = ['delegate_cancel', 'delegate_preflight', 'delegate_result', 'delegate_status', 'delegate_submit'];
+const EXPECTED_TOOLS = [
+  'delegate_cancel',
+  'delegate_permission_decide',
+  'delegate_preflight',
+  'delegate_result',
+  'delegate_status',
+  'delegate_submit',
+];
 
 // ---------------------------------------------------------------------------
 // 1. The exposed surface cannot authorize, configure or touch credentials
 // ---------------------------------------------------------------------------
 
-test('the MCP surface exposes exactly five bounded tools and no control-plane tool', () => {
+test('the MCP surface exposes exactly six bounded tools and no control-plane tool', () => {
   assert.deepEqual(TOOLS.map((tool) => tool.name).sort(), EXPECTED_TOOLS);
   // Named explicitly so the reason is in the failure message, not only in a diff.
   for (const forbidden of ['connection', 'grant', 'settings', 'credential', 'secret', 'authorize']) {
@@ -90,6 +104,15 @@ test('the MCP surface exposes exactly five bounded tools and no control-plane to
       assert.equal(tool.name.includes(forbidden), false, `${tool.name} must not name a control-plane action`);
     }
   }
+  // The one tool whose job is to answer a question must be readable as exactly
+  // that: it decides a PENDING PER-CALL request, and its schema accepts nothing
+  // that could widen anything (no mode, no policy, no isolation, no grant).
+  const decide = TOOLS.find((tool) => tool.name === 'delegate_permission_decide');
+  assert.ok(decide !== undefined);
+  assert.deepEqual(Object.keys(decide.inputSchema.properties).sort(), ['decision', 'fingerprint', 'reason', 'requestId', 'taskId']);
+  assert.deepEqual(decide.inputSchema.properties.decision.enum, ['allow-once', 'reject']);
+  assert.deepEqual(decide.inputSchema.required, ['taskId', 'requestId', 'decision']);
+  assert.equal(decide.inputSchema.additionalProperties, false);
 });
 
 test('no tool argument can carry a connection token, a credential value or a settings document', () => {
@@ -111,6 +134,11 @@ test('each tool reaches exactly its own execution-plane route', async () => {
       { workspacePath: 'C:\\w', prompt: 'go' }],
     ['delegate_result', { taskId: 't1' }, 'result', { taskId: 't1' }],
     ['delegate_cancel', { taskId: 't1' }, 'cancel', { taskId: 't1' }],
+    ['delegate_permission_decide', { taskId: 't1', requestId: 'permission-t1-1', decision: 'allow-once' }, 'permission',
+      { taskId: 't1', requestId: 'permission-t1-1', decision: 'allow-once' }],
+    ['delegate_permission_decide', { taskId: 't1', requestId: 'permission-t1-1', decision: 'reject', reason: 'no',
+      fingerprint: 'sha256:abc' }, 'permission',
+    { taskId: 't1', requestId: 'permission-t1-1', decision: 'reject', reason: 'no', fingerprint: 'sha256:abc' }],
     ['delegate_preflight', { workspacePath: 'C:\\w' }, 'preflight', { workspacePath: 'C:\\w' }],
     ['delegate_preflight', { workspacePath: 'C:\\w', allowShared: true }, 'preflight',
       { workspacePath: 'C:\\w', allowShared: true }],
@@ -689,7 +717,9 @@ test('the stdio loop answers one message per line and survives a malformed line'
   assert.equal(lines.length, 3);
   assert.equal(lines[0].result.serverInfo.name, 'dsh-delegate');
   assert.equal(lines[1].error.code, RPC_ERRORS.parse);
-  assert.equal(lines[2].result.tools.length, 5);
+  // The catalog over the wire is the same closed set the module exports: nothing
+  // is filtered out of `tools/list` and nothing is added to it.
+  assert.deepEqual(lines[2].result.tools.map((tool) => tool.name).sort(), EXPECTED_TOOLS);
 });
 
 /**
@@ -874,6 +904,7 @@ async function executionPlaneFixture(options = {}) {
       return found;
     };
   }
+  const nativePolicyServicesValue = await nativePolicyServices();
   const deps = {
     agents,
     agentPresets: {
@@ -891,6 +922,12 @@ async function executionPlaneFixture(options = {}) {
     // `JOB_CONVERSATION_UNAVAILABLE`, which is not what these tests measure.
     workspaces,
     sessionController,
+    // The native policy services a delegated run verifies its sandbox policy
+    // through (`ctx.sandboxPolicy` / `ctx.approval`, read per call). Built once per
+    // fixture: both fold each Session's own event log, so they hold no state this
+    // file resets. Without them every dispatch is refused with
+    // `RUN_SANDBOX_POLICY_UNAVAILABLE`, which is not what these tests measure.
+    policyServices: () => nativePolicyServicesValue,
     llm: fakeLlm({ providers: { 'relay-native': llmTable().relay } }),
     settings,
     auth,
@@ -1362,6 +1399,100 @@ test('the MCP handshake tells a model that an explicit id is the only way to con
   assert.match(answer.result.instructions, /new task conversation/i);
 });
 
+// ---------------------------------------------------------------------------
+// 7. Source-path contract: the authorized path is the source repository
+// ---------------------------------------------------------------------------
+//
+// A caller reads these strings and nothing else. Observed in a real Desktop run:
+// a follow-up was given the previous task's execution worktree as `workspacePath`
+// and was refused (`JOB_CONTINUATION_REFUSED`, another source repository), because
+// the engine binds an authorization — and a continuation — to the SOURCE
+// repository and reuses the parent's worktree internally. These tests read the
+// strings a caller actually receives (`initialize` and `tools/list` off a real
+// `createMcpServer`) and assert the property, not a fixed sentence.
+
+/** The `delegate_submit` tool as a caller receives it from `tools/list`.
+ * @param {object[]} tools - the listed catalog.
+ * @returns {object} the submit tool.
+ */
+function listedSubmit(tools) {
+  const submit = tools.find((tool) => tool.name === 'delegate_submit');
+  assert.ok(submit !== undefined, 'delegate_submit must be listed');
+  return submit;
+}
+
+test('source-path contract: the advertised workspacePath is the source repository', async () => {
+  const { server } = fixture();
+  const answer = await server.handle({ jsonrpc: '2.0', id: 1, method: 'initialize', params: {} });
+  const instructions = answer.result.instructions;
+  const listed = await server.handle({ jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} });
+  const submit = listedSubmit(listed.result.tools);
+  const { workspacePath } = submit.inputSchema.properties;
+  const continueFromTaskId = submit.inputSchema.properties.continueFromTaskId;
+
+  // 1. The path a caller sends is named as the SOURCE repository / checkout, not
+  //    merely "a workspace". Without that word, "workspace" reads as whatever
+  //    directory the previous run happened to execute in.
+  for (const [where, text] of [
+    ['delegate_submit description', submit.description],
+    ['workspacePath description', workspacePath.description],
+  ]) {
+    assert.match(text, /source\s+(repository|checkout)/iu, `${where} must name the source repository`);
+  }
+
+  // 2. The observed failure mode is stated: the INTERNAL execution location is not
+  //    the input for a follow-up, and substituting it is refused rather than
+  //    reinterpreted. This is about the continuation input, not about which
+  //    directories are legal source roots.
+  assert.match(workspacePath.description, /execution/iu,
+    'workspacePath must warn that an internal execution location is not the input');
+  assert.match(workspacePath.description, /refus/iu,
+    'workspacePath must say such a substitution is refused');
+
+  // 3. Scoping, asserted because the previous wording over-reached: a source root
+  //    may legitimately BE a Git worktree the operator authorized, so the copy must
+  //    not exclude Git worktree sources. Only the substitution of an internal
+  //    execution worktree for the parent's original source path is what fails.
+  assert.match(workspacePath.description, /git\s+worktree/iu,
+    'the copy must allow an authorized Git worktree as the source root');
+  assert.doesNotMatch(workspacePath.description, /never pass .{0,30}worktree|worktree path .{0,20}here/iu,
+    'the copy must not ban Git worktree source roots outright');
+  assert.match(submit.description, /worktree/iu, 'the tool description must address worktree sources');
+
+  // 4. A follow-up sends the SAME source path as the task it continues, and the
+  //    plugin — not the caller — recovers the tree the parent executed in.
+  assert.match(continueFromTaskId.description, /source\s+(repository|checkout)|source path/iu,
+    'continueFromTaskId must tell a follow-up which workspacePath to send');
+  assert.match(continueFromTaskId.description, /original|same/iu,
+    'continueFromTaskId must say to reuse the parent\'s original source path');
+  assert.match(continueFromTaskId.description, /reuse/iu,
+    'continueFromTaskId must say the plugin reuses the parent tree internally');
+
+  // 5. The handshake carries the same two facts, scoped to submit/continuation
+  //    rather than to every tool: `delegate_preflight` is only a read.
+  assert.match(instructions, /delegate_submit/u, 'the instructions must scope the path rule to submit');
+  assert.match(instructions, /delegate_preflight/u, 'the instructions must separate the read-only preflight');
+  assert.doesNotMatch(instructions, /on every tool/iu,
+    'the instructions must not claim every tool is bound to the authorization');
+  assert.match(instructions, /source\s+(repository|checkout)/iu, 'the instructions must name the source repository');
+  assert.match(instructions, /reuse[sd]?\b[^.]{0,90}(worktree|session)/isu,
+    'the instructions must say the parent tree or session is reused internally');
+
+  // 6. No new argument was invented to express any of this, and the closed set of
+  //    tools is untouched.
+  for (const forbidden of ['executionPath', 'worktreePath', 'sourcePath', 'executionWorkspacePath', 'isolation']) {
+    assert.equal(forbidden in submit.inputSchema.properties, false, `delegate_submit must not accept ${forbidden}`);
+  }
+  assert.deepEqual(listed.result.tools.map((tool) => tool.name).sort(), EXPECTED_TOOLS);
+  assert.equal(submit.inputSchema.additionalProperties, false, 'the submit schema stays closed');
+
+  // 7. Still fail-closed in what it promises: omitting the id is a NEW
+  //    conversation, and an unusable parent is refused, never replaced.
+  assert.match(submit.description, /NEW task conversation/i);
+  assert.match(instructions, /refused/iu);
+  assert.match(continueFromTaskId.description, /refused/iu);
+});
+
 
 test('the execution plane forwards continueFromTaskId and refuses an unusable one', async () => {
   // The HTTP half of the rule: the plane is a pass-through for the continuation
@@ -1400,7 +1531,10 @@ test('the execution plane forwards continueFromTaskId and refuses an unusable on
     await plane.engine.tasks.get(rootTaskId).settled;
 
     // A continuation of a task this deployment does not know fails closed during
-    // admission, before a worker Session can be created.
+    // admission, before a worker Session can be created. An id the plane cannot
+    // prove belongs to this connection is answered as "no such task", the same
+    // answer a task that never existed gets: one stable code, one message, and no
+    // Session or state reason that would confirm some other task exists.
     const unknown = await dispatch(plane.handler, `${origin}${EXECUTION_PREFIX}/tasks`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
@@ -1410,22 +1544,22 @@ test('the execution plane forwards continueFromTaskId and refuses an unusable on
         continueFromTaskId: 'task-does-not-exist',
       }),
     });
-    assert.equal(unknown.status, 409, 'an unusable parent is refused before a run is admitted');
+    assert.equal(unknown.status, 404, 'an unknown parent is answered as a missing task');
     const unknownResponse = await unknown.json();
-    assert.equal(unknownResponse.error.code, 'JOB_CONTINUATION_REFUSED');
+    assert.equal(unknownResponse.error.code, 'JOB_TASK_NOT_FOUND');
+    assert.equal(unknownResponse.error.details?.session, undefined, 'no Session reason is disclosed');
+    assert.equal(unknownResponse.error.details?.reason, undefined, 'no diagnostic reason is disclosed');
     const unknownTask = [...plane.engine.tasks.values()].find((task) => task.prompt === 'continue something unknown');
     assert.ok(unknownTask, 'the refused submission remains visible in task history');
     await unknownTask.settled;
     const settledUnknown = plane.engine.get(unknownTask.taskId);
     assert.equal(settledUnknown.state, TASK_STATES.failed);
-    assert.equal(settledUnknown.error.code, 'JOB_CONTINUATION_REFUSED');
-    // This fixture is constructed without a session identity store, so the stated
-    // reason is that the deployment keeps no continuation identity at all; either
-    // way the run is refused rather than started as a new conversation.
-    assert.ok(
-      ['SESSION_CONTINUATION_UNKNOWN', 'SESSION_CONTINUATION_UNAVAILABLE'].includes(settledUnknown.error.details.session),
-      `unexpected placement reason ${settledUnknown.error.details.session}`,
-    );
+    assert.equal(settledUnknown.error.code, 'JOB_TASK_NOT_FOUND');
+    // The refusal is indistinguishable from "never existed": it carries the id the
+    // caller itself supplied and nothing about a Session, a state or a placement.
+    assert.equal(settledUnknown.error.details.session, undefined, 'the failure keeps no Session reason');
+    assert.equal(settledUnknown.error.details.reason, undefined, 'the failure keeps no diagnostic reason');
+    assert.equal(settledUnknown.error.details.continueFromTaskId, 'task-does-not-exist');
     assert.equal(settledUnknown.execution, null, 'no conversation was started in its place');
   } finally {
     await plane.close();

@@ -39,6 +39,13 @@ export function createExecutionHandler(deps) {
     ['GET /tasks', listTasks],
     ['POST /tasks/get', getTask],
     ['POST /tasks/cancel', cancelTask],
+    // The one per-call permission decision a commander may take. It is NOT a
+    // control-plane write: it consumes an already pending native approval request
+    // that this task's own worker raised, cannot create or widen any grant, cannot
+    // change settings/credentials/the switch, and cannot approve a future call.
+    // The switch gate below applies to it exactly as it does to a submission,
+    // because a decision is an authorization exercise like any other.
+    ['POST /tasks/permission', decidePermission],
     // Read-only workspace inspection for a dispatcher: the facts and the isolation
     // recommendation that used to be discovered only when a job admitted. It is a
     // separate route — not a field on `/tasks` — because it neither authorizes nor
@@ -85,7 +92,12 @@ export function createExecutionHandler(deps) {
 
       let connection;
       if (deps.engine.authorizationMode === 'switch') {
-        if (key === 'POST /tasks' && deps.engine.posture().authorized !== true) {
+        // Both AUTHORIZING verbs need the switch: a submission creates work and a
+        // decision releases a paused call. Reads, cancel and preflight stay
+        // answerable while the switch is off, so an operator can always observe and
+        // stop what already exists.
+        const gated = key === 'POST /tasks' || key === 'POST /tasks/permission';
+        if (gated && deps.engine.posture().authorized !== true) {
           sendJson(res, 403, {
             ok: false,
             error: { code: 'DELEGATION_DISABLED', message: 'delegation is disabled in DSH settings' },
@@ -215,6 +227,51 @@ async function cancelTask({ req, res, connection, deps }) {
   }
   const task = await deps.engine.cancel(body.taskId, 'connection');
   sendJson(res, 200, { ok: true, task });
+}
+
+/**
+ * Decide one pending per-call permission request of one task.
+ *
+ * The connection identity comes from authentication, never from the body, and it
+ * is the same identity that owns the task: the engine reports a task of another
+ * connection — and an unknown one — as `JOB_TASK_NOT_FOUND`, one answer with one
+ * set of details, so a decision call cannot be used to learn which task ids or
+ * pending requests exist elsewhere.
+ *
+ * The body is validated here (not only in the MCP server) because this route is
+ * reachable by any local caller: an unknown field, a decision outside the closed
+ * vocabulary, or a reason that is not a string is refused before the engine reads
+ * anything.
+ * @param {object} context - `req`, `res`, `connection`, `deps`.
+ * @returns {Promise<void>} resolves after the answer is sent.
+ */
+async function decidePermission({ req, res, connection, deps }) {
+  const body = await readJsonBody(req);
+  if (typeof body.taskId !== 'string' || body.taskId.trim() === '') {
+    throw new HttpError(400, 'TASK_ID_REQUIRED', 'taskId is required');
+  }
+  if (typeof body.requestId !== 'string' || body.requestId.trim() === '') {
+    throw new HttpError(400, 'PERMISSION_REQUEST_ID_REQUIRED', 'requestId is required');
+  }
+  if (body.decision !== 'allow-once' && body.decision !== 'reject') {
+    throw new HttpError(400, 'PERMISSION_DECISION_INVALID', 'decision must be allow-once or reject');
+  }
+  if (body.reason !== undefined && body.reason !== null && typeof body.reason !== 'string') {
+    throw new HttpError(400, 'PERMISSION_REASON_INVALID', 'reason must be a string when present');
+  }
+  if (body.fingerprint !== undefined && body.fingerprint !== null && typeof body.fingerprint !== 'string') {
+    throw new HttpError(400, 'PERMISSION_FINGERPRINT_INVALID', 'fingerprint must be a string when present');
+  }
+  const result = await deps.engine.decidePermission({
+    // The verified connection, not `body.connectionId`: a caller cannot name an owner.
+    connectionId: connection.connectionId,
+    taskId: body.taskId,
+    requestId: body.requestId,
+    decision: body.decision,
+    ...(typeof body.reason === 'string' ? { reason: body.reason } : {}),
+    ...(typeof body.fingerprint === 'string' ? { fingerprint: body.fingerprint } : {}),
+  });
+  sendJson(res, 200, { ok: true, ...result });
 }
 
 /**

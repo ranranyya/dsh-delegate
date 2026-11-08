@@ -12,6 +12,32 @@ revoke-all routes. The execution plane is registered only on loopback. While the
 switch is ON, any local process that can reach that port may submit a task, so
 this setting is not per-process authentication or a same-user security boundary.
 
+## The one exception: `POST /tasks/permission`
+
+`delegate_permission_decide` reaches `POST /dsh-delegate/x/tasks/permission`. It is
+the single external verb that answers rather than requests, and it is bounded to
+what is already pending:
+
+- it is gated by the switch exactly like a submission (a decision is an
+  authorization exercise), and it is refused with `DELEGATION_DISABLED` while the
+  switch is OFF;
+- its identity is the authenticated connection (`local-mcp` on the switch path, a
+  verified connection on the grant path), never a `connectionId` in the body;
+- it can only settle the caller's OWN task's outstanding request. A task of
+  another connection — and an unknown task id — is answered with the same
+  `JOB_TASK_NOT_FOUND` and the same details, so the route cannot be used to learn
+  which task ids or pending requests exist elsewhere;
+- the engine re-checks `posture()` and the task's own live authorization at the
+  decision, so a switch turned off or a revoked grant between the ask and the
+  answer refuses the decision instead of applying it;
+- the outcome is `allow-once` (that one native tool call resumes) or `reject`.
+  It creates no grant, widens no grant, changes no setting, and is not reusable.
+
+What it does NOT add: a token, a signature, a new identity, or a per-process
+boundary. This route is exactly as protected as the rest of the switch-mode plane
+(loopback fence plus the shared local identity), and that is stated honestly rather
+than dressed up as process authentication.
+
 The remaining notes document the grant registry retained for compatibility and
 its isolated grant-mode tests. They are not the current product authorization
 contract.

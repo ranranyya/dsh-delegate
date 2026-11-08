@@ -62,6 +62,10 @@ const ROUTES = Object.freeze({
   submit: Object.freeze({ method: 'POST', path: '/tasks' }),
   result: Object.freeze({ method: 'POST', path: '/tasks/get' }),
   cancel: Object.freeze({ method: 'POST', path: '/tasks/cancel' }),
+  // The one per-call permission decision. Spelled out like every other route: the
+  // plane registers exactly this path, and a name-to-path guess would 404 with
+  // `EXECUTION_ROUTE_UNKNOWN` on the one call that unblocks a paused worker.
+  permission: Object.freeze({ method: 'POST', path: '/tasks/permission' }),
   // Read-only workspace facts. Registered on the execution plane beside `/status`
   // so it answers with the switch off; it creates nothing to clean up.
   preflight: Object.freeze({ method: 'POST', path: '/workspace/preflight' }),

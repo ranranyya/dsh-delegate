@@ -29,6 +29,7 @@ import {
   fakeWorkspaceController,
   llmTable,
   makeTempDir,
+  nativePolicyServices,
   validSettings,
 } from './helpers/fakes.js';
 
@@ -161,6 +162,10 @@ async function harness(options = {}) {
   const agents = options.agents ?? fakeAgents({ respond: { text: 'implemented the change' } });
   const providerRegistry = options.providerRegistry ?? fakeProviderRegistry();
   const presets = options.agentPresets ?? enginePresets();
+  // The native policy services every delegated run verifies its policy through.
+  // Built once per harness because they own no per-run state: the mode override
+  // and the approval stance are folded out of each Session's own log.
+  const defaultPolicyServices = await nativePolicyServices();
   // Placement, wired the way `src/index.js` wires it: the Workspace controller
   // and the SESSION controller are two distinct services, and the native
   // `sessions` service above is neither of them. Every worker run the engine
@@ -186,6 +191,10 @@ async function harness(options = {}) {
     sessions: { async flush() {} },
     workspaces,
     sessionController,
+    // `ctx.sandboxPolicy` and `ctx.approval`, as the entry point publishes them.
+    // Every worker run is a delegated run, and it fails closed before its prompt
+    // unless the policy it wrote resolves back through these services.
+    policyServices: () => options.policyServices ?? defaultPolicyServices,
     // The native route is not the profile id; the model table is keyed by the
     // route the harness will be asked to resolve.
     llm: fakeLlm({ providers: { 'relay-native': llmTable().relay } }),

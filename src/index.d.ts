@@ -106,6 +106,97 @@ export interface DelegateRouteOptions {
 }
 
 /**
+ * One pending per-call permission request, as the task view publishes it.
+ *
+ * Every field is redacted at construction time: `arguments` is a bounded JSON
+ * rendering whose string values have passed through the plugin's own redaction,
+ * and `reason` is the WORKER's own claim about why it asks — never the operation
+ * being decided.
+ */
+export interface DelegatePendingPermission {
+  /** Non-reusable identity of this request. */
+  requestId: string;
+  taskId: string;
+  sessionId: string | null;
+  /** The tool whose call is paused. */
+  toolName: string;
+  /** The exact native tool-call id the decision is bound to. */
+  callId: string;
+  turn: number | null;
+  step: number | null;
+  tool: { name: string; callId: string };
+  /** `pending` while the call waits; a settled request leaves the pending slot. */
+  state: 'pending' | 'decided' | 'expired' | 'cancelled' | 'unavailable';
+  /** The worker's own one-line justification. Evidence, not the operation. */
+  reason: string | null;
+  reasonSource: 'asker-claim';
+  /** The access the REAL arguments ask for. */
+  requestedAccess: { kind: string; mode: string | null };
+  argumentKeys: string[];
+  /** Redacted, bounded JSON of the real tool arguments. */
+  arguments: string | null;
+  argumentsRedacted: true;
+  /**
+   * Whether the published operation is the WHOLE operation. An `allow-once`
+   * decision is refused when this is not `complete`, because an allow must not grant
+   * a call whose executable material (a command tail, a write body) was cut by a
+   * bound. `reject` is unaffected.
+   */
+  completeness: 'complete' | 'truncated' | 'unbounded';
+  argumentsComplete: boolean;
+  /** Which bounds fired, e.g. `value`, `key`, `depth`, `item`. */
+  boundsApplied: string[];
+  omitted: { valueChars: number; keys: number; depth: number; items: number };
+  /** Why an `allow-once` would be refused, or `null` when an allow is decidable. */
+  allowBlocked: string | null;
+  /** Exact fingerprint of the real arguments; REQUIRED by `allow-once`. */
+  fingerprint: string;
+  createdAt: number;
+  /** Fixed bound: the wait never outlives this (default 10 minutes). */
+  deadlineAt: number;
+  decision: 'allow-once' | 'reject' | null;
+  decidedAt: number | null;
+  decidedBy: 'commander' | 'deadline' | 'asker' | 'stop' | 'binding' | 'restart' | null;
+  decisionReason: string | null;
+  /** Closed native outcome: `allowed-once` is the only grant. */
+  outcome: 'allowed-once' | 'rejected' | 'cancelled' | 'unavailable' | null;
+  /** Present only for an `allowed-once`: which checks the grant actually passed. */
+  verified?: {
+    fingerprintQuoted: boolean;
+    argumentsComplete: boolean;
+    callReread: boolean;
+    turnOpen: boolean;
+    boundsApplied: string[];
+  } | null;
+  /** Present only for an `allowed-once`; states that it covers one call. */
+  grant: { kind: 'allowed-once'; appliesTo: 'this-call-only'; callId: string; reusable: false } | null;
+  /** Always true: a decision never changes the Session's standing mode. */
+  standingModeUnchanged: true;
+}
+
+/** The per-call permission block every task view carries. */
+export interface DelegateTaskPermission {
+  /** Whether this run was offered a bridge at all. */
+  bridged: boolean;
+  /** Whether a request is outstanding right now. */
+  waiting: boolean;
+  pending: DelegatePendingPermission | null;
+  /** Bounded settled trail, oldest first. */
+  evidence: DelegatePendingPermission[];
+  /** Time the run spent waiting, which was NOT charged to the execution budget. */
+  pausedExecutionMs: number;
+  /** The standing sandbox mode, which no decision changes. */
+  standingSandboxMode: 'workspace-write';
+  /** Stated so no reader can mistake a decision for a standing grant. */
+  grantScope: 'single-call';
+  /**
+   * Present in a STORED record only: the process stopped while this request was
+   * pending, so it was rewritten as history and can never be decided or replayed.
+   */
+  interrupted?: true;
+}
+
+/**
  * Mount the delegation service.
  *
  * After this resolves the plugin holds no grant, owns no agent, and refuses to

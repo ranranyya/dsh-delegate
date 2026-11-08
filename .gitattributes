@@ -1,0 +1,4 @@
+# Agent ownership and migration fixtures depend on the exact shipped bytes.
+# Preserve their line endings across clones instead of applying core.autocrlf.
+codex/dsh-delegate.toml -text whitespace=cr-at-eol
+tests/fixtures/*.toml -text whitespace=cr-at-eol
