@@ -11,6 +11,10 @@ coverage/
 .tmp-*
 scratch-*.mjs
 *.tgz
+# Local worker delivery reports for a delegated task. Written into the execution
+# checkout so the coordinator can read the full report (the native aggregate
+# result text is truncated); never part of the package or the history.
+.silent-wait-delivery.txt
 .env
 .env.*
 !.env.example

@@ -25,6 +25,19 @@ import { preflightWorkspace } from '../workspace/preflight.js';
 export const EXECUTION_PREFIX = '/dsh-delegate/x';
 
 /**
+ * Upper bound on one observation request, in milliseconds.
+ *
+ * A caller may ask for less, never for more. The bound exists so one HTTP request
+ * is always answerable: a connection that has gone away cannot pin a handler open
+ * for an unbounded time, and a long host-side wait is composed out of these
+ * bounded observations rather than being one unbounded request.
+ */
+export const MAX_OBSERVE_WAIT_MS = 25_000;
+
+/** Body fields `POST /tasks/observe` accepts. Everything else is refused. */
+const OBSERVE_FIELDS = Object.freeze(['taskId', 'waitMs']);
+
+/**
  * Build a node-style handler for the execution plane.
  *
  * Routing is exact-match on method plus path, so an unmatched path is a 404 and
@@ -39,6 +52,11 @@ export function createExecutionHandler(deps) {
     ['GET /tasks', listTasks],
     ['POST /tasks/get', getTask],
     ['POST /tasks/cancel', cancelTask],
+    // A bounded long-poll read. It creates, settles and authorizes nothing: it
+    // reports what a task looks like now, or returns when something about it that a
+    // host must act on changes. Read availability follows `/tasks/get` exactly, so
+    // it stays answerable while the switch is off.
+    ['POST /tasks/observe', observeTask],
     // The one per-call permission decision a commander may take. It is NOT a
     // control-plane write: it consumes an already pending native approval request
     // that this task's own worker raised, cannot create or widen any grant, cannot
@@ -60,7 +78,6 @@ export function createExecutionHandler(deps) {
         sendJson(res, fence.status, { ok: false, error: { code: fence.code, message: 'request refused by the transport fence' } });
         return;
       }
-
       const bind = deps.getBindHost?.();
       if (bind !== undefined && bind !== '127.0.0.1') {
         // A non-loopback bind invalidates the only locality evidence this plane
@@ -123,7 +140,7 @@ export function createExecutionHandler(deps) {
     } catch (error) {
       const mapped = classifyError(error);
       deps.logger?.warn?.('dsh-delegate: execution plane refusal', mapped.code);
-      if (res.headersSent !== true) {
+      if (res.headersSent !== true && isWritable(res)) {
         sendJson(res, mapped.status, {
           ok: false,
           error: { code: mapped.code, message: mapped.message, details: mapped.details },
@@ -131,6 +148,26 @@ export function createExecutionHandler(deps) {
       }
     }
   };
+}
+
+/**
+ * Whether a response can still be written to.
+ *
+ * A long observation can outlive its own connection: a poller that gave up closes
+ * the socket, and this plane only finds out when it tries to answer. `sendJson` on
+ * a destroyed response throws from `writeHead` with an opaque socket error, which
+ * the refusal path would then report as an internal failure of a request nobody is
+ * listening to. The check is deliberately narrow — `writableEnded`,
+ * `writableFinished` (or its property form) and a destroyed socket — and it treats
+ * an unknown response shape as writable, so it never suppresses an answer.
+ * @param {import('node:http').ServerResponse} res - response object.
+ * @returns {boolean} true when writing is still meaningful.
+ */
+function isWritable(res) {
+  if (res === null || typeof res !== 'object') return false;
+  if (res.writableEnded === true || res.writableFinished === true) return false;
+  if (res.destroyed === true || res.socket?.destroyed === true) return false;
+  return true;
 }
 
 /**
@@ -272,6 +309,120 @@ async function decidePermission({ req, res, connection, deps }) {
     ...(typeof body.fingerprint === 'string' ? { fingerprint: body.fingerprint } : {}),
   });
   sendJson(res, 200, { ok: true, ...result });
+}
+
+/**
+ * Report a bounded observation of one task of this connection.
+ *
+ * The route is a *read with a deadline*, not a write: it creates no task, consumes
+ * no grant, allocates no slot, decides no permission and changes no switch. What it
+ * adds over `/tasks/get` is that the answer may arrive later, and that it arrives
+ * as soon as the task reaches a state a host must act on — a permission request, a
+ * finished run, a failure, a cancellation — instead of forcing a client to poll.
+ *
+ * Three properties are enforced here rather than left to the MCP adapter:
+ *
+ *   1. **Ownership is proven by the same rule as `/tasks/get`**: an unknown task and
+ *      another connection's task produce one answer, so an observation cannot be
+ *      used to learn that a task id exists elsewhere.
+ *   2. **The wait is bounded** at {@link MAX_OBSERVE_WAIT_MS}, and a negative or
+ *      non-integer `waitMs` is refused rather than clamped into something the caller
+ *      did not ask for.
+ *   3. **Abandonment ends only this observer.** When the requesting connection goes
+ *      away the wait is aborted with an `AbortSignal`; the worker keeps running and
+ *      nothing about the task is changed. A normal request that has already been
+ *      fully read is NOT an abandonment: after the body is consumed, `req` emits
+ *      `close` for every request, so only a real `aborted`/stream error or a
+ *      premature response close counts.
+ * @param {object} context - `req`, `res`, `connection`, `deps`.
+ * @returns {Promise<void>} resolves after the answer is sent (or after abandonment).
+ */
+async function observeTask({ req, res, connection, deps }) {
+  const body = await readJsonBody(req);
+  for (const key of Object.keys(body)) {
+    if (!OBSERVE_FIELDS.includes(key)) {
+      throw new HttpError(400, 'OBSERVE_ARGUMENT_UNKNOWN', `tasks/observe does not accept ${JSON.stringify(key)}`);
+    }
+  }
+  if (typeof body.taskId !== 'string' || body.taskId.trim() === '') {
+    throw new HttpError(400, 'TASK_ID_REQUIRED', 'taskId is required');
+  }
+  let waitMs = MAX_OBSERVE_WAIT_MS;
+  if (body.waitMs !== undefined && body.waitMs !== null) {
+    if (!Number.isInteger(body.waitMs) || body.waitMs < 0) {
+      throw new HttpError(400, 'OBSERVE_WAIT_INVALID', 'waitMs must be a non-negative integer');
+    }
+    waitMs = Math.min(body.waitMs, MAX_OBSERVE_WAIT_MS);
+  }
+
+  const abandonment = createAbandonment(req, res);
+  try {
+    const observation = await deps.engine.observeTask(body.taskId, {
+      // The verified connection, never a body field: a caller cannot name an owner.
+      connectionId: connection.connectionId,
+      waitMs,
+      signal: abandonment.signal,
+    });
+    // The reader left while the engine was settling: there is nothing to answer,
+    // and writing to a closed response would only throw into the refusal path.
+    if (abandonment.abandoned() || !isWritable(res)) return;
+    sendJson(res, 200, { ok: true, ...observation });
+  } finally {
+    abandonment.dispose();
+  }
+}
+
+/**
+ * Watch one request/response pair for a real, premature disconnect.
+ *
+ * A node `IncomingMessage` emits `close` after the body has been consumed on every
+ * request, including a perfectly normal one whose handler is still working. So
+ * `close` on the request is only treated as abandonment while the body has NOT been
+ * fully read; once it has, the only evidence of abandonment is `aborted` on the
+ * request, an error on its stream, or the response being closed before it finished.
+ *
+ * Every listener registered here is removed by {@link dispose}, so a completed
+ * observation leaves no accumulating listeners behind on a request object the
+ * caller may keep.
+ * @param {import('node:http').IncomingMessage} req - request.
+ * @param {import('node:http').ServerResponse} res - response.
+ * @returns {{ signal: AbortSignal, abandoned: () => boolean, dispose: () => void }} watcher.
+ */
+function createAbandonment(req, res) {
+  const controller = new AbortController();
+  let gone = false;
+  const mark = (reason) => {
+    if (gone) return;
+    gone = true;
+    controller.abort(Object.assign(new Error(reason), { name: 'AbortError', code: reason }));
+  };
+  const onRequestAborted = () => mark('OBSERVE_CLIENT_ABORTED');
+  const onRequestError = () => mark('OBSERVE_CLIENT_ABORTED');
+  const onRequestClose = () => {
+    // `readableEnded` is the fact that separates "the body was consumed" from "the
+    // caller vanished mid-wait". Without this distinction every normal request
+    // would abort its own observation the moment the body finished.
+    if (req.readableEnded !== true) mark('OBSERVE_CLIENT_ABORTED');
+  };
+  const onResponseClose = () => {
+    // A response is closed only after it finished, or because the socket died.
+    if (res.writableFinished !== true) mark('OBSERVE_CLIENT_ABORTED');
+  };
+  req.once?.('aborted', onRequestAborted);
+  req.once?.('error', onRequestError);
+  req.once?.('close', onRequestClose);
+  res.once?.('close', onResponseClose);
+
+  return {
+    signal: controller.signal,
+    abandoned: () => gone,
+    dispose() {
+      req.off?.('aborted', onRequestAborted);
+      req.off?.('error', onRequestError);
+      req.off?.('close', onRequestClose);
+      res.off?.('close', onResponseClose);
+    },
+  };
 }
 
 /**

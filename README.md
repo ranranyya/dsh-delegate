@@ -6,9 +6,10 @@ DeepSeek Harness（DSH）的委托插件：让 MCP 宿主在你开启本机总�
 新安装时本机调用总开关默认关闭。开关状态会保存在插件设置中，重启后恢复保存值；
 关闭时拒绝新的委派任务，并请求停止正在运行的任务。
 
-> **发布状态：`1.0.0` 正式版。** 源码仓库和可下载的 Release 位于
-> [GitHub](https://github.com/ranranyya/dsh-delegate)。npm 尚未作为安装渠道发布；
-> GitHub Release 附带的 `.tgz` 是推荐的安装包。
+> **发布状态：`1.1.0` 候选版本（静默等待与集中审查）。** 源码仓库和可下载的 Release
+> 位于 [GitHub](https://github.com/ranranyya/dsh-delegate)。npm 尚未作为安装渠道发布；
+> GitHub Release 附带的 `.tgz` 是推荐的安装包。`1.1.0` 的静默等待说明见
+> [`docs/silent-wait.md`](./docs/silent-wait.md)。
 
 ---
 
@@ -39,7 +40,7 @@ Desktop 侧的包操作只能交给应用完成——不要在 Desktop 的正式
 
    ```bash
    npm pack
-   #    → dsh-delegate-1.0.0.tgz
+   #    → dsh-delegate-1.1.0.tgz
    ```
 
 2. 打开 Desktop 的 **Plugins manager**，用它的 add-plugin（添加插件）入口选择上一步生成的
@@ -54,7 +55,7 @@ Desktop 侧的包操作只能交给应用完成——不要在 Desktop 的正式
 
 ```bash
 # 装进一个 profile（例：web）
-dsh plugin --profile web add ./dsh-delegate-1.0.0.tgz && dsh plugin --profile web why dsh-delegate
+dsh plugin --profile web add ./dsh-delegate-1.1.0.tgz && dsh plugin --profile web why dsh-delegate
 
 # 启动（首次启动会自动把插件 bundle 追加到 dsh.profile.bundles）
 dsh --profile web
@@ -67,7 +68,7 @@ dsh --profile web
 ### 说明与注意
 
 - **不要装进你正在用的正式 profile 做试验。** 建议先用一次性 profile：
-  `dsh plugin --profile dsh-delegate-try add ./dsh-delegate-1.0.0.tgz`，再把
+  `dsh plugin --profile dsh-delegate-try add ./dsh-delegate-1.1.0.tgz`，再把
   `DSH_HOME` 指向临时目录做隔离验证。该命令同样只用于 CLI profile。
 - 该包声明了 `@deepseek-ai/dsh-*` 的 peer，若你的包管理器默认自动安装 peer，
   安装过程会尝试解析这些版本。可显式关闭：`npm_config_auto_install_peers=false`
@@ -375,6 +376,38 @@ worker 请求把**某一次调用**的沙箱权限提升时，那次调用会暂
 
 细节与原生 API 依据见 `docs/worker-permissions.md`。
 
+## 7.3 静默等待与集中审查（1.1.0）
+
+正常推进的任务**不再**需要派工方一遍遍读结果。默认 5 分钟安静后，插件在本机做一次
+**只读自检**；10 分钟仍然安静，才把 `attention` 报告给派工方。真实推进（模型输出、推理、
+工具调用与结果）只会**重置**计时，属于内部事实，不会叫醒任何人。
+
+- 只读自检：看执行器是否还在、当前阶段、有没有待决定的调用、正在跑哪个工具。
+  **不调用任何大模型**，不读代码差异，不改任务状态、不动时限。
+- 安静不等于失败，单个工具跑得久也不等于失败；插件不会因为时长而判失败、取消或重启。
+- 连接心跳、结果轮询、页面刷新都不算进展；否则真正卡住的执行器会永远"看起来在动"。
+- 提醒有冷却：同一次静默里到点报一次，之后要再过同样的间隔才会再报。
+- 间隔是全局设置（`monitoring.selfCheckSeconds` / `monitoring.attentionSeconds`，存成整秒），
+  项目覆盖和单任务覆盖都不能改它。设置页在「执行设置」里的**进阶：静默监控间隔**卡片，
+  以分钟呈现、按秒保存，也可以点页面底部的「保存设置」一起保存。
+- 修改只影响**之后新提交**的任务；运行中的任务保留它开始时冻结的那份间隔快照。
+- 任务记录页在有进行中任务、且页面可见时每 5 秒只读刷新一次；终端状态的任务不会触发刷新。
+  详情里显示阶段、最近进展、当前工具与其耗时、无进展诊断；旧版本写的记录会如实显示
+  “未采集到”，不会编造空闲时间。
+
+Codex 子智能体现在按「提交 → `delegate_wait` 同一任务」运作：`heartbeat` 是内部心跳，
+不会送到模型；`attention` 是提问、默认继续等；`permission` 审查这一次调用后决定再继续等；
+`ready`/`failed`/`cancelled` 只读**一次**完整证据；`interrupted`/`wait-limit` 立刻重新等待
+同一任务。托管 MCP 条目会写入 `tool_timeout_sec = 3660`，让默认 60 分钟的一次等待跑完。
+
+升级后的操作：设置页 → Codex 集成 → **安装 / 更新 Codex 集成**，然后让 Codex 重新载入
+（新开会话或重启）。
+
+完整说明见 [`docs/silent-wait.md`](./docs/silent-wait.md)。
+
+**这不是省 token 的承诺**：插件只改变"什么时候把什么告诉派工方"，不控制 Codex 自己的上下文
+与思考开销，也不做节省量的估算。
+
 ## 8. 升级 / 导出 / 卸载 / 回滚
 
 ```bash
@@ -383,7 +416,7 @@ worker 请求把**某一次调用**的沙箱权限提升时，那次调用会暂
 # 不要在 Desktop 的正式 profile 下执行下面的 CLI 命令。
 
 # CLI web profile 的升级：换成本地新包或（将来）新版本
-dsh plugin --profile web add ./dsh-delegate-1.0.0.tgz
+dsh plugin --profile web add ./dsh-delegate-1.1.0.tgz
 
 # 导出：界面里"导出非敏感配置"按钮，或用只读 API
 #   GET /api/dsh-delegate/settings
@@ -424,6 +457,12 @@ dsh plugin --profile web remove dsh-delegate
   `delegate_permission_decide` 的调用者身份就是那个共享身份。决定只会作用于**调用者自己这个
   连接名下的任务**（别人的任务按"不存在"处理，无法借此试探其他任务），但本插件**不声称**能
   对抗同一操作系统用户下的任意本地代码。桥不引入新的令牌、签名或角色标签。
+- **静默监控不是进度模型**：插件不计算完成百分比，不预测剩余时间，也不读取代码内容来判断
+  “是否在推进”。它只看执行器是否真的产生了事件。一次 `attention` 是提示，不是结论；
+  一个非常安静但确实在工作的长步骤，也可能到达提醒阈值。
+- **不承诺省多少 token**：`1.1.0` 改变的是"什么时候把什么告诉派工方"。Codex 自己的上下文、
+  思考与工具往返开销不由本插件控制，本插件也不做节省量的估算或承诺。
+- **只在有人观察时运行**：没有派工方在等待时，监控不启动定时器、不消耗资源，也不会提醒。
 - **逐次授权桥只决定一次调用**：`allow-once` 只对那一次原生工具调用有效，会话的常规沙箱模式
   仍是 `workspace-write`；它不能创建或扩大任何账号/工作区/会话授权，不能改设置/凭据/开关/
   提供方/模型/隔离，也不能预先批准后续调用。它是本机指挥官的决定，不是自动放行规则、不是

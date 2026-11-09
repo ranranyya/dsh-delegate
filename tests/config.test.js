@@ -674,3 +674,167 @@ test('replacing the configuration keeps a stored legacy block instead of droppin
     }
   })();
 });
+
+// ---------------------------------------------------------------------------
+// Monitoring thresholds: defaults, validation, precedence and persistence
+// ---------------------------------------------------------------------------
+
+test('a document without a monitoring block loads with the documented defaults', () => {
+  const without = validSettings();
+  assert.equal(Object.hasOwn(without, 'monitoring'), false, 'the fixture models a pre-feature document');
+  const settings = validateSettings(without);
+  assert.deepEqual(settings.monitoring, { selfCheckSeconds: 300, attentionSeconds: 600 });
+});
+
+test('monitoring accepts whole seconds inside the documented bounds', () => {
+  assert.deepEqual(
+    validateSettings({ ...validSettings(), monitoring: { selfCheckSeconds: 30, attentionSeconds: 31 } }).monitoring,
+    { selfCheckSeconds: 30, attentionSeconds: 31 },
+  );
+  assert.deepEqual(
+    validateSettings({ ...validSettings(), monitoring: { selfCheckSeconds: 3600, attentionSeconds: 7200 } }).monitoring,
+    { selfCheckSeconds: 3600, attentionSeconds: 7200 },
+  );
+  // A partial block takes the default for the missing key.
+  assert.deepEqual(
+    validateSettings({ ...validSettings(), monitoring: { selfCheckSeconds: 120 } }).monitoring,
+    { selfCheckSeconds: 120, attentionSeconds: 600 },
+  );
+});
+
+test('monitoring refuses out-of-range, non-integer and wrongly typed values', () => {
+  const cases = [
+    [{ selfCheckSeconds: 29 }, 'MONITORING_INVALID'],
+    [{ selfCheckSeconds: 3601 }, 'MONITORING_INVALID'],
+    [{ selfCheckSeconds: 300.5 }, 'MONITORING_INVALID'],
+    [{ selfCheckSeconds: '300' }, 'MONITORING_INVALID'],
+    [{ attentionSeconds: 30 }, 'MONITORING_INVALID'],
+    [{ attentionSeconds: 7201 }, 'MONITORING_INVALID'],
+    [{ attentionSeconds: null }, 'MONITORING_INVALID'],
+    [{ attentionSeconds: Number.NaN }, 'MONITORING_INVALID'],
+    [{ selfCheckSeconds: 300, attentionSeconds: 300 }, 'MONITORING_TIMING_INVALID'],
+    [{ selfCheckSeconds: 600, attentionSeconds: 300 }, 'MONITORING_TIMING_INVALID'],
+  ];
+  for (const [monitoring, code] of cases) {
+    assert.throws(
+      () => validateSettings({ ...validSettings(), monitoring }),
+      (error) => error instanceof ConfigError && error.code === code,
+      `monitoring ${JSON.stringify(monitoring)} must be refused with ${code}`,
+    );
+  }
+  // A non-object block is refused rather than coerced.
+  for (const monitoring of ['300', 300, [300, 600], true]) {
+    assert.throws(
+      () => validateSettings({ ...validSettings(), monitoring }),
+      (error) => error.code === 'MONITORING_INVALID',
+    );
+  }
+});
+
+test('monitoring refuses an unknown key instead of ignoring it', () => {
+  // A typo would otherwise silently keep the default while the operator believes
+  // they configured something, which is the one outcome a settings document must
+  // never produce.
+  assert.throws(
+    () => validateSettings({ ...validSettings(), monitoring: { atentionSeconds: 900 } }),
+    (error) => error.code === 'MONITORING_INVALID' && error.details.field === 'monitoring.atentionSeconds',
+  );
+});
+
+test('public settings, export and effective snapshots all carry monitoring', () => {
+  const settings = validateSettings({ ...validSettings(), monitoring: { selfCheckSeconds: 120, attentionSeconds: 240 } });
+  assert.deepEqual(publicSettings(settings).monitoring, { selfCheckSeconds: 120, attentionSeconds: 240 });
+  assert.deepEqual(exportSettings(settings).monitoring, { selfCheckSeconds: 120, attentionSeconds: 240 });
+  const effective = resolveEffectiveConfig(settings, { projectPath: null });
+  assert.deepEqual(effective.monitoring, { selfCheckSeconds: 120, attentionSeconds: 240 });
+  // Frozen like every other part of the snapshot.
+  assert.equal(Object.isFrozen(effective), true);
+  assert.equal(Object.isFrozen(effective.monitoring), true);
+});
+
+test('monitoring is global-only: no project override or per-job override can retime it', () => {
+  const settings = validateSettings({
+    ...validSettings(),
+    monitoring: { selfCheckSeconds: 300, attentionSeconds: 600 },
+    // A project override is a complete worker triple, and it deliberately has no
+    // monitoring field to give: the thresholds are deployment-wide.
+    projectOverrides: {
+      'C:\\fixtures\\repo': {
+        worker: { providerId: 'relay', model: 'deepseek-chat', reasoningEffort: 'low', timeoutSeconds: 900 },
+      },
+    },
+  });
+  const effective = resolveEffectiveConfig(settings, { projectPath: 'C:\\fixtures\\repo' });
+  assert.equal(effective.worker.timeoutSeconds, 900, 'the project override applied to its own block');
+  assert.equal(effective.worker.reasoningEffort, 'low');
+  assert.deepEqual(effective.monitoring, { selfCheckSeconds: 300, attentionSeconds: 600 },
+    'and did not touch the monitoring thresholds');
+  assert.throws(
+    () => resolveEffectiveConfig(settings, { projectPath: null, overrides: { monitoring: { selfCheckSeconds: 60 } } }),
+    (error) => error.code === 'OVERRIDE_INVALID',
+  );
+});
+
+test('an export/import round trip preserves monitoring', async () => {
+  const dir = await makeTempDir();
+  try {
+    const service = new SettingsService(dir);
+    await service.replace(validSettings());
+    await service.setMonitoring({ selfCheckSeconds: 90, attentionSeconds: 300 });
+    const exported = exportSettings(await service.read());
+    assert.deepEqual(exported.monitoring, { selfCheckSeconds: 90, attentionSeconds: 300 });
+
+    const other = new SettingsService(await makeTempDir());
+    try {
+      await other.replaceValidated(exported);
+      assert.deepEqual((await other.read()).monitoring, { selfCheckSeconds: 90, attentionSeconds: 300 });
+    } finally {
+      await cleanup(other.document.path.replace(/[\\/][^\\/]+$/, ''));
+    }
+  } finally {
+    await cleanup(dir);
+  }
+});
+
+test('setMonitoring validates before writing and persists through the serialized queue', async () => {
+  const dir = await makeTempDir();
+  try {
+    const service = new SettingsService(dir);
+    await service.replace(validSettings());
+
+    // A refused value writes nothing.
+    const before = await service.read();
+    await assert.rejects(
+      () => service.setMonitoring({ selfCheckSeconds: 600, attentionSeconds: 300 }),
+      (error) => error.code === 'MONITORING_TIMING_INVALID',
+    );
+    assert.deepEqual((await service.read()).monitoring, before.monitoring);
+
+    const committed = await service.setMonitoring({ selfCheckSeconds: 60, attentionSeconds: 120 });
+    assert.deepEqual(committed.monitoring, { selfCheckSeconds: 60, attentionSeconds: 120 });
+
+    // Reads, and a fresh service over the same directory, see it.
+    const reopened = new SettingsService(dir);
+    assert.deepEqual((await reopened.read()).monitoring, { selfCheckSeconds: 60, attentionSeconds: 120 });
+  } finally {
+    await cleanup(dir);
+  }
+});
+
+test('setMonitoring cannot lose a concurrent settings edit', async () => {
+  const dir = await makeTempDir();
+  try {
+    const service = new SettingsService(dir);
+    await service.replace(validSettings());
+    await Promise.all([
+      service.setMonitoring({ selfCheckSeconds: 60, attentionSeconds: 120 }),
+      service.setWorker({ providerId: 'relay', model: 'deepseek-reasoner', reasoningEffort: 'high', timeoutSeconds: 900 }),
+    ]);
+    const settings = await service.read();
+    assert.deepEqual(settings.monitoring, { selfCheckSeconds: 60, attentionSeconds: 120 });
+    assert.equal(settings.worker.model, 'deepseek-reasoner', 'the concurrent worker edit survived');
+    assert.equal(settings.monitoring.check === undefined, true);
+  } finally {
+    await cleanup(dir);
+  }
+});

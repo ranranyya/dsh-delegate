@@ -223,6 +223,30 @@ export const KNOWN_AGENT_TEMPLATES = [
     version: '0.1.14',
     sha256: '11379c0152f3fb2bd4da1170812e51fe68006d98f6378c720cbadcee9ee4750c',
   },
+  // The published 1.0.0 companion — the body an existing 1.0.0 installation holds
+  // when 1.1.0 starts. 1.1.0 replaced the repeat-result polling rules with
+  // `delegate_wait` and added the explicit "do not implement locally" boundary, so
+  // the instruction bytes changed and this is a DISTINCT published build that has to
+  // be enumerated: without it, every 1.0.0 installation would be reported `modified`
+  // ("somebody else's file") and the settings-page update button would refuse to
+  // refresh a file this plugin really published.
+  //
+  // The digest is the exact 1.0.0 stamped bytes as packed (CRLF, 11519 bytes),
+  // computed by hashing that shipped file rather than by normalizing anything: a
+  // version line is part of the bytes an operator's file is proved against.
+  {
+    version: '1.0.0',
+    sha256: 'a8c888afaa0a1a6a0abfcb56670ffbdb67697f07e54871ece78c8adffb15c149',
+  },
+  // The same 1.0.0 body with LF line endings. It is an exact identity, not a
+  // normalized comparison: an operator who installed from an LF checkout holds these
+  // bytes, and the installer never rewrites line endings. Normalizing would also make
+  // an edited file hash to a known value, which is the defect these digests exist to
+  // prevent.
+  {
+    version: '1.0.0',
+    sha256: 'f51831e2ff265c9ba63a4760e245787060de7bd91dcc9663a11729fb472e5f62',
+  },
 ];
 
 /** The `version = "…"` line of an agent file, at column 0. */
@@ -984,15 +1008,30 @@ export function discoveryPin(discoveryFile, env = process.env) {
 }
 
 /**
- * The exact stdio command this plugin owns in Codex.
+ * How long Codex must let ONE `delegate_wait` call run, in seconds.
+ *
+ * The default wait is 3600 s (60 minutes) and the tool caps it there, so a managed
+ * entry that left Codex's default tool timeout in place would cut a legitimate wait
+ * off at its default (60 s) and make the companion look broken on a healthy long
+ * task. 3660 s is that 3600 s plus a minute of slack for one internal observation
+ * slice, JSON overhead and clock skew — never a second wait window.
+ *
+ * This is written on THIS server's entry only. It is not a Codex-wide setting and it
+ * is never written anywhere else in the operator's config.
+ */
+export const DELEGATE_TOOL_TIMEOUT_SEC = 3660;
+
+/**
+ * The exact stdio command and timeout this plugin owns in Codex.
  * @param {object} options - `node`, `script`, `discoveryFile`, `pinDiscovery`.
- * @returns {{ command: string, args: string[], env: Record<string, string> }} command description.
+ * @returns {{ command: string, args: string[], env: Record<string, string>, toolTimeoutSec: number }} command description.
  */
 export function desiredMcpCommand({ node, script, discoveryFile = null, pinDiscovery = false }) {
   return {
     command: node,
     args: [script],
     env: pinDiscovery && discoveryFile !== null ? { DSH_DELEGATE_DISCOVERY_FILE: discoveryFile } : {},
+    toolTimeoutSec: DELEGATE_TOOL_TIMEOUT_SEC,
   };
 }
 
@@ -1074,7 +1113,9 @@ export function classifyMcpEntry(document, desired) {
   const command = readStringValue(values.command?.text);
   const args = readArrayValue(values.args?.text);
   const envKeys = Object.keys(values).filter((key) => key.startsWith('env.')).map((key) => key.slice(4));
-  const previous = { command, args, envKeys };
+  /** @type {'missing' | 'different' | null} */
+  let timeoutMismatch = null;
+  const previous = { command, args, envKeys, toolTimeoutSec: null };
   if (marker === null) {
     // Values that happen to match are still not proof the plugin wrote them; the
     // marker is the only authorship proof this format carries.
@@ -1102,6 +1143,15 @@ export function classifyMcpEntry(document, desired) {
   if (extraEnv.length > 0) {
     return { state: MCP_STATES.conflict, previous, reason: 'extra-env', ownedValues: { extraEnv }, marked: true };
   }
+  // The tool timeout is an OWNED fact. A managed entry written by an earlier release
+  // has no `tool_timeout_sec` at all, and one an operator (or a future build) changed
+  // has a different integer: both are this plugin's entry with a stale value, so they
+  // migrate in place instead of being reported as somebody else's definition. A
+  // non-integer was already refused by `describeEntryShape`.
+  const recordedTimeout = readIntegerValue(values.tool_timeout_sec?.text);
+  previous.toolTimeoutSec = recordedTimeout;
+  if (recordedTimeout === null) timeoutMismatch = 'missing';
+  else if (recordedTimeout !== desired.toolTimeoutSec) timeoutMismatch = 'different';
   if (legacyDesktopCommand && (mismatched || envMismatch || missingEnv.length > 0)) {
     return {
       state: MCP_STATES.conflict,
@@ -1111,7 +1161,7 @@ export function classifyMcpEntry(document, desired) {
       marked: true,
     };
   }
-  if (mismatched || envMismatch || missingEnv.length > 0) {
+  if (mismatched || envMismatch || missingEnv.length > 0 || timeoutMismatch !== null) {
     return { state: MCP_STATES.outdated, previous, reason: null, ownedValues: {}, marked: true };
   }
   return {
@@ -1151,10 +1201,14 @@ function describeEntryShape(values) {
   if (values.command === undefined) return 'missing-command';
   if (values.command.type !== 'string') return 'command-not-a-string';
   if (values.args !== undefined && values.args.type !== 'array') return 'args-not-an-array';
+  // `tool_timeout_sec` is an owned scalar: this plugin writes it so one
+  // `delegate_wait` call can span the default 60-minute wait. A non-integer value is
+  // not something this plugin writes, so the entry is somebody else's.
+  if (values.tool_timeout_sec !== undefined && values.tool_timeout_sec.type !== 'integer') return 'timeout-not-an-integer';
   // `env` may be a table header (`env.KEY = …`) or an inline table; both unpack to
   // `env.*` keys, so both are accepted. Anything else is a field this plugin does
   // not own and must not silently drop.
-  const allowed = new Set(['command', 'args']);
+  const allowed = new Set(['command', 'args', 'tool_timeout_sec']);
   for (const key of keys) {
     if (allowed.has(key)) continue;
     if (key.startsWith('env.')) continue;
@@ -1223,6 +1277,24 @@ function parseInlineTable(raw) {
     values[keyText] = { type: tomlValueType(rawValue), text: rawValue };
   }
   return values;
+}
+
+/**
+ * Decode a TOML integer.
+ *
+ * Only the plain decimal form this plugin writes is accepted: a hex/octal literal, a
+ * float, a quoted value or an expression is `null`, which the classifier treats as
+ * "not a value this plugin wrote" rather than as a number it can compare.
+ * @param {string | undefined} raw - raw value text.
+ * @returns {number | null} the integer, or null.
+ */
+function readIntegerValue(raw) {
+  if (typeof raw !== 'string') return null;
+  const text = raw.trim();
+  if (!/^[+-]?\d+$/u.test(text)) return null;
+  const value = Number(text);
+  if (!Number.isSafeInteger(value)) return null;
+  return value;
 }
 
 /**
@@ -1321,6 +1393,9 @@ function renderMcpBlock(desired) {
     `[${renderKey(['mcp_servers', MCP_SERVER_NAME])}]`,
     `command = ${renderString(desired.command)}`,
     `args = ${renderStringArray(desired.args)}`,
+    // One `delegate_wait` call may legitimately hold for the 60-minute default, so
+    // Codex must allow this entry to run that long. Written on THIS server only.
+    `tool_timeout_sec = ${String(desired.toolTimeoutSec)}`,
   ];
   const envKeys = Object.keys(desired.env).sort();
   for (const key of envKeys) {
@@ -1375,10 +1450,27 @@ export function applyMcpEntry(document, desired, classification) {
     const line = block.find((candidate) => candidate.startsWith(`${key} =`));
     return line === undefined ? null : line.slice(line.indexOf('=') + 1).trim();
   };
-  for (const key of ['command', 'args']) {
+  for (const key of ['command', 'args', 'tool_timeout_sec']) {
     const value = blockValue(key);
     const entry = document.assignmentAt([...serverPath, key]);
     if (entry !== undefined && value !== null && entry.raw !== value) document.replaceValue(entry, value);
+  }
+  // An entry written before this field existed has no `tool_timeout_sec` at all, so
+  // it is added inside the owned table, directly after the args line when that line
+  // is present and otherwise after the header. Never appended at the end of the
+  // document, where it could land under a different table.
+  if (document.assignmentAt([...serverPath, 'tool_timeout_sec']) === undefined) {
+    const line = `tool_timeout_sec = ${String(desired.toolTimeoutSec)}`;
+    const argsEntry = document.assignmentAt([...serverPath, 'args']);
+    if (argsEntry !== undefined) {
+      document.replaceLines(argsEntry.endLine + 1, argsEntry.endLine, [line]);
+    } else {
+      const headerIndex = document.entries.findIndex(
+        (candidate) => candidate.kind !== 'assignment' && samePath(candidate.path, serverPath),
+      );
+      const insertAt = headerIndex === -1 ? document.lines.length : document.entries[headerIndex].endLine + 1;
+      document.replaceLines(insertAt, insertAt - 1, [line]);
+    }
   }
   for (const [key, value] of Object.entries(desired.env)) {
     const entry = document.assignmentAt([...serverPath, 'env', key]);

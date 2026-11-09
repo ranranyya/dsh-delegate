@@ -32,6 +32,7 @@ import {
   KNOWN_AGENT_TEMPLATES,
   MCP_MARKER,
   MCP_SERVER_NAME,
+  applyMcpEntry,
   classifyMcpEntry,
   createFileExclusive,
   desiredMcpCommand,
@@ -58,7 +59,7 @@ import { USER_PLANE_PREFIX, wrapUserPlaneRoutes } from '../src/http/user-plane.j
 import { PREFLIGHT_ISOLATIONS, PREFLIGHT_REASONS } from '../src/workspace/preflight.js';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
-const DELIVERABLE_VERSION = '1.0.0';
+const DELIVERABLE_VERSION = '1.1.0';
 // The baseline the current release upgrades *from*, pinned rather than derived: an
 // expectation that followed `DELIVERABLE_VERSION` would assert nothing.
 const PREVIOUS_VERSION = '0.1.14';
@@ -98,6 +99,17 @@ const AGENT_0_1_12_VERSION = '0.1.12';
 const AGENT_0_1_13_FIXTURE = join(ROOT, 'tests', 'fixtures', 'codex-agent-0.1.13.toml');
 const AGENT_0_1_13_DIGEST = 'b3a1d2f0520774c0067ea733f27fd47c67c5f5ac44394d0eec2564c7959700aa';
 const AGENT_0_1_14_DIGEST = '11379c0152f3fb2bd4da1170812e51fe68006d98f6378c720cbadcee9ee4750c';
+/**
+ * The published 1.0.0 companion, as packed (CRLF).
+ *
+ * 1.1.0 replaced the repeat-result polling rules with `delegate_wait` and added the
+ * explicit "do not implement locally while a delegated worker runs" boundary, so the
+ * body changed and this is a *distinct* published build. It is reconstructed from the
+ * current template by restamping the version line, which is exactly how it was
+ * derived: 1.1.0 changed only the instruction body afterwards, so the reconstructed
+ * bytes equal the shipped 1.0.0 bytes and the pinned digest proves it.
+ */
+const AGENT_1_0_0_DIGEST = 'a8c888afaa0a1a6a0abfcb56670ffbdb67697f07e54871ece78c8adffb15c149';
 /**
  * The 0.1.13 template text, which is the body every release from 0.1.10 to 0.1.13 shipped.
  *
@@ -1289,19 +1301,20 @@ test('the published 0.1.13 agent is refreshed when unchanged and preserved when 
   }
 });
 
-test('the published 0.1.14 agent is refreshed to 1.0.0 and preserved when customized', async () => {
-  // 1.0.0 keeps the 0.1.14 companion body and changes only the release marker. The
-  // prior digest must therefore remain enumerated so an existing 0.1.14 install is
-  // migrated instead of being misclassified as an operator-owned file.
+test('the published 1.0.0 agent is refreshed to this build and preserved when customized', async () => {
+  // 1.1.0 replaced the repeat-result polling rules with `delegate_wait` and added the
+  // "do not implement locally" boundary, so the instruction BYTES changed and the
+  // 1.0.0 file is a distinct published build. It must stay enumerated, or every
+  // 1.0.0 installation would be reported as somebody else's file and never update.
   const fixture = codexHomeFixture();
   const template = readFileSync(join(ROOT, 'codex', AGENT_FILENAME), 'utf8');
   assertShippedTemplate(template);
-  const prior = stampedTemplate(template, DELIVERABLE_VERSION, '0.1.14', 'crlf');
+  const prior = stampedTemplate(template, DELIVERABLE_VERSION, '1.0.0', 'crlf');
   try {
-    assert.equal(digest(prior), AGENT_0_1_14_DIGEST, 'the reconstructed bytes are the published 0.1.14 template');
+    assert.equal(digest(prior), AGENT_1_0_0_DIGEST, 'the reconstructed 1.0.0 bytes are the published template');
     assert.ok(
-      KNOWN_AGENT_TEMPLATES.some((entry) => entry.version === '0.1.14' && entry.sha256 === AGENT_0_1_14_DIGEST),
-      'the published 0.1.14 template must stay enumerated for the 1.0.0 upgrade',
+      KNOWN_AGENT_TEMPLATES.some((entry) => entry.version === '1.0.0' && entry.sha256 === AGENT_1_0_0_DIGEST),
+      'the published 1.0.0 template must stay enumerated for this upgrade',
     );
 
     mkdirSync(dirname(fixture.agentPath), { recursive: true });
@@ -2137,7 +2150,9 @@ test('a non-default discovery location is pinned into the entry, the default is 
 
 test('classifyMcpEntry requires the marker before it accepts an entry as its own', () => {
   const desired = desiredMcpCommand({ node: 'C:\\node\\node.exe', script: 'C:\\pkg\\bin\\dsh-delegate-mcp.js' });
-  const values = 'command = "C:\\\\node\\\\node.exe"\nargs = ["C:\\\\pkg\\\\bin\\\\dsh-delegate-mcp.js"]\n';
+  // Every value this plugin writes, including the owned tool timeout: an entry
+  // missing it is this plugin's OLD entry and classified `outdated`, not `configured`.
+  const values = 'command = "C:\\\\node\\\\node.exe"\nargs = ["C:\\\\pkg\\\\bin\\\\dsh-delegate-mcp.js"]\ntool_timeout_sec = 3660\n';
   const ours = `${MCP_MARKER}\n[mcp_servers.dsh-delegate]\n${values}`;
   assert.equal(classifyMcpEntry(new Document(ours), desired).state, 'configured');
   assert.equal(classifyMcpEntry(new Document(ours), desired).marked, true);
@@ -2155,9 +2170,9 @@ test('classifyMcpEntry requires the marker before it accepts an entry as its own
 
   // The inline spelling is managed only when marked too. (Without the marker this
   // document already conflicts earlier, as `not-a-table`.)
-  const inlineMarked = `${MCP_MARKER}\n[mcp_servers]\ndsh-delegate = { command = "C:\\\\node\\\\node.exe", args = ["C:\\\\pkg\\\\bin\\\\dsh-delegate-mcp.js"] }\n`;
+  const inlineMarked = `${MCP_MARKER}\n[mcp_servers]\ndsh-delegate = { command = "C:\\\\node\\\\node.exe", args = ["C:\\\\pkg\\\\bin\\\\dsh-delegate-mcp.js"], tool_timeout_sec = 3660 }\n`;
   assert.equal(classifyMcpEntry(new Document(inlineMarked), desired).state, 'configured');
-  const inlineUnmarked = `[mcp_servers]\ndsh-delegate = { command = "C:\\\\node\\\\node.exe", args = ["C:\\\\pkg\\\\bin\\\\dsh-delegate-mcp.js"] }\n`;
+  const inlineUnmarked = `[mcp_servers]\ndsh-delegate = { command = "C:\\\\node\\\\node.exe", args = ["C:\\\\pkg\\\\bin\\\\dsh-delegate-mcp.js"], tool_timeout_sec = 3660 }\n`;
   assert.equal(classifyMcpEntry(new Document(inlineUnmarked), desired).state, 'conflict');
 
   assert.equal(classifyMcpEntry(new Document('model = "x"\n'), desired).state, 'not-configured');
@@ -2571,4 +2586,89 @@ test('writing through the same atomic helper the installer uses leaves no temp f
   } finally {
     fixture.cleanup();
   }
+});
+
+// ---------------------------------------------------------------------------
+// Managed tool timeout: one 60-minute delegate_wait must fit inside it
+// ---------------------------------------------------------------------------
+
+test('the managed entry owns tool_timeout_sec so a default 60-minute wait can complete', () => {
+  const desired = desiredMcpCommand({ node: '/usr/bin/node', script: '/pkg/bin/dsh-delegate-mcp.js' });
+  // 3600 s default wait + one minute of slack; never a second wait window.
+  assert.equal(desired.toolTimeoutSec, 3660);
+  const document = new Document('');
+  const classification = classifyMcpEntry(document, desired);
+  const written = applyMcpEntry(document, desired, classification);
+  assert.match(written, /^tool_timeout_sec = 3660$/mu, 'the rendered entry carries the timeout');
+  // It is written inside OUR table, before any later section.
+  const lines = written.split('\n');
+  const serverLine = lines.findIndex((line) => line.startsWith('[mcp_servers.dsh-delegate]'));
+  const timeoutLine = lines.findIndex((line) => line.startsWith('tool_timeout_sec'));
+  assert.ok(timeoutLine > serverLine, 'the timeout belongs to our server table');
+  assert.equal(classifyMcpEntry(new Document(written), desired).state, 'configured');
+  assert.equal(applyMcpEntry(new Document(written), desired, classifyMcpEntry(new Document(written), desired)), null,
+    'repairing an already-correct entry writes nothing');
+});
+
+test('a prior managed entry without the timeout migrates in place and preserves unrelated config', () => {
+  const desired = desiredMcpCommand({ node: '/usr/bin/node', script: '/pkg/bin/dsh-delegate-mcp.js' });
+  const prior = [
+    'model = "kept"',
+    '',
+    MCP_MARKER,
+    '[mcp_servers.dsh-delegate]',
+    'command = "/usr/bin/node"',
+    'args = ["/pkg/bin/dsh-delegate-mcp.js"]',
+    '',
+    '[mcp_servers.other]',
+    'command = "elsewhere"',
+    '',
+  ].join('\n');
+  const classification = classifyMcpEntry(new Document(prior), desired);
+  // An entry this plugin wrote BEFORE the field existed is stale, never somebody
+  // else's definition: otherwise a 1.0.0 install could never be repaired.
+  assert.equal(classification.state, 'outdated');
+  assert.equal(classification.previous.toolTimeoutSec, null);
+
+  const migrated = applyMcpEntry(new Document(prior), desired, classification);
+  assert.match(migrated, /^tool_timeout_sec = 3660$/mu);
+  // Unrelated configuration survives byte for byte, and the operator marker is not
+  // duplicated.
+  assert.match(migrated, /^model = "kept"$/mu);
+  assert.match(migrated, /^\[mcp_servers\.other\]$/mu);
+  assert.match(migrated, /^command = "elsewhere"$/mu);
+  assert.equal(migrated.split(MCP_MARKER).length - 1, 1, 'exactly one ownership marker');
+  // The timeout is inside our table, not appended after somebody else's section.
+  assert.ok(
+    migrated.indexOf('tool_timeout_sec') < migrated.indexOf('[mcp_servers.other]'),
+    'the timeout is added inside our own table',
+  );
+  assert.equal(classifyMcpEntry(new Document(migrated), desired).state, 'configured');
+});
+
+test('a changed or non-integer tool_timeout_sec is never silently adopted', () => {
+  const desired = desiredMcpCommand({ node: '/usr/bin/node', script: '/pkg/bin/dsh-delegate-mcp.js' });
+  const ours = (timeout) => `${MCP_MARKER}\n[mcp_servers.dsh-delegate]\ncommand = "/usr/bin/node"\nargs = ["/pkg/bin/dsh-delegate-mcp.js"]\n${timeout}\n`;
+
+  // The plugin's own entry with a stale value: repairable, and repair rewrites it.
+  const stale = new Document(ours('tool_timeout_sec = 120'));
+  const staleClass = classifyMcpEntry(stale, desired);
+  assert.equal(staleClass.state, 'outdated');
+  assert.equal(staleClass.previous.toolTimeoutSec, 120);
+  assert.match(applyMcpEntry(stale, desired, staleClass), /^tool_timeout_sec = 3660$/mu);
+
+  // A non-integer is not a value this plugin writes: the whole entry is treated as
+  // somebody else's and left untouched.
+  const float = new Document(ours('tool_timeout_sec = 12.5'));
+  assert.equal(classifyMcpEntry(float, desired).state, 'conflict');
+  assert.equal(classifyMcpEntry(float, desired).reason, 'timeout-not-an-integer');
+  assert.throws(
+    () => applyMcpEntry(float, desired, classifyMcpEntry(float, desired)),
+    (error) => error.code === 'MCP_ENTRY_CONFLICT',
+  );
+
+  // An unmarked entry with the right values is still not ours, whatever it contains.
+  const unmarked = new Document('[mcp_servers.dsh-delegate]\ncommand = "/usr/bin/node"\nargs = ["/pkg/bin/dsh-delegate-mcp.js"]\ntool_timeout_sec = 3660\n');
+  assert.equal(classifyMcpEntry(unmarked, desired).state, 'conflict');
+  assert.equal(classifyMcpEntry(unmarked, desired).reason, 'unmanaged-entry');
 });

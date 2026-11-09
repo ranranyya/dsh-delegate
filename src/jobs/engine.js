@@ -60,10 +60,11 @@
 // recorded), not merely that the state was written.
 
 import { randomUUID } from 'node:crypto';
-import { defaultSettings, LIMITS } from '../config/defaults.js';
+import { defaultSettings, LIMITS, MONITORING_DEFAULTS } from '../config/defaults.js';
 import { redactDeep, redactText } from '../config/redact.js';
 import { resolveEffectiveConfig } from '../config/settings.js';
 import { AUTH_CODES, AuthError } from '../auth/grants.js';
+import { TaskMonitor, isPublicReason, terminalReason } from './activity.js';
 import { resolveRoute } from '../model/routing.js';
 import { PROVIDER_SET_CODES, managedProvidersOf } from '../model/providers.js';
 import { RUN_OUTCOMES, RunError, SessionPlacementRefusal, diagnostic, runAgent } from '../runtime/agent-runner.js';
@@ -191,6 +192,33 @@ const MAX_RETAINED_TASKS = 256;
 const PHASE_AWAITING_PERMISSION = 'awaiting-permission';
 const PHASE_EXECUTE = 'execute';
 
+/**
+ * The closed vocabulary of reasons one observation may report to a caller.
+ *
+ * `heartbeat` is in it because the adapter contract names it, but
+ * {@link JobEngine#observeTask} never RETURNS it: it means "the internal wait
+ * expired with nothing to say", and the documented behaviour is to re-wait once
+ * rather than hand the caller a report that carries no information.
+ */
+export const OBSERVE_TASK_REASONS = Object.freeze({
+  heartbeat: 'heartbeat',
+  attention: 'attention',
+  permission: 'permission',
+  ready: 'ready',
+  failed: 'failed',
+  cancelled: 'cancelled',
+  interrupted: 'interrupted',
+});
+
+/**
+ * How long one observation may wait inside the engine, and the internal slice it
+ * polls on. The outer bound is a hard part of the contract (an adapter must never
+ * hold a request open indefinitely); the slice is an implementation detail that a
+ * test narrows to simulate time.
+ */
+const OBSERVE_WAIT_MS = 25_000;
+const OBSERVE_SLICE_MS = 1000;
+
 /** Raised for job-level refusals. */
 export class JobError extends Error {
   /**
@@ -222,9 +250,11 @@ export class JobEngine {
    *   registration used as the fallback seam), optional `worktrees` (a
    *   `WorktreeManager`), optional `history` (a `HistoryStore`), optional
    *   `sweepIntervalMs`, optional `preflightTimeoutMs` (a bound for preflight
-   *   steps that run before the worker timeout is known), and
+   *   steps that run before the worker timeout is known),
    *   `allowLegacyProviderRoutes` (tests only: use the profile id as the native
-   *   route when neither seam is present).
+   *   route when neither seam is present), and the optional observation seams
+   *   `now` (a clock returning epoch milliseconds) and `wait(ms, { signal })`
+   *   (a bounded sleep), plus `observeSliceMs` (test-only polling slice).
    */
   constructor(deps) {
     this.deps = deps;
@@ -250,6 +280,18 @@ export class JobEngine {
     this.preflightTimeoutMs = Number.isFinite(configuredPreflight) && configuredPreflight > 0
       ? configuredPreflight
       : DEFAULT_PREFLIGHT_TIMEOUT_MS;
+    // Observation seams. Production leaves both absent and gets the real clock and
+    // a real unref'd wait; a test injects a clock and a wait it can advance, so
+    // "twenty minutes of silent waiting" costs no wall time and cannot flake. They
+    // live on the engine, not on the monitor, because every monitor of every task
+    // must read the same time source.
+    this.clock = typeof deps?.now === 'function' ? deps.now : Date.now;
+    this.observationWait = typeof deps?.wait === 'function' ? deps.wait : undefined;
+    const slice = Number(deps?.observeSliceMs);
+    this.observeSliceMs = Number.isFinite(slice) && slice > 0 ? Math.trunc(slice) : OBSERVE_SLICE_MS;
+    // Observers currently waiting, so disposal can release them without touching
+    // the workers they were only watching.
+    this.observers = new Set();
     this.listen();
   }
 
@@ -499,6 +541,11 @@ export class JobEngine {
       // timer when the request settles, so an approval wait can never be charged
       // to the execution timeout.
       permission: { bridge: null, pending: null, evidence: [], pausedAt: null, pausedExecutionMs: 0 },
+      // The activity monitor for this run. Created with the task, fed from the
+      // runner's `onEvent` hook, and disposed with the task: its counters describe
+      // THIS run and must not outlive it. It holds metadata only (counts,
+      // timestamps, a tool name and call id), never model text or tool arguments.
+      monitor: null,
       // Idempotence latch for {@link finalize}: one promise per task, ever.
       finalizing: null,
       finalizedAt: null,
@@ -2370,6 +2417,17 @@ export class JobEngine {
       task.phase = 'execute';
       task.startedAt = Date.now();
     }
+    // The monitor exists from the moment the run is driven, so an executor that
+    // produces nothing at all is still measured from its own state time instead of
+    // being invisible. Its thresholds come from the snapshot this task froze at
+    // admission, never from live settings: an edit mid-run must not retime a task
+    // that is already in flight.
+    //
+    // `ensureMonitor` never REPLACES one: an observation started before this call
+    // (against `startedAt`, i.e. while the task was still `pending`) already holds a
+    // reference to the monitor, and swapping it here would leave that observer
+    // watching an object that never receives another event.
+    this.ensureMonitor(task);
     try {
       const workerSelection = {
         // The public profile id stays the operator-facing identity; the native
@@ -2445,6 +2503,12 @@ export class JobEngine {
           connectionId: task.connectionId,
           selfTaskId: task.taskId,
         }),
+        // The activity feed. `runAgent` already dispatches every native session
+        // event here, and the monitor reads only the parts it classifies: whether
+        // the event was progress, and (for a tool event) its name and call id.
+        // Reasoning text, assistant text and tool arguments are never retained or
+        // forwarded — there is no field in the summary they could travel in.
+        onEvent: (event) => { task.monitor?.onEvent(event, this.clock()); },
       });
       task.native.promise = pending;
       let run;
@@ -2610,6 +2674,362 @@ export class JobEngine {
   }
 
   /**
+   * Build the activity monitor for one task.
+   *
+   * Thresholds come from the task's own frozen effective snapshot. They are
+   * therefore immutable for the life of the run: `setMonitoring` affects the next
+   * admission, never one already executing. The engine's clock and wait seams are
+   * handed to every monitor so all of them observe one time source.
+   * @param {object} task - admitted task record with `effective`.
+   * @returns {object} the task's monitor.
+   */
+  createMonitor(task) {
+    const monitoring = task.effective?.monitoring ?? null;
+    return new TaskMonitor(task, {
+      now: () => this.clock(),
+      ...(this.observationWait === undefined ? {} : { wait: this.observationWait }),
+      waitSliceMs: this.observeSliceMs,
+      selfCheckSeconds: monitoring?.selfCheckSeconds ?? MONITORING_DEFAULTS.selfCheckSeconds,
+      attentionSeconds: monitoring?.attentionSeconds ?? MONITORING_DEFAULTS.attentionSeconds,
+      log: (message, detail) => this.deps?.logger?.warn?.(message, detail),
+    });
+  }
+
+  /**
+   * Return this task's monitor, creating it only when there is none.
+   *
+   * There is exactly ONE monitor per task. A task may be observed before `execute`
+   * creates its monitor (the task is `pending` but already admitted, so its frozen
+   * thresholds are known), and the observation holds a reference to whatever it
+   * got. Replacing the monitor later — which an unconditional assignment would do —
+   * would leave that observer watching an object that never receives another event,
+   * so it would stay silent forever. Creation therefore happens at most once, and
+   * the threshold source is the frozen snapshot either way.
+   * @param {object} task - task record (admitted, so `effective` is resolved).
+   * @returns {object} the task's single monitor.
+   */
+  ensureMonitor(task) {
+    if (task.monitor === null || task.monitor === undefined) task.monitor = this.createMonitor(task);
+    return task.monitor;
+  }
+
+  /**
+   * Stop one task's monitor and release any observation waiting on it.
+   *
+   * Idempotent, and never touches the worker: an observation that ends is a reader
+   * leaving, not a run being stopped. The activity is finalized at the task's own
+   * end so a later view or a stored record cannot report an idle (or tool-elapsed)
+   * span that keeps growing after the run stopped.
+   * @param {object} task - task record.
+   * @returns {void}
+   */
+  releaseMonitor(task) {
+    const monitor = task?.monitor ?? null;
+    if (monitor === null || monitor === undefined) return;
+    try {
+      monitor.dispose(Number.isFinite(task.endedAt) ? task.endedAt : this.clock());
+    } catch {
+      // A monitor that refuses to dispose is a defect, not a reason to leave a
+      // task unsettled; the observer set is cleared below regardless.
+    }
+  }
+
+  /**
+   * Whether a task currently has a native tool call outstanding.
+   *
+   * The monitor keeps the last tool span it was told about. What that means is the
+   * ENGINE's judgement, not the monitor's: a run in its permission wait is not
+   * "waiting on a tool" (the request carries its own reason), and a settled run is
+   * not waiting on anything. So the monitor is asked for a duration, and the answer
+   * about meaning is decided here.
+   * @param {object} task - task record.
+   * @returns {boolean} true when the summary should describe a running tool.
+   */
+  toolActive(task) {
+    const monitor = task?.monitor ?? null;
+    if (monitor === null || monitor === undefined || monitor.disposed === true) return false;
+    if (task.permission?.pending !== null && task.permission?.pending !== undefined) return false;
+    return LIVE.has(task.state) && monitor.activity.tool !== null;
+  }
+
+  /**
+   * The bounded, publishable activity block of one task view.
+   *
+   * Safe by construction: counts, timestamps and identifiers only. No transcript,
+   * no reasoning, no tool arguments and no diff has a field here, so every existing
+   * view (`get`, `list`, history, MCP) inherits a progress summary without
+   * inheriting content.
+   * @param {object} task - task record.
+   * @returns {object | null} activity summary, or null for a task that never ran.
+   */
+  activityView(task) {
+    const monitor = task?.monitor ?? null;
+    if (monitor === null || monitor === undefined) return null;
+    const at = this.clock();
+    try {
+      return monitor.snapshot({ at, toolActive: this.toolActive(task) });
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Await one bounded observation of a task.
+   *
+   * This is the documented seam the HTTP adapter (a later work unit) turns into an
+   * endpoint. It answers ONE question — "is there anything the commander should
+   * know right now, or should this request simply wait?" — and reports why it
+   * returned.
+   *
+   * Contract:
+   *
+   *  * `waitMs` defaults to 25 s and is clamped to `[1, 25000]`. The wait is
+   *    BOUNDED BY ONE WAIT: when it expires with nothing to report the reason is
+   *    `heartbeat` and the caller re-issues. There is no internal re-wait, so the
+   *    documented bound is the real upper bound of one call.
+   *  * Reasons, in precedence order: `interrupted` (caller aborted, or the engine
+   *    was disposed — the WORKER keeps running), then any terminal state
+   *    (`ready`/`failed`/`cancelled`, which wins even over an `interrupted` caused
+   *    by engine teardown, because the run really did reach that outcome), then
+   *    `permission` (a per-call decision is outstanding), then `attention` (the
+   *    silence reached `attentionSeconds`, claimed by exactly one observer), then
+   *    `heartbeat`. Genuine progress never produces `attention`: it resets the
+   *    silence instead.
+   *  * The permission reason carries the FULL existing redacted request view,
+   *    including its exact fingerprint and completeness facts. A shortened
+   *    operation is not decidable, and an undecidable request is the one thing this
+   *    feature must never produce.
+   *  * An unknown task and another connection's task are the SAME refusal
+   *    (`JOB_TASK_NOT_FOUND`, same message, same details), so the answer cannot be
+   *    used to discover that an id exists.
+   *  * The checks are re-run after the wait, before the summary is built, and the
+   *    summary is built from the SAME task record the checks read. A permission
+   *    request or a finish that lands while the caller is waiting is therefore
+   *    reported, not lost.
+   *  * Aborting an observation releases only its own listener and timer. It never
+   *    cancels, restarts or resumes the worker, and never disturbs another
+   *    observer of the same task.
+   * @param {string} taskId - task to observe.
+   * @param {object} [options] - `connectionId`, `waitMs` (default 25000, max 25000), `signal`.
+   * @returns {Promise<{ task: object, reason: string, permission: object | null, activity: object | null,
+   *   selfCheck: object | null, wait: { waitMs: number, waitedMs: number, activitySinceWait: boolean } }>} observation.
+   * @throws {JobError} `JOB_TASK_NOT_FOUND` for an unknown or foreign task.
+   */
+  async observeTask(taskId, options = {}) {
+    const task = this.taskForObservation(taskId, options?.connectionId);
+    const waitMs = clampObserveWait(options?.waitMs);
+    const signal = options?.signal ?? null;
+
+    if (this.aborted) return this.observationOf(task, OBSERVE_TASK_REASONS.interrupted, null, waitMs, 0, false);
+    if (signal !== null && signal.aborted === true) {
+      return this.observationOf(task, OBSERVE_TASK_REASONS.interrupted, null, waitMs, 0, false);
+    }
+
+    // Exactly one monitor per task, created at most once (see `ensureMonitor`).
+    const monitor = this.ensureMonitor(task);
+
+    // A task that has already ended owes the caller its outcome immediately: there
+    // is nothing to wait for, and a `heartbeat` here would invite a pointless
+    // re-request for a run that will never change again. The same is true of an
+    // outstanding permission request, which is decidable right now.
+    const immediate = this.settleReason(task);
+    if (immediate !== null) {
+      return this.observationOf(task, immediate, monitor, waitMs, 0, false);
+    }
+
+    // ONE bounded wait, and nothing more. `waitMs` is the caller's promise: a
+    // documented `<= 25 s` observation must never become two waits back to back,
+    // which would double it and blow an adapter's own request timeout. Re-issuing
+    // is the caller's loop (the MCP tool in the next unit), not this method's.
+    const outcome = await this.waitForTaskReport(monitor, { waitMs, signal });
+    let reason = isPublicReason(outcome.reason) ? outcome.reason : OBSERVE_TASK_REASONS.heartbeat;
+
+    // Late-event delivery: the summary is rebuilt from the record AFTER the wait,
+    // and the checks below read the SAME `task` object the monitor loop examined.
+    // A terminal state always wins — including over an `interrupted` produced by an
+    // engine dispose, because the run really did reach an outcome — and a pending
+    // request beats a silence report. `heartbeat` is the only reason that yields.
+    const settled = this.settleReason(task);
+    if (settled !== null) reason = settled;
+    return this.observationOf(task, reason, monitor, waitMs, outcome.waitedMs, outcome.activitySinceWait);
+  }
+
+  /**
+   * Run one bounded internal wait against a task's monitor.
+   *
+   * The monitor's loop reads the task's own fields through the SAME record, so no
+   * step here re-reads a stale copy. This method owns only the registration that
+   * lets {@link dispose} release the waiter; it never touches the run.
+   * @param {object} monitor - task monitor.
+   * @param {object} input - `waitMs` and `signal`.
+   * @returns {Promise<{ reason: string, waitedMs: number, activitySinceWait: boolean, selfCheck: object | null }>} outcome.
+   */
+  async waitForTaskReport(monitor, { waitMs, signal }) {
+    const registration = { controller: new AbortController() };
+    this.observers.add(registration);
+    const forwarded = new AbortController();
+    const forward = () => {
+      try {
+        forwarded.abort();
+        registration.controller.abort();
+      } catch {
+        // Abort is idempotent.
+      }
+    };
+    if (signal !== null) signal.addEventListener?.('abort', forward, { once: true });
+    try {
+      return await monitor.observe({ waitMs, signal: forwarded.signal });
+    } finally {
+      this.observers.delete(registration);
+      if (signal !== null) signal.removeEventListener?.('abort', forward);
+    }
+  }
+
+  /**
+   * The reason a task's current record implies right now, or null while it is
+   * still running with nothing outstanding.
+   *
+   * Shared by the wait loop and the post-wait re-check, so the two can never
+   * disagree about precedence.
+   *
+   * A terminal state comes FIRST. A task that has ended may still carry a stale
+   * `permission.pending` block (a run stopped while a request was outstanding), and
+   * reporting that as `permission` would offer a decision for a call that no longer
+   * exists — and would keep offering it forever, because nothing will ever settle
+   * it. A settled run is reported as settled, and the stored request is history.
+   * @param {object} task - task record.
+   * @returns {string | null} reason key, or null.
+   */
+  settleReason(task) {
+    const terminal = terminalReason(task);
+    if (terminal !== null) return terminal;
+    if (task?.permission?.pending !== null && task?.permission?.pending !== undefined) {
+      return OBSERVE_TASK_REASONS.permission;
+    }
+    return null;
+  }
+
+  /**
+   * Resolve the task one observation may read, refusing identically for every
+   * task this caller cannot prove.
+   * @param {unknown} taskId - caller-supplied id.
+   * @param {unknown} connectionId - the caller's verified connection identity.
+   * @returns {object} the task record.
+   * @throws {JobError} `JOB_TASK_NOT_FOUND`, indistinguishable across causes.
+   */
+  taskForObservation(taskId, connectionId) {
+    const requested = typeof taskId === 'string' ? taskId.trim() : '';
+    const caller = typeof connectionId === 'string' && connectionId !== '' ? connectionId : null;
+    const task = requested === '' || caller === null ? undefined : this.tasks.get(requested);
+    const owner = task !== null && task !== undefined && typeof task.connectionId === 'string' && task.connectionId !== ''
+      ? task.connectionId
+      : null;
+    // Unknown id, blank id, no verified caller, a task with no recorded owner and
+    // another connection's task are one answer with one shape. The details carry
+    // only what the caller itself supplied.
+    if (task === undefined || owner === null || owner !== caller) {
+      throw new JobError(JOB_CODES.taskNotFound, 'no such task for this connection', { taskId: requested });
+    }
+    return task;
+  }
+
+  /**
+   * Build the documented observation result.
+   *
+   * The permission reason carries the WHOLE redacted pending view — request id,
+   * exact fingerprint, completeness, bounds, redacted arguments — because a
+   * commander cannot decide a shortened operation. Everything else is the compact
+   * task summary: no transcript, no execution text, no diff.
+   * @param {object} task - task record.
+   * @param {string} reason - reported reason.
+   * @param {object | null} monitor - task monitor, for the self-check diagnostic.
+   * @param {number} waitMs - the bound that applied.
+   * @param {number} waitedMs - how long the wait actually took.
+   * @param {boolean} activitySinceWait - whether activity arrived during the wait.
+   * @returns {object} observation result.
+   */
+  observationOf(task, reason, monitor, waitMs, waitedMs, activitySinceWait) {
+    const at = this.clock();
+    const summary = this.observationSummary(task, at);
+    const pending = task?.permission?.pending ?? null;
+    const live = monitor ?? task?.monitor ?? null;
+    const selfCheck = live === null || live === undefined ? null : live.snapshot({ at }).selfCheck;
+    return {
+      task: summary,
+      reason,
+      // The full, unshortened redacted request on the ONE reason that needs it.
+      permission: reason === OBSERVE_TASK_REASONS.permission ? pending : null,
+      activity: summary.activity,
+      selfCheck,
+      wait: { waitMs, waitedMs: Math.max(0, Math.trunc(waitedMs)), activitySinceWait: activitySinceWait === true },
+    };
+  }
+
+  /**
+   * The compact task summary an observation returns.
+   *
+   * Deliberately narrower than {@link view}: it carries the facts a waiting caller
+   * needs (identity, phase, timing, silence, the tool in flight, the frozen route)
+   * and NONE of the evidence a reviewer reads (diff, execution text, review text).
+   * @param {object} task - task record.
+   * @param {number} at - reference time.
+   * @returns {object} compact summary.
+   */
+  observationSummary(task, at) {
+    const monitor = task?.monitor ?? null;
+    const activity = monitor === null || monitor === undefined
+      ? null
+      : monitor.snapshot({ at, toolActive: this.toolActive(task) });
+    const startedAt = Number.isFinite(task.startedAt) ? task.startedAt : task.createdAt;
+    const endedAt = Number.isFinite(task.endedAt) ? task.endedAt : null;
+    return {
+      taskId: task.taskId,
+      state: task.state,
+      phase: task.phase,
+      createdAt: task.createdAt ?? null,
+      startedAt: task.startedAt ?? null,
+      endedAt,
+      elapsedMs: Math.max(0, (endedAt ?? at) - (Number.isFinite(startedAt) ? startedAt : at)),
+      lastActivityAt: activity === null ? null : activity.lastActivityAt,
+      currentTool: activity === null ? null : activity.currentTool,
+      idleForMs: activity === null ? null : activity.idleForMs,
+      waitingOn: activity === null ? null : activity.waitingOn,
+      activity,
+      selfCheck: monitor === null || monitor === undefined
+        ? null
+        : { episode: monitor.selfCheck.episode, checkedAt: monitor.selfCheck.checkedAt, verdict: monitor.selfCheck.verdict },
+      // The route this task froze at admission. Reported as the frozen triple, not
+      // re-resolved: a settings edit during the wait must not change what a
+      // finished run is described as having used.
+      route: this.observationRoute(task),
+      connectionId: task.connectionId ?? null,
+      // Stated so no consumer reads `awaiting-host-review` as acceptance.
+      selfApproved: false,
+      hostAcceptance: null,
+    };
+  }
+
+  /**
+   * The frozen worker route of one task, for an observation summary.
+   * @param {object} task - task record.
+   * @returns {object | null} route.
+   */
+  observationRoute(task) {
+    if (task?.effective === null || task?.effective === undefined) return null;
+    return {
+      providerId: task.effective.worker?.providerId ?? null,
+      providerRoute: task.route?.providerRoute ?? null,
+      model: task.route?.model ?? task.effective.worker?.model ?? null,
+      reasoningEffort: task.route?.reasoningEffort ?? task.effective.worker?.reasoningEffort ?? null,
+      isolation: task.effective.worker?.isolation ?? null,
+      monitoring: {
+        selfCheckSeconds: task.effective.monitoring?.selfCheckSeconds ?? null,
+        attentionSeconds: task.effective.monitoring?.attentionSeconds ?? null,
+      },
+    };
+  }
+
+  /**
    * Settle a terminal task: release its capacity (slot and leases) through the
    * single idempotent {@link finalize} path, then resolve its settlement promise.
    *
@@ -2625,6 +3045,10 @@ export class JobEngine {
     // (the worker's paused tool call resumes `unavailable`) and the bridge can never
     // answer a request that outlived the run it belonged to.
     this.releasePermissionBridge(task, 'dispose');
+    // The monitor is stopped BEFORE the record is persisted, so no observation can
+    // still be waiting on a run that has already ended. The summary survives on the
+    // task, so the stored view still says how much activity there was.
+    this.releaseMonitor(task);
     await this.finalize(task);
     await this.persistHistory(task);
     task.settle();
@@ -2907,6 +3331,10 @@ export class JobEngine {
       // setting: a new submission starts a new DSH conversation, and a follow-up
       // continues the thread named by `continueFromTaskId`.
       conversation: { ...task.effective.conversation },
+      // The silence thresholds this task froze at admission. Published so a reader
+      // can interpret the activity block without consulting a settings document
+      // that may have changed since.
+      monitoring: { ...(task.effective.monitoring ?? MONITORING_DEFAULTS) },
       provenance: task.effective.provenance,
     };
     const view = {
@@ -2981,6 +3409,11 @@ export class JobEngine {
       // The approval stance the run installed and read back (`never` without a
       // bridge, `ask` with an armed one), recorded from the run itself.
       approval: task.execution?.approval ?? null,
+      // A bounded progress summary: counts, timestamps and the tool in flight. It
+      // carries no model text, no reasoning, no tool arguments and no diff, so the
+      // ordinary task view can show "still working, last activity 12s ago" without
+      // becoming a second transcript.
+      activity: this.activityView(task),
       hostAcceptance: task.hostAcceptance,
       // Stated explicitly so no consumer can read `awaiting-host-review` as
       // "done and approved".
@@ -3014,8 +3447,22 @@ export class JobEngine {
   async dispose() {
     this.aborted = true;
     this.stopListening();
+    // Every observation still waiting is released, and nothing else: an observer
+    // is a reader, so ending it must not be mistaken for ending the run. The
+    // monitors are disposed with their tasks below.
+    for (const registration of [...this.observers]) {
+      try {
+        registration.controller.abort();
+      } catch {
+        // Abort is idempotent.
+      }
+    }
+    this.observers.clear();
     let count = 0;
     for (const task of this.tasks.values()) {
+      // Every task's monitor is stopped, terminal or not: a monitor outliving the
+      // engine would keep a waiter alive against a task nobody may read again.
+      this.releaseMonitor(task);
       if (TERMINAL.has(task.state)) {
         // A terminal task may still hold a bridge if its own teardown has not run
         // yet; disposing is idempotent and cannot answer anything after this point.
@@ -3036,6 +3483,20 @@ export class JobEngine {
     this.aborted = true;
     return count;
   }
+}
+
+/**
+ * Clamp one caller-requested observation wait to the documented bound.
+ *
+ * The ceiling is part of the contract, not a courtesy: an adapter must be able to
+ * promise that a request returns within 25 seconds. A missing, negative or
+ * non-finite request takes the default rather than a wild value.
+ * @param {unknown} waitMs - requested wait in milliseconds.
+ * @returns {number} a whole number of milliseconds within `[1, OBSERVE_WAIT_MS]`.
+ */
+function clampObserveWait(waitMs) {
+  if (typeof waitMs !== 'number' || !Number.isFinite(waitMs) || waitMs <= 0) return OBSERVE_WAIT_MS;
+  return Math.min(OBSERVE_WAIT_MS, Math.max(1, Math.trunc(waitMs)));
 }
 
 /**

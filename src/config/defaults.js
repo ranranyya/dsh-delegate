@@ -71,8 +71,30 @@ export const LIMITS = Object.freeze({
   taskGrantTtlSecondsMax: 60 * 60,
   sessionGrantTtlSecondsMin: 60,
   sessionGrantTtlSecondsMax: 12 * 60 * 60,
+  // Monitoring. The two thresholds are bounded, and the second one must stay
+  // strictly greater than the first: two identical thresholds would deliver a
+  // self-check and an attention alert for the same instant, which is exactly the
+  // noisy behaviour the whole feature exists to remove.
+  selfCheckSecondsMin: 30,
+  selfCheckSecondsMax: 60 * 60,
+  attentionSecondsMin: 31,
+  attentionSecondsMax: 2 * 60 * 60,
   promptChars: 200_000,
   reviewPromptChars: 400_000,
+});
+
+/**
+ * Default activity-monitoring thresholds, in seconds of *inactivity*.
+ *
+ * A run that keeps producing events never reaches either threshold, so these are
+ * not poll intervals: nothing is scheduled until the executor has actually been
+ * silent for the first one.
+ */
+export const MONITORING_DEFAULTS = Object.freeze({
+  /** Idle span after which one read-only local self-check is performed. */
+  selfCheckSeconds: 300,
+  /** Idle span after which the wait reports `attention` instead of `heartbeat`. */
+  attentionSeconds: 600,
 });
 
 /**
@@ -117,6 +139,13 @@ export function defaultSettings() {
     authorization: {
       taskGrantTtlSeconds: 900,
       sessionGrantTtlSeconds: 4 * 60 * 60,
+    },
+    // Silence thresholds for a running task. Absent in documents written before
+    // this block existed; validation fills in the defaults, so schema version 1
+    // stays readable both ways and an upgraded document needs no migration step.
+    monitoring: {
+      selfCheckSeconds: MONITORING_DEFAULTS.selfCheckSeconds,
+      attentionSeconds: MONITORING_DEFAULTS.attentionSeconds,
     },
     projectOverrides: {},
     // Named, non-secret worker/review combinations. Empty by default, and absent

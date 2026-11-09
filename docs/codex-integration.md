@@ -1,6 +1,6 @@
 # Codex integration contract
 
-Status: implemented in 1.0.0. Scope: Codex only. Claude Code and other hosts are
+Status: implemented in 1.1.0. Scope: Codex only. Claude Code and other hosts are
 out of scope and no surface for them is provided.
 
 This document is the contract between the plugin's settings page (browser half),
@@ -76,6 +76,7 @@ The owned shape, written as a marked block:
 [mcp_servers.dsh-delegate]
 command = "<a Node.js executable, resolved as described in 2.1>"
 args = ["<installed package>/bin/dsh-delegate-mcp.js"]
+tool_timeout_sec = 3660
 ```
 
 * `command` is an **absolute path to a Node.js executable**, never a bare `node` and
@@ -87,6 +88,21 @@ args = ["<installed package>/bin/dsh-delegate-mcp.js"]
 * `args[0]` is derived from `import.meta.url` of the running module, so it names
   the *installed* package — never a repository checkout and never a path captured
   when the tarball was built.
+* `tool_timeout_sec = 3660` (1.1.0) is an **owned scalar on this entry only**. The
+  `delegate_wait` tool defaults to a 3600-second wait and caps it there, so Codex must
+  be allowed to let one call run that long; Codex's default tool timeout would cut a
+  healthy long wait at one minute. 3660 s is the 3600-second wait plus one minute of
+  slack — never a second wait window. It is not a Codex-wide setting and the plugin
+  writes it nowhere else.
+  * A managed entry written by an earlier release has no such field. It is classified
+    `outdated` and repaired **in place** (the line is inserted inside our table), so an
+    existing installation updates through the settings page instead of being reported as
+    somebody else's file.
+  * A managed entry with a different integer is likewise `outdated` and rewritten to
+    3660. A non-integer value is not a value this plugin writes, so the whole entry is
+    treated as operator-owned and left untouched (`timeout-not-an-integer`).
+  * An unmarked same-name entry stays a conflict regardless of its values: the marker
+    comment is the only authorship proof this format carries.
 * `env.DSH_DELEGATE_DISCOVERY_FILE` is written only when DSH uses a non-default
   discovery location (`DSH_HOME` set, or `DSH_DELEGATE_DISCOVERY_FILE` set). The
   default stays implicit so a later `DSH_HOME` change is not silently overridden.
@@ -303,7 +319,7 @@ successful diagnosis.
 ```jsonc
 {
   "codexHome": "…",
-  "packageVersion": "1.0.0",
+  "packageVersion": "1.1.0",
   "boundary": { "blocked": false, "link": null, "unknown": false, "home": "directory", "agents": "directory" },
   "agent": {
     "path": "…", "state": "installed", "installed": true, "managed": true,
@@ -519,23 +535,47 @@ one fails the build:
    model, effort or timeout, and never encode a route in the prompt. `allowShared`
    on preflight records the decision but does not change the submitted job's
    isolation by itself.
-9. **One task, polled.** Keep the returned `taskId`, poll `delegate_result` for that
-   same task until terminal, and never submit a duplicate because a result is still
-   running; `delegate_cancel` stops it.
-10. **Evidence, not approval.** Return state, the actual provider/model/effort,
+9. **One task, WAITED — not polled (1.1.0).** Keep the returned `taskId` and call
+   `delegate_wait` on that same task, repeating it until it returns an actionable
+   reason. `delegate_result` is **not** a polling loop: one `delegate_wait` blocks
+   internally for up to about 25 seconds and re-issues itself, which is the polling
+   loop. Never submit a duplicate because a task is still running; `delegate_cancel`
+   stops it. The wait defaults to 3600 seconds and the tool caps it there.
+   `heartbeat` means "nothing to report" and is internal: the tool re-waits rather than
+   handing it to the model, so normal progress never wakes Codex.
+10. **Each wait reason has a stated policy (1.1.0).**
+    - `attention` — the run has been completely silent past the configured attention
+      interval. It is a QUESTION, not a verdict: read the compact diagnostic (phase,
+      last activity, current tool and its elapsed time, self-check verdict) and
+      **default to waiting again** on the same task. Never cancel, never mark failed,
+      and never resubmit merely because a task is quiet or one tool or test is slow.
+      Only a concrete, stated error justifies anything else, and then it is reported
+      rather than silently restarted.
+    - `permission` — a per-call decision is outstanding; see item 12. After deciding,
+      wait the SAME task again.
+    - `ready` — execution finished and the task awaits **host review**; that is not
+      acceptance. Read `delegate_result` **once** for full evidence and review it in
+      Codex. A large diff is inspected file by relevant file, once each, not re-read.
+    - `failed` / `cancelled` — read `delegate_result` once for the recorded reason and
+      report it; do not resubmit identical work hoping for a different outcome.
+    - `interrupted` (transport hiccup, page or tool restart) and `wait-limit` (the
+      client's own wait budget ran out) — the task is still running: immediately
+      `delegate_wait` the same task. Neither is a failure, a stall, or a reason to
+      submit anything new or to check the implementation locally.
+11. **Evidence, not approval.** Return state, the actual provider/model/effort,
     changed-file summary, verification evidence, limitations, and the preflight
     facts with the isolation reason actually used. Executing is not accepting:
     Codex remains responsible for review. Do not claim a check passed without
     evidence, and never commit or push.
-11. **The workspace is not tidied up to pass a check.** No commit, stash, branch,
+12. **The workspace is not tidied up to pass a check.** No commit, stash, branch,
     worktree creation, `clean`, `reset` or revert on the operator's behalf. A dirty
     workspace is an isolation decision for the coordinator; pause only when the
     existing edits' ownership or risk is unclear.
-12. **A task awaiting a permission decision is still running, and the coordinating
-    Codex decides it.** A result reporting phase `awaiting-permission` with a
-    `permission.pending` request is the worker paused on one native tool call, not a
+13. **A task awaiting a permission decision is still running, and the coordinating
+    Codex decides it.** A wait reporting `permission` (with the full redacted request
+    at the top level) is the worker paused on one native tool call, not a
     stall: never submit a duplicate, mark it failed, or cancel it merely because it
-    waits, and keep polling the SAME task. The agent does **not** invoke a second
+    waits, and keep waiting the SAME task. The agent does **not** invoke a second
     approval/review model, does **not** ask the operator to choose routine within-task
     decisions, and does **not** delegate the decision to the worker. The worker's own
     `reason` is a claim, never authority. It checks the actual tool, redacted
@@ -549,14 +589,26 @@ one fails the build:
     its exact `fingerprint`, passed to `delegate_permission_decide` with the `taskId`,
     `requestId`, `decision` (`allow-once`/`reject`) and a bounded `reason`. An invalid or
     stale allow grants nothing: re-read the current request and decide safely, and never
-    retry under broader settings. Polling the SAME task continues after the decision, a
+    retry under broader settings. Waiting the SAME task continues after the decision, a
     later request needs a fresh check, and an approval is one call only — never host
     acceptance and never a standing sandbox grant. When dispatching on behalf of a
     parent commander, the complete request evidence is preserved for that commander
     rather than involving a separate review model.
-12. **No secrets.** Never read, request, store or relay provider credentials or
+14. **No local implementation while a delegated worker runs (1.1.0).** Neither the
+    dispatch companion nor the parent commander writes, patches or "just fixes" the
+    implementation while a delegated task is running, waiting, or awaiting review: that
+    would make the reviewer a second implementer of the same change, produce conflicting
+    edits in one workspace, and break the single-writer property the isolation mode
+    provides. The only exception is an explicit, user-authorized takeover — the operator
+    saying to take over and implement it here. A long silence, a permission refusal, a
+    failed run, a wait-limit or the commander's own opinion of the plan is **not** that
+    authorization. Permitted local actions while a task runs are: reading status and
+    diagnostics, waiting, reading evidence, deciding a pending permission, cancelling,
+    and writing the follow-up prompt. A believed-wrong result is reported and proposed
+    as a follow-up in the same chain, never applied locally.
+15. **No secrets.** Never read, request, store or relay provider credentials or
     connection tokens.
-13. **Task threads are explicit.** A submission starts a NEW DSH task conversation
+16. **Task threads are explicit.** A submission starts a NEW DSH task conversation
     by default; a directory-level reuse setting no longer exists. `continueFromTaskId`
     is passed **only** for a follow-up change, correction or retry that belongs to one
     earlier delegated task, and its value is the latest prior task id of that chain.
@@ -568,6 +620,8 @@ one fails the build:
     authorization path or choose a new isolation override. A refusal naming an
     unavailable or mismatched tree is reported and escalated, never worked around
     by re-submitting as a new task. The run's report states which of the two happened.
+    Corrections are consolidated into one follow-up submission rather than a scatter of
+    new tasks.
 
 ### 5.2 What the file cannot guarantee: `@` selection
 

@@ -614,3 +614,240 @@ test('timestamps and counters are stored only as finite numbers', async () => {
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+// ---------------------------------------------------------------------------
+// Activity metadata: safe round-trip and interrupted semantics
+// ---------------------------------------------------------------------------
+
+/**
+ * An activity block shaped exactly like the engine's projection.
+ * @param {object} [overrides] - fields to replace.
+ * @returns {object} activity summary.
+ */
+function fixtureActivity(overrides = {}) {
+  return {
+    lastActivityAt: 1_700_000_001_500,
+    idleForMs: 12_000,
+    waitingOn: 'tool',
+    currentTool: { name: 'bash', callId: 'call-1', startedAt: 1_700_000_001_500, elapsedMs: 12_000 },
+    lastTool: { name: 'read', durationMs: 340 },
+    events: 41,
+    activityEvents: 17,
+    toolCallsStarted: 3,
+    toolCallsFinished: 2,
+    selfCheckSeconds: 300,
+    attentionSeconds: 600,
+    selfCheck: { episode: 4, checkedAt: 1_700_000_030_000, verdict: 'tool-running' },
+    kinds: { 'text-delta': 9, 'tool-call': 3, 'tool-result': 2 },
+    ...overrides,
+  };
+}
+
+test('a bounded activity summary round-trips through the file unchanged', async () => {
+  const dir = await dataDir();
+  try {
+    const store = new HistoryStore(dir);
+    await store.save(fixtureView({ activity: fixtureActivity() }));
+    await store.flush();
+    const reloaded = new HistoryStore(dir);
+    const [row] = await reloaded.load();
+    assert.equal(row.activity.events, 41);
+    assert.equal(row.activity.activityEvents, 17);
+    assert.equal(row.activity.waitingOn, 'tool');
+    assert.equal(row.activity.currentTool.name, 'bash');
+    assert.equal(row.activity.currentTool.elapsedMs, 12_000);
+    assert.equal(row.activity.kinds['text-delta'], 9);
+    assert.equal(row.activity.selfCheck.verdict, 'tool-running');
+    assert.equal(row.activity.selfCheckSeconds, 300);
+    // Storing and reloading twice must not rewrite the document.
+    const first = await readFile(historyFile(dir), 'utf8');
+    await new HistoryStore(dir).load();
+    assert.equal(await readFile(historyFile(dir), 'utf8'), first);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('activity content that is not metadata can never reach the file', async () => {
+  const dir = await dataDir();
+  try {
+    const store = new HistoryStore(dir);
+    await store.save(fixtureView({
+      activity: fixtureActivity({
+        // A hostile/over-eager summary: text, reasoning, arguments and results.
+        text: 'MODEL OUTPUT TEXT',
+        reasoning: 'PRIVATE CHAIN OF THOUGHT',
+        currentTool: {
+          name: 'bash',
+          callId: 'call-1',
+          startedAt: 1_700_000_001_500,
+          elapsedMs: 12_000,
+          arguments: '{"command":"curl -H Authorization: Bearer sk-live-abcdefghijklmnop"}',
+          result: 'TOOL RESULT BODY',
+        },
+        transcript: [{ role: 'assistant', text: 'PRIVATE ANSWER' }],
+        kinds: { 'text-delta': 9, 'made-up-kind-with-a-secret': 'sk-live-abcdefghijklmnop' },
+      }),
+    }));
+    await store.flush();
+    const raw = await readFile(historyFile(dir), 'utf8');
+    for (const forbidden of ['MODEL OUTPUT TEXT', 'PRIVATE CHAIN', 'TOOL RESULT BODY', 'PRIVATE ANSWER', 'sk-live']) {
+      assert.equal(raw.includes(forbidden), false, `${forbidden} must not be stored`);
+    }
+    const [row] = await new HistoryStore(dir).load();
+    assert.equal(Object.hasOwn(row.activity, 'text'), false);
+    assert.equal(Object.hasOwn(row.activity.currentTool, 'arguments'), false);
+    assert.equal(row.activity.kinds['made-up-kind-with-a-secret'], undefined, 'a non-numeric counter is dropped');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('an interrupted run reports its activity as interrupted, never as a growing idle span', async () => {
+  const dir = await dataDir();
+  try {
+    const store = new HistoryStore(dir);
+    await store.save(fixtureView({
+      taskId: 'task-live',
+      state: 'running',
+      phase: 'execute',
+      endedAt: null,
+      activity: fixtureActivity(),
+    }));
+    await store.flush();
+
+    const [row] = await new HistoryStore(dir).load();
+    assert.equal(row.state, 'interrupted');
+    assert.equal(row.interruptedFrom, 'running');
+    assert.equal(row.endedAt > 0, true, 'the interrupt is stamped');
+    assert.equal(row.activity.interrupted, true);
+    // The open span is closed and preserved as evidence rather than reported as
+    // current: a restarted record must not claim a tool is still running.
+    assert.equal(row.activity.currentTool, null);
+    assert.equal(row.activity.waitingOn, null);
+    assert.equal(row.activity.idleForMs, null);
+    assert.equal(row.activity.interruptedTool.name, 'bash');
+    assert.equal(row.activity.interruptedTool.callId, 'call-1');
+    // The bounded counts survive, so history still says how much work happened.
+    assert.equal(row.activity.events, 41);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('history records no executor, no session and no way to replay an approval', async () => {
+  const dir = await dataDir();
+  try {
+    const store = new HistoryStore(dir);
+    await store.save(fixtureView({
+      state: 'running',
+      activity: fixtureActivity(),
+      execution: null,
+      permission: {
+        bridged: true,
+        waiting: true,
+        pending: {
+          requestId: 'permission-1',
+          taskId: 'task-fixture-1',
+          callId: 'call-1',
+          toolName: 'bash',
+          state: 'pending',
+          fingerprint: 'a'.repeat(64),
+          arguments: '{"command":"npm test"}',
+          completeness: 'complete',
+        },
+        evidence: [],
+        pausedExecutionMs: 5000,
+      },
+    }));
+    await store.flush();
+    const raw = await readFile(historyFile(dir), 'utf8');
+    // The manager/agent/session VALUES are never projected, and the exact
+    // fingerprint is deliberately absent from a stored request. (The permission
+    // view carries a `sessionId` KEY with a null value by its own allow-list, so
+    // this asserts on values rather than on key names.)
+    const parsed = JSON.parse(raw);
+    const anywhere = JSON.stringify(parsed);
+    for (const forbidden of ['agent-fixture-1', 'session-fixture-1', 'a'.repeat(64)]) {
+      assert.equal(anywhere.includes(forbidden), false, `${forbidden} must not be stored`);
+    }
+    const stored = parsed.jobs[0];
+    assert.equal(Object.hasOwn(stored, 'controller'), false);
+    assert.equal(Object.hasOwn(stored, 'handle'), false);
+    assert.equal(stored.execution, null);
+    const [row] = await new HistoryStore(dir).load();
+    assert.equal(row.activity.interrupted, true);
+    assert.equal(row.permission.pending.state, 'unavailable', 'a stored request can never be decided');
+    assert.equal(row.permission.interrupted, true);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('the frozen monitoring thresholds are stored with the effective snapshot', async () => {
+  const dir = await dataDir();
+  try {
+    const store = new HistoryStore(dir);
+    const view = fixtureView();
+    // A monitor and the task it measures must agree after a restart, and the live
+    // settings may have changed since.
+    view.effective = {
+      ...view.effective,
+      monitoring: { selfCheckSeconds: 120, attentionSeconds: 240 },
+    };
+    view.activity = fixtureActivity({ selfCheckSeconds: 120, attentionSeconds: 240, finalizedAt: view.endedAt });
+    await store.save(view);
+    await store.flush();
+
+    const [row] = await new HistoryStore(dir).load();
+    assert.deepEqual(row.effective.monitoring, { selfCheckSeconds: 120, attentionSeconds: 240 });
+    // The activity block keeps the same thresholds, so a stored "idle for 12 min"
+    // can still be interpreted against the threshold it was measured under.
+    assert.equal(row.activity.selfCheckSeconds, 120);
+    assert.equal(row.activity.attentionSeconds, 240);
+    assert.equal(row.activity.finalizedAt, view.endedAt, 'a final span is marked as final');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('a frozen activity record does not drift between loads', async () => {
+  const dir = await dataDir();
+  try {
+    const store = new HistoryStore(dir);
+    const view = fixtureView();
+    view.activity = fixtureActivity({ finalizedAt: view.endedAt, idleForMs: 120_000 });
+    await store.save(view);
+    await store.flush();
+    const first = await readFile(historyFile(dir), 'utf8');
+    const [row] = await new HistoryStore(dir).load();
+    assert.equal(row.activity.idleForMs, 120_000);
+    // Reloading rewrites nothing: a stored span is already the final one.
+    assert.equal(await readFile(historyFile(dir), 'utf8'), first);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('an interrupted record keeps the cut-off tool call as evidence', async () => {
+  const dir = await dataDir();
+  try {
+    const store = new HistoryStore(dir);
+    await store.save(fixtureView({
+      state: 'running',
+      endedAt: null,
+      activity: fixtureActivity(),
+    }));
+    await store.flush();
+    const [row] = await new HistoryStore(dir).load();
+    assert.equal(row.activity.interrupted, true);
+    assert.equal(row.activity.currentTool, null);
+    // The call that was in flight is preserved, not deleted: it is how a reader
+    // learns the run was cut off mid-tool rather than simply idle.
+    assert.equal(row.activity.interruptedTool.name, 'bash');
+    assert.equal(row.activity.interruptedTool.callId, 'call-1');
+    assert.equal(typeof row.activity.interruptedTool.elapsedMs, 'number');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});

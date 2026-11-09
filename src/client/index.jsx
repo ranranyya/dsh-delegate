@@ -82,13 +82,24 @@ import {
   grantState,
   isAwaitingPermission,
   isCancellable,
+  hasLiveTasks,
+  formatDuration,
+  isLiveTask,
+  minutesToSeconds,
+  monitoringOf,
   pendingPermission,
   permissionSummary,
   precheckDraft,
+  precheckMonitoring,
   previewEffective,
+  secondsToMinutes,
+  SELF_CHECK_LABELS,
+  taskActivity,
   taskOutcome,
   taskPhaseLabel,
+  taskProgress,
   taskStateLabel,
+  WAIT_REASON_LABELS,
 } from './api.js';
 import { injectStyles } from './styles.js';
 
@@ -1122,6 +1133,12 @@ function EffectiveSummary({ label, effective, note }) {
             ? `开启 · ${review.providerId ?? '（未配置）'} / ${review.model ?? '（未配置）'} / ${review.reasoningEffort ?? '不指定'}`
             : '关闭'}
         </dd>
+        <dt>静默监控</dt>
+        <dd>
+          {effective?.monitoring === null || effective?.monitoring === undefined
+            ? '未采集到'
+            : `自检 ${formatDuration(effective.monitoring.selfCheckSeconds * 1000)} · 提醒 ${formatDuration(effective.monitoring.attentionSeconds * 1000)}`}
+        </dd>
       </dl>
       {note === undefined ? null : <p className="dshdg-hint">{note}</p>}
     </div>
@@ -1418,6 +1435,123 @@ function PresetsCard({ store, snapshot }) {
   );
 }
 
+/**
+ * Advanced monitoring controls for a running task's silence.
+ *
+ * What this card deliberately does NOT do: it does not submit work, does not read a
+ * task, does not call a model, and does not create a monitoring process of its own.
+ * It edits two numbers and, on the operator's click, sends them to the one narrow
+ * authenticated route. Everything it says about the behaviour is a statement about
+ * the engine, not a control here.
+ *
+ * Units: the operator thinks in minutes, the document stores whole seconds. Each
+ * field converts on the way in and out (`minutesToSeconds` / `secondsToMinutes`), so a
+ * stored value of 300 s shows as 5 and a value of 90 s shows as 1.5 rather than being
+ * rounded into a different setting.
+ * @param {object} props - `store`, `snapshot`.
+ * @returns {object} the monitoring card.
+ */
+function MonitoringCard({ store, snapshot }) {
+  const draft = snapshot.draft;
+  const monitoring = monitoringOf(draft);
+  const saved = monitoringOf(snapshot.settings);
+  const [saving, setSaving] = useState(false);
+  const problems = precheckMonitoring(monitoring);
+  const dirty = monitoring.selfCheckSeconds !== saved.selfCheckSeconds
+    || monitoring.attentionSeconds !== saved.attentionSeconds;
+
+  /**
+   * Write one field, converting minutes back to the stored unit.
+   * @param {'selfCheckSeconds' | 'attentionSeconds'} field - target field.
+   * @param {unknown} raw - operator input, in minutes.
+   * @returns {void}
+   */
+  const edit = (field, raw) => {
+    store.editDraft((current) => {
+      current.monitoring = { ...monitoringOf(current), [field]: minutesToSeconds(raw) };
+    });
+  };
+
+  return (
+    <div className="dshdg-card" data-dshdg-monitoring="">
+      <h4>进阶：静默监控间隔</h4>
+      <p className="dshdg-hint">
+        任务长时间没有新输出时，插件自己会看一眼执行器还在不在（程序自检），再过一段时间才提醒你。
+        <strong>这些检查完全在本机进行，不会调用任何大模型，也不消耗 token。</strong>
+      </p>
+      <div className="dshdg-grid">
+        <Field
+          label="程序自检间隔（分钟）"
+          htmlFor="dshdg-monitoring-selfcheck"
+          hint={`${LIMITS.selfCheckSecondsMin / 60}–${LIMITS.selfCheckSecondsMax / 60} 分钟；存成整秒（当前 ${monitoring.selfCheckSeconds} 秒）`}
+        >
+          <input
+            id="dshdg-monitoring-selfcheck"
+            type="number"
+            inputMode="decimal"
+            min={LIMITS.selfCheckSecondsMin / 60}
+            max={LIMITS.selfCheckSecondsMax / 60}
+            step={0.5}
+            value={String(Number.isFinite(secondsToMinutes(monitoring.selfCheckSeconds)) ? secondsToMinutes(monitoring.selfCheckSeconds) : '')}
+            onChange={(event) => {
+              const raw = event.target.value;
+              edit('selfCheckSeconds', raw === '' ? '' : raw);
+            }}
+          />
+        </Field>
+        <Field
+          label="提醒你的间隔（分钟）"
+          htmlFor="dshdg-monitoring-attention"
+          hint={`${LIMITS.attentionSecondsMin / 60}–${LIMITS.attentionSecondsMax / 60} 分钟，且必须大于自检间隔；存成整秒（当前 ${monitoring.attentionSeconds} 秒）`}
+        >
+          <input
+            id="dshdg-monitoring-attention"
+            type="number"
+            inputMode="decimal"
+            min={LIMITS.attentionSecondsMin / 60}
+            max={LIMITS.attentionSecondsMax / 60}
+            step={0.5}
+            value={String(Number.isFinite(secondsToMinutes(monitoring.attentionSeconds)) ? secondsToMinutes(monitoring.attentionSeconds) : '')}
+            onChange={(event) => {
+              const raw = event.target.value;
+              edit('attentionSeconds', raw === '' ? '' : raw);
+            }}
+          />
+        </Field>
+      </div>
+      {problems.length === 0 ? null : <p className="dshdg-fail">{problems.join('；')}</p>}
+      <ul className="dshdg-hint">
+        <li>「没有新进展」本身不等于失败：插件不会因为安静、也不会因为单个工具跑得久就判定任务失败。</li>
+        <li>只有确实没有进展、并且超过「提醒你的间隔」之后，才会把这件事报告给派工方。</li>
+        <li>修改只影响<strong>之后新提交</strong>的任务；已经运行的任务保留它开始时的那份间隔快照。</li>
+        <li>程序自检只读取本机已有的事实（任务是否还在、当前阶段、有没有待决定的调用、正在跑哪个工具），不读取代码差异，也不会读取你的文件内容。</li>
+      </ul>
+      <div className="dshdg-row">
+        <button
+          type="button"
+          disabled={!dirty || saving || snapshot.loading?.monitoring === true || problems.length > 0}
+          onClick={async () => {
+            setSaving(true);
+            try {
+              await store.saveMonitoring(monitoring);
+            } finally {
+              setSaving(false);
+            }
+          }}
+        >
+          {snapshot.loading?.monitoring === true || saving ? '保存中…' : '只保存监控间隔'}
+        </button>
+        <span className="dshdg-hint">
+          {dirty ? '与已保存的值不同。' : `已保存：自检 ${saved.selfCheckSeconds} 秒，提醒 ${saved.attentionSeconds} 秒。`}
+        </span>
+      </div>
+      <p className="dshdg-hint">
+        也可以点页面底部的「保存设置」一起保存；保存的是同一个设置文档。
+      </p>
+    </div>
+  );
+}
+
 /** @param {object} props @returns {object} the execution settings panel. */
 function ExecutionPanel({ store, snapshot }) {
   const draft = snapshot.draft;
@@ -1508,6 +1642,7 @@ function ExecutionPanel({ store, snapshot }) {
             : `已应用：${preview.applied.join('；')}`}
         />
       )}
+      <MonitoringCard store={store} snapshot={snapshot} />
       {served === null ? (
         <p className="dshdg-faint">宿主尚未回报实际生效值（模型目录不可用或尚未加载）。</p>
       ) : (
@@ -1601,6 +1736,11 @@ function ReviewPanel({ store, snapshot }) {
 function TaskDetail({ store, task }) {
   const outcome = taskOutcome(task);
   const files = changedFiles(task);
+  // A bounded read of the task's own activity metadata. `available: false` means the
+  // record carries none (an old record, or a task that never reached execution), and
+  // that is stated as "未采集到" rather than as "idle" or "healthy".
+  const progress = taskProgress(task);
+  const activity = taskActivity(task);
   // `view()` freezes the configuration that actually ran; a later settings edit
   // does not retroactively change what a finished task reports.
   const worker = task.effective?.worker ?? {};
@@ -1635,6 +1775,12 @@ function TaskDetail({ store, task }) {
       </div>
       <p className="dshdg-muted">{outcome.note}</p>
 
+      <div className="dshdg-card" data-dshdg-task-progress="">
+        <h4>进展</h4>
+        <p className="dshdg-mono">{progress.headline}</p>
+        <p className="dshdg-hint">{progress.detail}</p>
+      </div>
+
       <dl className="dshdg-kv">
         <dt>生效提供方</dt>
         <dd className="dshdg-mono">{worker.providerId ?? '—'}</dd>
@@ -1658,6 +1804,31 @@ function TaskDetail({ store, task }) {
         </dd>
         <dt>阶段</dt>
         <dd>{taskPhaseLabel(task.phase)}</dd>
+        <dt>最近进展</dt>
+        <dd>
+          {activity === null || activity.lastActivityAt === null
+            ? '未采集到'
+            : `${formatTime(activity.lastActivityAt)}（距上次进展 ${formatDuration(activity.idleForMs)}）`}
+        </dd>
+        <dt>当前工具</dt>
+        <dd>
+          {activity === null || activity.currentTool === null
+            ? (activity === null ? '未采集到' : '当前没有正在运行的工具')
+            : `${activity.currentTool.name} · 已运行 ${formatDuration(activity.currentTool.elapsedMs)}`}
+        </dd>
+        <dt>无进展诊断</dt>
+        <dd>
+          {activity === null || activity.selfCheck === null || activity.selfCheck.verdict === null
+            ? (activity === null ? '未采集到' : '尚未触发程序自检（安静时间还没到自检间隔）')
+            : `${SELF_CHECK_LABELS[activity.selfCheck.verdict] ?? activity.selfCheck.verdict}`
+              + (activity.selfCheck.checkedAt === null ? '' : `（${formatTime(activity.selfCheck.checkedAt)}）`)}
+        </dd>
+        <dt>监控间隔</dt>
+        <dd>
+          {activity === null || activity.selfCheckSeconds === null
+            ? '未采集到'
+            : `自检 ${formatDuration(activity.selfCheckSeconds * 1000)} · 提醒 ${formatDuration((activity.attentionSeconds ?? 0) * 1000)}`}
+        </dd>
         <dt>创建</dt>
         <dd>{formatTime(task.createdAt)}</dd>
         <dt>结束</dt>
@@ -1752,58 +1923,142 @@ function TaskDetail({ store, task }) {
 }
 
 /** @param {object} props @returns {object} the task records panel. */
+/**
+ * Bounded, program-driven task refresh.
+ *
+ * Every condition here exists to keep a *visible page* from doing work on its own:
+ *
+ *  * it runs ONLY while the tasks tab is mounted (the effect lives in `TasksPanel`),
+ *    so switching tabs or unmounting clears the timer;
+ *  * it runs ONLY while there is something that can change — a live task in the list
+ *    or a live selected detail. A page full of terminal records never polls;
+ *  * it skips a hidden document (`document.hidden`) and registers a
+ *    `visibilitychange` listener so returning to the tab reads immediately instead
+ *    of waiting out the interval;
+ *  * it never overlaps: a refresh in flight suppresses the next tick, and the
+ *    interval is reset after each attempt, so a slow host cannot accumulate calls;
+ *  * it is a pure read of the task list — no model call, no task action, no settings
+ *    write — so it cannot disturb an unsaved draft or the selected task.
+ *
+ * The interval is deliberately much slower than the host's 5 s suggestion is worth
+ * fighting over: 5 s of list reads costs nothing and keeps the page truthful.
+ * @param {object} props - `store`, `snapshot`, `intervalMs`.
+ * @returns {object | null} nothing (side effects only).
+ */
+function useTaskAutoRefresh({ store, snapshot, intervalMs = 5000 }) {
+  const live = hasLiveTasks(snapshot.tasks) || (snapshot.taskDetail !== null && isLiveTask(snapshot.taskDetail));
+  // Read through a ref so the effect does not restart on every store revision: a
+  // restarted effect would reset the timer constantly and effectively poll far
+  // faster than the interval.
+  const liveRef = useRef(live);
+  liveRef.current = live;
+
+  useEffect(() => {
+    if (!live) return undefined;
+    let timer = null;
+    let disposed = false;
+
+    const schedule = () => {
+      if (disposed) return;
+      if (timer !== null) clearTimeout(timer);
+      timer = setTimeout(tick, intervalMs);
+      timer.unref?.();
+    };
+
+    const tick = () => {
+      timer = null;
+      if (disposed) return;
+      // A hidden tab is not watching anything: skip the read entirely, and let the
+      // visibility listener below schedule the next one when it comes back.
+      if (globalThis.document?.hidden === true) return;
+      if (!liveRef.current) return;
+      void store.refreshTasks('auto').finally(() => { schedule(); });
+    };
+
+    const onVisibility = () => {
+      if (globalThis.document?.hidden === true) return;
+      if (!liveRef.current) return;
+      if (timer !== null) clearTimeout(timer);
+      timer = null;
+      void store.refreshTasks('auto').finally(() => { schedule(); });
+    };
+
+    schedule();
+    const doc = globalThis.document;
+    doc?.addEventListener?.('visibilitychange', onVisibility);
+    return () => {
+      disposed = true;
+      if (timer !== null) clearTimeout(timer);
+      timer = null;
+      doc?.removeEventListener?.('visibilitychange', onVisibility);
+    };
+  }, [store, live, intervalMs]);
+}
+
 function TasksPanel({ store, snapshot }) {
   const tasks = snapshot.tasks ?? [];
   const detail = snapshot.taskDetail;
+  useTaskAutoRefresh({ store, snapshot });
+  const liveCount = tasks.filter(isLiveTask).length;
   return (
     <div className="dshdg-panel">
       <div className="dshdg-row">
         <p className="dshdg-muted">这里只记录执行事实。执行完成不等于被接受：“等待宿主审查”要由宿主（例如 Codex）单独给出结论。</p>
         <span className="dshdg-spacer" />
-        <button type="button" disabled={snapshot.loading?.tasks === true} onClick={() => { void store.loadTasks(); }}>
+        <span className="dshdg-hint">
+          {liveCount === 0 && !(detail !== null && isLiveTask(detail))
+            ? '当前没有运行中的任务，不会自动刷新。'
+            : `有 ${liveCount} 个进行中的任务，页面可见时每 5 秒自动刷新一次（只读，不调用模型）。`}
+        </span>
+        <button type="button" disabled={snapshot.loading?.tasks === true} onClick={() => { void store.refreshTasks('manual'); }}>
           {snapshot.loading?.tasks === true ? '读取中…' : '刷新'}
         </button>
       </div>
       {tasks.length === 0 ? <p className="dshdg-faint">还没有任务记录。</p> : (
         <div className="dshdg-list">
-          {tasks.map((task) => (
-            <div className="dshdg-item" key={task.taskId}>
-              <div className="dshdg-item-head">
-                <span className="dshdg-mono">{task.taskId}</span>
-                <Badge tone={isAwaitingPermission(task)
-                  ? 'warn'
-                  : (task.state === 'awaiting-host-review' ? 'warn' : (task.state === 'failed' ? 'warn' : 'off'))}>
-                  {taskStateLabel(task.state)}
-                </Badge>
-                {isAwaitingPermission(task) ? <Badge tone="warn">{PERMISSION_STATE_LABELS.pending}</Badge> : null}
-                <span className="dshdg-mono dshdg-faint">
-                  {task.config?.worker?.model ?? '—'}
-                  {' / '}
-                  {task.config?.worker?.reasoningEffort ?? '不指定'}
-                </span>
-                <span className="dshdg-spacer" />
-                <span className="dshdg-faint">{formatTime(task.createdAt)}</span>
-                <button
-                  type="button"
-                  disabled={snapshot.loading?.taskDetail === true}
-                  onClick={() => { void store.openTask(task.taskId); }}
-                >
-                  详情
-                </button>
-                <button
-                  type="button"
-                  className="dshdg-danger"
-                  disabled={!isCancellable(task.state)}
-                  onClick={() => { void store.cancelTask(task.taskId); }}
-                >
-                  取消
-                </button>
+          {tasks.map((task) => {
+            const progress = taskProgress(task);
+            return (
+              <div className="dshdg-item" key={task.taskId}>
+                <div className="dshdg-item-head">
+                  <span className="dshdg-mono">{task.taskId}</span>
+                  <Badge tone={isAwaitingPermission(task)
+                    ? 'warn'
+                    : (task.state === 'awaiting-host-review' ? 'warn' : (task.state === 'failed' ? 'warn' : 'off'))}>
+                    {taskStateLabel(task.state)}
+                  </Badge>
+                  <Badge tone={progress.tone}>{taskPhaseLabel(task.phase)}</Badge>
+                  {isAwaitingPermission(task) ? <Badge tone="warn">{PERMISSION_STATE_LABELS.pending}</Badge> : null}
+                  <span className="dshdg-mono dshdg-faint">
+                    {task.config?.worker?.model ?? task.effective?.worker?.model ?? '—'}
+                    {' / '}
+                    {task.config?.worker?.reasoningEffort ?? task.effective?.worker?.reasoningEffort ?? '不指定'}
+                  </span>
+                  <span className="dshdg-spacer" />
+                  <span className="dshdg-faint">{formatTime(task.createdAt)}</span>
+                  <button
+                    type="button"
+                    disabled={snapshot.loading?.taskDetail === true}
+                    onClick={() => { void store.openTask(task.taskId); }}
+                  >
+                    详情
+                  </button>
+                  <button
+                    type="button"
+                    className="dshdg-danger"
+                    disabled={!isCancellable(task.state)}
+                    onClick={() => { void store.cancelTask(task.taskId); }}
+                  >
+                    取消
+                  </button>
+                </div>
+                <p className="dshdg-hint">{progress.headline}</p>
+                {isAwaitingPermission(task)
+                  ? <p className="dshdg-hint">{permissionSummary(task).note}</p>
+                  : null}
               </div>
-              {isAwaitingPermission(task)
-                ? <p className="dshdg-hint">{permissionSummary(task).note}</p>
-                : <p className="dshdg-hint">{taskStateLabel(task.state) === '等待宿主审查' ? taskOutcome(task).note : ''}</p>}
-            </div>
-          ))}
+            );
+          })}
         </div>
       )}
       {detail === null ? null : <TaskDetail store={store} task={detail} />}

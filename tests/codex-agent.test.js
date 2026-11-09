@@ -168,3 +168,53 @@ test('the shipped dispatcher rules are what install actually writes', async () =
     rmSync(codexHome, { recursive: true, force: true });
   }
 });
+
+// ---------------------------------------------------------------------------
+// 1.1.0 companion template: wait-based dispatch, no local implementation
+// ---------------------------------------------------------------------------
+
+test('the shipped companion drives delegate_wait and never polls delegate_result in a loop', () => {
+  const template = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'codex', 'dsh-delegate.toml'), 'utf8');
+  // The wait tool is the loop; the old "poll delegate_result until terminal" rule is gone.
+  assert.match(template, /delegate_wait/u);
+  assert.doesNotMatch(template, /poll `delegate_result` for that\s+same task until terminal/u);
+  assert.doesNotMatch(template, /Keep polling the SAME task/u);
+  // Every actionable reason is named with its policy.
+  for (const reason of ['heartbeat', 'attention', 'permission', 'ready', 'failed', 'cancelled', 'interrupted', 'wait-limit']) {
+    assert.match(template, new RegExp(`\`${reason}\``, 'u'), `the template must state the ${reason} policy`);
+  }
+  // Heartbeat is internal: it must not be described as something to act on.
+  assert.match(template, /`heartbeat`: nothing to report/u);
+  // Ready is explicitly not acceptance.
+  assert.match(template, /is not\s+acceptance/iu);
+  // Attention defaults to waiting, not to cancelling or failing.
+  assert.match(template, /DEFAULT: keep waiting/u);
+  assert.match(template, /Never cancel, never mark the task failed/u);
+  // Result evidence is read ONCE, not repeatedly.
+  assert.match(template, /`delegate_result` ONCE/u);
+});
+
+test('the shipped companion forbids local implementation while a worker runs', () => {
+  const template = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'codex', 'dsh-delegate.toml'), 'utf8');
+  assert.match(template, /DO NOT IMPLEMENT LOCALLY WHILE A DELEGATED WORKER RUNS/u);
+  assert.match(template, /single-writer/u);
+  // The one exception is an explicit user-authorized takeover, and nothing weaker.
+  assert.match(template, /user-authorized takeover/u);
+  assert.match(template, /long silence, a permission refusal, a failed run or your own judgement/u);
+  // Corrections go back through continueFromTaskId on the same source path.
+  assert.match(template, /continueFromTaskId/u);
+});
+
+test('the shipped companion keeps its activation and safety rules unchanged', () => {
+  const template = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'codex', 'dsh-delegate.toml'), 'utf8');
+  for (const anchor of [
+    'ACTIVATION (check this before anything else)',
+    'delegate_preflight',
+    'Never open the switch yourself',
+    'delegate_permission_decide',
+    'fingerprint',
+    'REVIEW BOUNDARY',
+  ]) {
+    assert.ok(template.includes(anchor), `the template must still contain ${anchor}`);
+  }
+});

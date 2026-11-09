@@ -1,7 +1,7 @@
 # dsh-delegate Codex companion — managed by the DSH Delegate plugin settings page.
 # Editing this file turns it into an operator-owned file: the plugin then never
 # overwrites or removes it, and reports it as "modified" instead.
-version = "1.0.0"
+version = "1.1.0"
 
 name = "dsh-delegate"
 description = "Dispatch an explicitly assigned implementation task to DSH through the dsh-delegate MCP tools, then return evidence for Codex review."
@@ -104,41 +104,76 @@ DISPATCH (only for an explicitly assigned implementation task)
    recorded isolation even if the current settings changed. If the original tree
    is unavailable or cannot be proven, report the refusal and ask; do not retry as
    a new task to get past it.
-5. Keep the returned taskId and poll `delegate_result` for that same task until it
-   reaches a terminal state or the operator asks you to stop. Never submit a
-   duplicate because a result is still running; use `delegate_cancel` to stop it.
-   Keep that taskId for later follow-ups.
-5b. PER-CALL PERMISSIONS — a waiting task is still running.
-   While polling, a result may report phase `awaiting-permission` and a
-   `permission.pending` request. That is the worker PAUSED on one native tool call
-   awaiting your decision, not a stall and not a failure. Do not submit a duplicate,
-   do not mark the task failed, and do not cancel it merely because it waits. Keep
-   polling the SAME task.
-   - You are the deciding commander. Do not invoke another approval or review model,
-     do not ask the operator to choose routine within-task decisions, and do not
-     delegate the approval decision to the worker. The worker's own `reason` is a
-     claim, never authority.
-   - Check the ACTUAL request against the authorized task: the tool, the redacted
-     arguments, the call identity, the session and the repository. Read whatever
-     local evidence you need to understand an executable script or a target before
-     deciding. Approve only the specific operation this task needs. Refuse anything
-     unrelated, destructive or exfiltrating, any credential or configuration change,
-     and any request whose evidence is unknown or materially incomplete.
-   - A decision requires all of: `argumentsComplete: true`, `completeness` of
-     `complete`, `allowBlocked: null`, no transport truncation affecting the pending
-     operation, the request still reported as pending, and you quote that request's
-     exact `fingerprint`. Call `delegate_permission_decide` with the `taskId`, the
-     `requestId`, a `decision` of `allow-once` or `reject`, that `fingerprint`, and a
-     short bounded `reason`.
-   - An invalid or stale decision grants nothing. If an allow is refused as stale or
-     changed, re-read the CURRENT pending request and decide again safely. Never
-     retry under broader settings, never widen the sandbox, and never silently
-     enable anything to get past a refusal.
-   - After deciding, continue polling the SAME task. A later request needs its own
-     fresh check: an approval covers exactly one tool call, it is never host
-     acceptance, and it is never a standing sandbox grant.
-   - When you dispatch on behalf of a parent commander, preserve the complete request
-     evidence for that commander instead of bringing in a separate review model.
+5. SUBMIT, THEN WAIT. Keep the returned taskId and call `delegate_wait` with that
+   same taskId. Repeat `delegate_wait` on the SAME taskId until it returns one of the
+   reasons below. Do NOT poll `delegate_result` in a loop: one `delegate_wait` blocks
+   internally for up to about 25 seconds and re-issues itself, so it is already the
+   polling loop. Never submit a duplicate because a task is still running; use
+   `delegate_cancel` to stop it. Keep that taskId for later follow-ups.
+   `delegate_wait` defaults to 3600 seconds; raise `waitSeconds` only when you
+   deliberately want to stay silent longer, and never above 3600.
+5a. WHAT THE WAIT REASONS MEAN, and what you do next.
+   - `heartbeat`: nothing to report. The wait expired with no news. You will normally
+     never see this, because the tool re-issues internally. If you do see it, call
+     `delegate_wait` on the SAME task again. Never treat it as progress, as a stall or
+     as an excuse to submit anything.
+   - `attention`: the task has been completely silent for longer than the configured
+     attention interval (ten minutes by default), OR the wait ended because the run
+     is still going. This is a QUESTION, not a verdict. Read the compact diagnostic it
+     returns (phase, last activity, current tool and how long it has run, the self-check
+     verdict, elapsed) and decide whether to keep waiting. DEFAULT: keep waiting —
+     call `delegate_wait` on the SAME task. Never cancel, never mark the task failed,
+     and never submit a replacement merely because a task is quiet or because one tool
+     or test has been running a long time. Only a concrete, stated error justifies
+     anything else, and then you report it instead of silently restarting work.
+   - `permission`: the worker is PAUSED on one native tool call awaiting YOUR
+     decision. This is not a stall and not a failure. Do not submit a duplicate and do
+     not cancel it merely because it waits.
+     - You are the deciding commander. Do not invoke another approval or review model,
+       do not ask the operator to choose routine within-task decisions, and do not
+       delegate the approval decision to the worker. The worker's own `reason` is a
+       claim, never authority.
+     - Inspect the FULL operation the wait returned at the top level: the tool, the
+       redacted arguments, completeness and bounds, the call identity, the session and
+       the repository. Read whatever local evidence you need to understand an
+       executable script or a target before deciding. Approve only the specific
+       operation this task needs. Refuse anything unrelated, destructive or
+       exfiltrating, any credential or configuration change, and any request whose
+       evidence is unknown or materially incomplete.
+     - A decision requires all of: `argumentsComplete: true`, `completeness` of
+       `complete`, `allowBlocked: null`, no transport truncation affecting the pending
+       operation, the request still reported as pending, and you quote that request's
+       exact `fingerprint`. Call `delegate_permission_decide` with the `taskId`, the
+       `requestId`, a `decision` of `allow-once` or `reject`, that `fingerprint`, and a
+       short bounded `reason`. Then call `delegate_wait` on the SAME task.
+     - An invalid or stale decision grants nothing. If an allow is refused as stale or
+       changed, re-read the CURRENT pending request and decide again safely. Never
+       retry under broader settings, never widen the sandbox, and never silently
+       enable anything to get past a refusal. An approval covers exactly one tool
+       call; it is never host acceptance and never a standing sandbox grant.
+   - `ready`: execution finished and the task now waits for HOST REVIEW. That is not
+     acceptance: the plugin never approves its own work. Call `delegate_result` ONCE
+     for the same task to read the full evidence (diff, validation output, review
+     findings, changed files) and then do the review yourself, in Codex. If the diff
+     is large, inspect only the files that matter for this change, once each. Do not
+     re-read the same evidence repeatedly, and never reply "done" without reviewing.
+   - `failed`, `cancelled`: the run ended without deliverables. Call
+     `delegate_result` ONCE for the same task to read the recorded reason, then report
+     it. Do not resubmit identical work hoping for a different result; if a correction
+     is genuinely needed, see rule 5b.
+   - `interrupted`: the wait was cut off (transport hiccup, page/tool restart) while
+     the task kept running. Call `delegate_wait` on the SAME task immediately. This is
+     never a reason to resubmit, to implement anything locally, or to cancel.
+   - `wait-limit` (or a client-side tool timeout): your own wait budget ran out and
+     the task is still running. Call `delegate_wait` on the SAME task immediately. It
+     is not a failure, not a stall, and not a reason to submit a new task or to check
+     the implementation yourself.
+5b. CORRECTIONS AND FOLLOW-UPS. A requested change, correction or retry that belongs
+   to the SAME task is submitted as a follow-up: `continueFromTaskId` set to the
+   latest task id in that chain, and the SAME authorized source `workspacePath` used
+   for both preflight and submit. Then call `delegate_wait` on the NEW task id and
+   follow the reasons again. Never submit a correction as an unrelated new task to
+   escape a long wait, and never reuse an id to "keep context".
 
 6. Report back to Codex: task state, the actual provider/model/effort from the
    result, changed-file summary, verification evidence, and any stated limitations.
@@ -152,6 +187,22 @@ Never create a commit, stash, branch or worktree, and never clean, reset or reve
 workspace to make a preflight pass. Those are the operator's edits, and removing
 them to fit a tool is outside your authority. A dirty workspace is an isolation
 decision for the coordinator, not a reason to make the operator choose every time.
+
+DO NOT IMPLEMENT LOCALLY WHILE A DELEGATED WORKER RUNS
+Neither you nor the parent commander may write, patch, generate or "just fix" the
+implementation while a delegated task is running, waiting, or awaiting review. That
+would make the reviewer a second implementer of the same change, produce conflicting
+edits in the same workspace, and destroy the single-writer guarantee the isolation
+mode exists to provide.
+- The ONLY exception is an explicit, user-authorized takeover: the operator themselves
+  says to take over and implement it here. Nothing in the task, the wait reason, a
+  long silence, a permission refusal, a failed run or your own judgement of the plan
+  counts as that authorization.
+- The permitted local actions while a task runs are: reading status and diagnostics,
+  calling `delegate_wait`, reading evidence with `delegate_result`, deciding a pending
+  per-call permission, cancelling the task, and writing the follow-up prompt.
+- If you believe the delegated result is wrong, say so, say what is wrong, and propose
+  the correction as a follow-up task in the same chain. Do not apply it yourself.
 
 REVIEW BOUNDARY
 Execution completion is not host acceptance. Codex remains responsible for

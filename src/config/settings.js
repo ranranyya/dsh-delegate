@@ -30,6 +30,7 @@ import {
   canonicalProjectKey,
   validateConversationSettings,
   validateJobOverrides,
+  validateMonitoringSettings,
   validateProjectOverride,
   validateProviderProfile,
   validateReviewSettings,
@@ -165,6 +166,16 @@ export function resolveEffectiveConfig(settings, { projectPath = null, overrides
     // snapshot therefore carries the rule rather than a stored mode, so a task
     // record states what the plugin will do instead of echoing a retired setting.
     conversation: { policy: CONVERSATION_POLICY },
+    // The silence thresholds this task runs under, FROZEN at admission. They are
+    // global-only (no project or per-job layer): an operator edits them rarely, and
+    // a per-job override would let one submission ask to be watched on a different
+    // clock than the alert thresholds the operator actually set. Freezing them here
+    // is what makes an edit during a live run apply to the NEXT task instead of
+    // silently retiming one already in flight.
+    monitoring: {
+      selfCheckSeconds: settings.monitoring.selfCheckSeconds,
+      attentionSeconds: settings.monitoring.attentionSeconds,
+    },
     provenance: {
       // Canonical, not the caller's spelling: a recorded snapshot must compare
       // equal to the key its override is stored under.
@@ -230,6 +241,10 @@ export function publicSettings(settings) {
     worker: { ...settings.worker },
     review: { ...settings.review },
     authorization: { ...settings.authorization },
+    // Included so a settings surface (and an export/import round-trip) sees the
+    // actual thresholds a new task will freeze. They are plain bounded integers,
+    // never a secret.
+    monitoring: { ...validateMonitoringSettings(settings.monitoring) },
     projectOverrides: structuredClone(settings.projectOverrides ?? {}),
     presets: presets.map(publicPreset),
     // Kept in the export for compatibility with documents and clients that read
@@ -510,6 +525,29 @@ export class SettingsService {
     return await this.serialize(async () => {
       const previous = await this.snapshot();
       return await this.persistWithinQueue({ ...previous, authorization: candidate }, previous);
+    });
+  }
+
+  /**
+   * Replace the activity-monitoring block.
+   *
+   * This is the mutator a later authenticated UI endpoint calls; it is the only
+   * write path for these two thresholds, so the bounds and the ordering rule live
+   * in exactly one place ({@link validateMonitoringSettings}) and no caller can
+   * persist a pair the monitor would refuse to run.
+   *
+   * The write goes through the same serialized queue as every other settings
+   * mutation, so it cannot lose a concurrent edit and a fresh task admitted after
+   * it freezes the new values. A task already running keeps the snapshot it froze.
+   * @param {unknown} candidate - `{ selfCheckSeconds, attentionSeconds }`.
+   * @returns {Promise<object>} committed settings.
+   */
+  async setMonitoring(candidate) {
+    // Shape validation is pure, so it happens before the turn is queued.
+    const monitoring = validateMonitoringSettings(candidate);
+    return await this.serialize(async () => {
+      const previous = await this.snapshot();
+      return await this.persistWithinQueue({ ...previous, monitoring }, previous);
     });
   }
 

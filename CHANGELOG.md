@@ -1,5 +1,89 @@
 # Changelog
 
+## 1.1.0 — silent waiting and concentrated host review
+
+Candidate feature release. Ships the monitoring foundation, the browser settings and task
+panels, the Codex companion's wait-based dispatch rules and the managed Codex config
+migration. It is **not** published and **not** installed by this change.
+
+The transport that actually returns `delegate_wait` results (HTTP execution-plane and MCP
+tool) lands in the same release but a separate change; until both are present, the
+companion's new rules describe the contract the tool will honour, and the legacy
+`delegate_result` polling path still works.
+
+### Waiting no longer means polling
+
+- New global setting `monitoring = { selfCheckSeconds: 300, attentionSeconds: 600 }`,
+  stored as whole seconds, validated (self-check 30–3600, attention greater than the
+  self-check and at most 7200). Missing blocks use the defaults, so an existing
+  document keeps loading unchanged.
+- A running task now reports bounded activity metadata: last activity time, how long it
+  has been idle, the current tool call and how long it has run, event counters, and the
+  last self-check verdict. It carries **no** transcript, reasoning, tool arguments or
+  diff, so a task view can show progress without becoming a second transcript.
+- At the self-check interval the engine performs one read-only local inspection of the
+  executor it already holds (alive, phase, pending permission, current tool). No model
+  call, no workspace read, no state change, no deadline change.
+- At the attention interval it reports `attention` instead of staying silent. Idle time
+  is the only trigger: a single long tool call is not proof of progress, and nothing is
+  failed, cancelled or restarted for duration alone.
+- Real progress resets the silence and stays internal, so a healthy run never wakes the
+  dispatcher. Connection heartbeats, result polling and page refreshes never reset it.
+- Attention reports are delivered once per silence and then cooled down; concurrent
+  observers cannot both deliver the same one.
+
+### Settings page
+
+- New advanced monitoring controls in the existing execution panel: 5 and 10 minutes by
+  default, shown in minutes, stored as integer seconds, with local validation and a
+  narrow "save monitoring only" action. A general settings save persists them too.
+- The page states the behaviour it relies on: the checks are local, no LLM is called,
+  no-progress is not failure, and changes apply to newly submitted tasks only.
+- New authenticated route `POST /api/dsh-delegate/monitoring`. It is a browser-plane
+  operator action; the MCP surface still has no settings write.
+
+### Task records
+
+- Task rows and the detail view show the phase, the last activity, the current tool and
+  its elapsed time, and the no-progress diagnostic in plain Chinese. A record written
+  before this feature says "no progress information was collected" instead of inventing
+  an idle time.
+- The task tab refreshes itself every 5 seconds **only** while it is visible and at least
+  one task is still pending or running. It skips a hidden document, never overlaps a
+  request, cleans up its timer on tab change and unmount, and never reads or writes
+  settings. Terminal tasks stop the refresh.
+- No completion percentage is estimated or displayed.
+
+### Codex companion
+
+- Dispatch is now submit → `delegate_wait` on the same task id, repeated until a reason
+  is actionable. `heartbeat` is internal and never reaches the model.
+- Each reason has a stated policy: `attention` is a question and the default answer is to
+  keep waiting; `permission` is a decision on one call followed by waiting the same task;
+  `ready`/`failed`/`cancelled` read `delegate_result` once for full evidence;
+  `interrupted` and `wait-limit` immediately re-wait the same task.
+- Corrections are consolidated into a follow-up `continueFromTaskId` submission using the
+  same authorized source path.
+- Explicitly forbids the parent commander and the dispatch companion from implementing
+  locally while a delegated worker runs, except for an explicit user-authorized takeover.
+
+### Managed Codex config
+
+- The managed `[mcp_servers.dsh-delegate]` entry now carries `tool_timeout_sec = 3660`,
+  so a default 60-minute wait can complete. The value is written on this entry only.
+- A managed entry from an earlier release without the field is repaired in place, and
+  unrelated configuration is preserved byte for byte. An unmarked or differently shaped
+  same-name entry is still treated as operator-owned and never overwritten.
+- The published 1.0.0 companion is enumerated by exact SHA-256 (CRLF and LF byte forms),
+  so an existing 1.0.0 installation updates through the settings page instead of being
+  reported as somebody else's file.
+
+### Known limits
+
+- This release does not promise zero model tokens or a measured token saving. It changes
+  what a dispatcher is told and when.
+- Wait-return counts and timing metrics come from the transport change, not from this one.
+
 ## 1.0.0 — first formal release
 
 The first public major release of `dsh-delegate`. It is distributed from the GitHub

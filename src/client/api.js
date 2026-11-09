@@ -43,6 +43,9 @@ export const ROUTES = Object.freeze({
   delegation: `${USER_PLANE_PREFIX}/delegation`,
   nativeProviders: `${USER_PLANE_PREFIX}/native-providers`,
   settings: `${USER_PLANE_PREFIX}/settings`,
+  // One narrow, authenticated operator route for the two silence thresholds. It is
+  // a browser-plane write only: the MCP surface never gains a settings write.
+  monitoring: `${USER_PLANE_PREFIX}/monitoring`,
   catalog: `${USER_PLANE_PREFIX}/catalog`,
   connections: `${USER_PLANE_PREFIX}/connections`,
   connectionsRevoke: `${USER_PLANE_PREFIX}/connections/revoke`,
@@ -172,6 +175,19 @@ export function createApi(options = {}) {
      */
     async putSettings(settings) {
       return await request('POST', ROUTES.settings, { settings });
+    },
+    /**
+     * Replace only the two silence thresholds.
+     *
+     * This is the narrow route the advanced monitoring controls use, so a operator
+     * adjusting a timer cannot accidentally rewrite a provider list. The host
+     * re-validates: whole seconds, each in range, and the attention threshold strictly
+     * greater than the self-check one.
+     * @param {{ selfCheckSeconds: number, attentionSeconds: number }} monitoring - thresholds in seconds.
+     * @returns {Promise<object>} `{ monitoring, settings }`.
+     */
+    async putMonitoring(monitoring) {
+      return await request('POST', ROUTES.monitoring, { monitoring });
     },
     /**
      * Resolve provider models/efforts plus the composed effective config.
@@ -403,6 +419,59 @@ export function conversationModeLabel(mode) {
   return CONVERSATION_LABELS[mode] ?? String(mode ?? '未设置');
 }
 
+/**
+ * The monitoring block a draft carries, normalized to whole seconds.
+ *
+ * This is a *display/normalization* helper, not the validator: an out-of-range or
+ * inconsistent pair is passed through so the operator sees what they typed and the
+ * precheck can explain it. Only a missing block, a non-object, or a non-finite value
+ * falls back to the documented default — an older stored document (no `monitoring`
+ * key) therefore opens at 300/600 s, i.e. 5/10 minutes.
+ * @param {object | null} source - served document, draft, or raw block.
+ * @returns {{ selfCheckSeconds: number, attentionSeconds: number }} normalized block.
+ */
+export function monitoringOf(source) {
+  const block = source?.monitoring;
+  if (block === null || typeof block !== 'object' || Array.isArray(block)) return { ...MONITORING_DEFAULTS };
+  const whole = (value, fallback) => (Number.isFinite(value) ? Math.trunc(value) : fallback);
+  return {
+    selfCheckSeconds: whole(block.selfCheckSeconds, MONITORING_DEFAULTS.selfCheckSeconds),
+    attentionSeconds: whole(block.attentionSeconds, MONITORING_DEFAULTS.attentionSeconds),
+  };
+}
+
+/**
+ * Convert whole seconds to minutes, for display only.
+ *
+ * A threshold that is not a whole number of minutes is returned as a fraction so the
+ * field shows the stored value instead of a rounded one that would not round-trip.
+ * @param {number} seconds - stored threshold.
+ * @returns {number} minutes.
+ */
+export function secondsToMinutes(seconds) {
+  if (!Number.isFinite(seconds)) return 0;
+  return seconds / 60;
+}
+
+/**
+ * Convert a minutes input back to whole seconds.
+ *
+ * The stored unit is seconds: a fractional minute is converted and rounded, because
+ * the host accepts integers only. A non-numeric input yields `NaN`, which the local
+ * precheck reports rather than silently becoming a zero.
+ * @param {unknown} minutes - operator input.
+ * @returns {number} whole seconds, or NaN.
+ */
+export function minutesToSeconds(minutes) {
+  // An empty or blank field is NOT zero: `Number('')` is `0`, which would silently
+  // persist a threshold of 0 s instead of letting the precheck report the blank.
+  if (typeof minutes === 'string' && minutes.trim() === '') return Number.NaN;
+  if (minutes === null || minutes === undefined) return Number.NaN;
+  const value = typeof minutes === 'number' ? minutes : Number(String(minutes).trim());
+  if (!Number.isFinite(value)) return Number.NaN;
+  return Math.round(value * 60);
+}
+
 /** Grant scopes. */
 export const GRANT_KINDS = Object.freeze(['task', 'session']);
 
@@ -509,6 +578,46 @@ export const LIMITS = Object.freeze({
   sessionGrantTtlSecondsMin: 60,
   sessionGrantTtlSecondsMax: 43200,
   providers: 32,
+  // Silence thresholds. Mirrors `LIMITS` in `src/config/defaults.js`; the host is
+  // still the authority, these only drive input attributes and the local precheck.
+  selfCheckSecondsMin: 30,
+  selfCheckSecondsMax: 3600,
+  attentionSecondsMin: 31,
+  attentionSecondsMax: 7200,
+});
+
+/**
+ * Default silence thresholds, mirroring `MONITORING_DEFAULTS`.
+ *
+ * Stored as whole SECONDS (300 / 600). The panel presents them as minutes because
+ * that is how an operator thinks about them; a value that is not a whole number of
+ * minutes is still editable and is shown exactly.
+ */
+export const MONITORING_DEFAULTS = Object.freeze({
+  selfCheckSeconds: 300,
+  attentionSeconds: 600,
+});
+
+/** Chinese labels for the self-check verdicts the host publishes. */
+export const SELF_CHECK_LABELS = Object.freeze({
+  'executor-alive-silent': '执行器健在，这段时间没有新输出',
+  'executor-not-started': '执行器尚未开始',
+  'idle-between-steps': '两步之间，执行器已停止输出',
+  'tool-running': '某个工具调用仍在运行',
+  'waiting-for-permission': '正在等待本次调用授权决定',
+  settled: '任务已经结束',
+});
+
+/** Chinese labels for the reasons a wait returns. */
+export const WAIT_REASON_LABELS = Object.freeze({
+  heartbeat: '没有需要处理的事（内部心跳）',
+  attention: '长时间没有任何新进展，需要你判断',
+  permission: '有一次工具调用在等待授权决定',
+  ready: '执行已结束，等待宿主审查（不等于已接受）',
+  failed: '执行失败',
+  cancelled: '已取消',
+  interrupted: '这次等待被中断，任务仍在运行',
+  'wait-limit': '本轮等待时间用完，任务仍在运行',
 });
 
 /**
@@ -646,6 +755,10 @@ export function defaultDraft() {
     },
     review: { enabled: false, providerId: null, model: null, reasoningEffort: null },
     authorization: { taskGrantTtlSeconds: 900, sessionGrantTtlSeconds: 14400 },
+    // Silence thresholds. Present in a fresh draft so the controls render without a
+    // second load, and normalized from the served document below so an older host
+    // (or an older stored file) still opens with the documented defaults.
+    monitoring: { ...MONITORING_DEFAULTS },
     projectOverrides: {},
     presets: [],
     // Deprecated and inert, kept only so a save round-trips the stored document
@@ -688,6 +801,11 @@ export function draftFromSettings(document) {
     worker: { ...base.worker, ...(source.worker ?? {}) },
     review: { ...base.review, ...(source.review ?? {}) },
     authorization: { ...base.authorization, ...(source.authorization ?? {}) },
+    // A document written before this block existed has no `monitoring` key at all,
+    // and a host that predates it never serves one. Both open with the documented
+    // defaults instead of a blank control, and the values are coerced to whole
+    // seconds because that is the only shape the host accepts.
+    monitoring: monitoringOf(source),
     projectOverrides: clone(source.projectOverrides ?? {}),
     presets: Array.isArray(source.presets)
       ? source.presets.map((preset) => ({
@@ -732,6 +850,9 @@ export function documentFromDraft(draft) {
     worker: { ...source.worker },
     review: { ...source.review },
     authorization: { ...source.authorization },
+    // Sent on every save, normalized to whole seconds: the host refuses anything
+    // else, and a document that omitted the block would store the defaults.
+    monitoring: monitoringOf(source),
     projectOverrides: clone(source.projectOverrides ?? {}),
     presets: (source.presets ?? []).map((preset) => ({
       id: preset.id,
@@ -794,6 +915,9 @@ export function previewEffective(draft, projectPath = null) {
   return {
     worker: { ...worker, providerRoute: worker.providerId ?? null },
     review: { ...review, providerRoute: review.providerId ?? null },
+    // Global-only, like the host's own snapshot: no project or per-job layer can
+    // retime a task, so the preview reports the same pair the task would freeze.
+    monitoring: monitoringOf(draft),
     applied,
   };
 }
@@ -871,6 +995,25 @@ export function precheckDraft(draft) {
   const parallelism = Number(draft?.worker?.maxParallelism);
   if (!Number.isInteger(parallelism) || parallelism < LIMITS.maxParallelismMin || parallelism > LIMITS.maxParallelismMax) {
     problems.push(`最大并发需为 ${LIMITS.maxParallelismMin}–${LIMITS.maxParallelismMax} 之间的整数`);
+  }
+  const monitoring = monitoringOf(draft);
+  for (const [field, label] of [
+    ['selfCheckSeconds', '程序自检间隔'],
+    ['attentionSeconds', '提醒你的间隔'],
+  ]) {
+    const value = monitoring[field];
+    const min = field === 'selfCheckSeconds' ? LIMITS.selfCheckSecondsMin : LIMITS.attentionSecondsMin;
+    const max = field === 'selfCheckSeconds' ? LIMITS.selfCheckSecondsMax : LIMITS.attentionSecondsMax;
+    if (!Number.isInteger(value) || value < min || value > max) {
+      problems.push(`${label}需为 ${min}–${max} 秒之间的整数`);
+    }
+  }
+  // The ordering rule mirrors `validateMonitoringSettings`: an attention threshold at
+  // or below the self-check one would alert about something the self-check has not
+  // even examined yet.
+  if (Number.isInteger(monitoring.selfCheckSeconds) && Number.isInteger(monitoring.attentionSeconds)
+    && monitoring.attentionSeconds <= monitoring.selfCheckSeconds) {
+    problems.push('提醒你的间隔必须大于程序自检间隔');
   }
   return problems;
 }
@@ -972,6 +1115,173 @@ export function permissionSummary(task) {
     note: `最近一次调用授权请求：${outcome}。该决定只对那一次调用有效，不构成常规权限，也不会被后续调用复用。`,
     detail: `请求编号 ${last?.requestId ?? '—'}（共 ${evidence.length} 条记录）`,
   };
+}
+
+/**
+ * Human duration in plain Chinese, bounded to two units.
+ *
+ * Used for every elapsed span the task panels show ("12 秒", "4 分 12 秒",
+ * "2 小时 5 分"). A negative or non-finite value is reported as unknown rather than
+ * as a plausible-looking zero.
+ * @param {number | null | undefined} ms - milliseconds.
+ * @returns {string} Chinese duration, or `—`.
+ */
+export function formatDuration(ms) {
+  if (typeof ms !== 'number' || !Number.isFinite(ms) || ms < 0) return '—';
+  const totalSeconds = Math.floor(ms / 1000);
+  if (totalSeconds < 60) return `${totalSeconds} 秒`;
+  const minutes = Math.floor(totalSeconds / 60);
+  if (minutes < 60) return `${minutes} 分 ${totalSeconds % 60} 秒`;
+  const hours = Math.floor(minutes / 60);
+  return `${hours} 小时 ${minutes % 60} 分`;
+}
+
+/**
+ * The bounded activity block of a task, normalized for display.
+ *
+ * Returns `null` for a record that genuinely has none — including every task stored
+ * before this feature existed. A caller must render "没有采集到" for `null` rather than
+ * inventing a zero, because "no data" and "no activity" are different facts.
+ * @param {object} task - task view (list or detail).
+ * @returns {object | null} normalized activity, or null when the record has none.
+ */
+export function taskActivity(task) {
+  const activity = task?.activity;
+  if (activity === null || typeof activity !== 'object' || Array.isArray(activity)) return null;
+  const tool = activity.currentTool;
+  const selfCheck = activity.selfCheck;
+  return {
+    lastActivityAt: Number.isFinite(activity.lastActivityAt) ? activity.lastActivityAt : null,
+    idleForMs: Number.isFinite(activity.idleForMs) ? activity.idleForMs : null,
+    waitingOn: activity.waitingOn === 'tool' ? 'tool' : 'idle',
+    currentTool: tool === null || typeof tool !== 'object'
+      ? null
+      : {
+        name: typeof tool.name === 'string' && tool.name !== '' ? tool.name : '未知工具',
+        callId: typeof tool.callId === 'string' ? tool.callId : null,
+        startedAt: Number.isFinite(tool.startedAt) ? tool.startedAt : null,
+        elapsedMs: Number.isFinite(tool.elapsedMs) ? tool.elapsedMs : null,
+      },
+    lastTool: activity.lastTool !== null && typeof activity.lastTool === 'object'
+      ? { name: activity.lastTool.name ?? null, durationMs: Number.isFinite(activity.lastTool.durationMs) ? activity.lastTool.durationMs : null }
+      : null,
+    events: Number.isFinite(activity.events) ? activity.events : null,
+    activityEvents: Number.isFinite(activity.activityEvents) ? activity.activityEvents : null,
+    toolCallsStarted: Number.isFinite(activity.toolCallsStarted) ? activity.toolCallsStarted : null,
+    toolCallsFinished: Number.isFinite(activity.toolCallsFinished) ? activity.toolCallsFinished : null,
+    selfCheckSeconds: Number.isFinite(activity.selfCheckSeconds) ? activity.selfCheckSeconds : null,
+    attentionSeconds: Number.isFinite(activity.attentionSeconds) ? activity.attentionSeconds : null,
+    selfCheck: selfCheck === null || typeof selfCheck !== 'object'
+      ? null
+      : {
+        episode: Number.isFinite(selfCheck.episode) ? selfCheck.episode : null,
+        checkedAt: Number.isFinite(selfCheck.checkedAt) ? selfCheck.checkedAt : null,
+        verdict: typeof selfCheck.verdict === 'string' ? selfCheck.verdict : null,
+      },
+    finalizedAt: Number.isFinite(activity.finalizedAt) ? activity.finalizedAt : null,
+    interrupted: activity.interrupted === true,
+  };
+}
+
+/**
+ * One plain-Chinese line describing what a running task is doing, from its activity.
+ *
+ * Rules the wording obeys:
+ *
+ *  * it never claims a percentage of completion — the plugin does not measure one;
+ *  * an open tool call is described as a running tool with its OWN elapsed span,
+ *    and the silence is stated separately, because a tool that emits nothing is
+ *    still silence and may be reported as needing attention;
+ *  * a task with no activity block (an older record, or one that never ran) is
+ *    described as "未采集到进展信息", never as "空闲" or "正常".
+ * @param {object} task - task view.
+ * @returns {{ available: boolean, headline: string, detail: string, tone: 'off'|'on'|'warn' }} progress description.
+ */
+export function taskProgress(task) {
+  const activity = taskActivity(task);
+  const phase = taskPhaseLabel(task?.phase);
+  if (activity === null) {
+    return {
+      available: false,
+      headline: `${phase} · 未采集到进展信息`,
+      detail: '这条记录没有进展信息（可能是旧版本写入的记录，或任务尚未进入执行）。没有信息不等于没有进展，也不代表失败。',
+      tone: 'off',
+    };
+  }
+  const settled = typeof activity.finalizedAt === 'number';
+  const idle = formatDuration(activity.idleForMs);
+  const parts = [phase, `距上次进展 ${idle}`];
+  if (activity.currentTool !== null) {
+    parts.push(`正在运行 ${activity.currentTool.name}（已 ${formatDuration(activity.currentTool.elapsedMs)}）`);
+  }
+  const headline = parts.join(' · ');
+  const detailParts = [];
+  if (activity.currentTool !== null) {
+    detailParts.push('有一个工具调用正在运行；它本身耗时较长不算失败，也不会让插件结束任务。');
+  }
+  if (activity.selfCheck !== null && activity.selfCheck.verdict !== null) {
+    detailParts.push(`程序自检结论：${SELF_CHECK_LABELS[activity.selfCheck.verdict] ?? activity.selfCheck.verdict}`);
+  }
+  if (settled) {
+    detailParts.push('任务已结束，这些时间不再变化。');
+  } else if (activity.attentionSeconds !== null) {
+    detailParts.push(`超过 ${formatDuration(activity.attentionSeconds * 1000)} 没有新进展时会提醒你；提醒只是提示，不会自动判失败。`);
+  }
+  if (activity.activityEvents !== null && activity.events !== null) {
+    detailParts.push(`已记录 ${activity.events} 个执行事件，其中 ${activity.activityEvents} 个是真正的进展。`);
+  }
+  return {
+    available: true,
+    headline,
+    detail: detailParts.join(' '),
+    tone: activity.currentTool !== null ? 'on' : (settled ? 'off' : 'on'),
+  };
+}
+
+/**
+ * Whether a task is still live, i.e. a bounded auto-refresh may still learn something.
+ *
+ * `pending` and `running` are the only states that can change on their own; every
+ * other state is terminal and a refresh would only repeat the same bytes.
+ * @param {object} task - task view.
+ * @returns {boolean} true while the task may still progress.
+ */
+export function isLiveTask(task) {
+  return task?.state === 'pending' || task?.state === 'running';
+}
+
+/**
+ * Whether a task list contains any live task.
+ * @param {object[]} tasks - task views.
+ * @returns {boolean} true when at least one is pending or running.
+ */
+export function hasLiveTasks(tasks) {
+  return Array.isArray(tasks) && tasks.some(isLiveTask);
+}
+
+/**
+ * Pre-flight checks for the two silence thresholds.
+ *
+ * Mirrors `validateMonitoringSettings`. Kept separate because the monitoring save has
+ * its own narrow button: a bad timer must not block saving the rest of the settings,
+ * and a bad provider block must not block saving a timer.
+ * @param {{ selfCheckSeconds: number, attentionSeconds: number }} monitoring - normalized block.
+ * @returns {string[]} Chinese problem descriptions; empty when plausible.
+ */
+export function precheckMonitoring(monitoring) {
+  const problems = [];
+  const self = monitoring?.selfCheckSeconds;
+  const attention = monitoring?.attentionSeconds;
+  if (!Number.isInteger(self) || self < LIMITS.selfCheckSecondsMin || self > LIMITS.selfCheckSecondsMax) {
+    problems.push(`程序自检间隔需为 ${LIMITS.selfCheckSecondsMin}–${LIMITS.selfCheckSecondsMax} 秒之间的整数`);
+  }
+  if (!Number.isInteger(attention) || attention < LIMITS.attentionSecondsMin || attention > LIMITS.attentionSecondsMax) {
+    problems.push(`提醒你的间隔需为 ${LIMITS.attentionSecondsMin}–${LIMITS.attentionSecondsMax} 秒之间的整数`);
+  }
+  if (Number.isInteger(self) && Number.isInteger(attention) && attention <= self) {
+    problems.push('提醒你的间隔必须大于程序自检间隔');
+  }
+  return problems;
 }
 
 /**
@@ -1833,6 +2143,73 @@ export function createStore(options = {}) {
           return { ok: false, error };
         }
       });
+    },
+
+    /**
+     * Replace only the two silence thresholds.
+     *
+     * The narrow route exists so an operator adjusting a timer cannot rewrite a
+     * provider list. On success the committed document is adopted for `settings` and
+     * the draft's monitoring block, and OTHER unsaved draft edits are left alone —
+     * a timer save must never discard a half-finished provider edit.
+     * @param {{ selfCheckSeconds: number, attentionSeconds: number }} monitoring - already-validated block.
+     * @returns {Promise<{ ok: boolean, error?: unknown }>} outcome.
+     */
+    async saveMonitoring(monitoring) {
+      const normalized = monitoringOf({ monitoring });
+      const problems = precheckMonitoring(normalized);
+      if (problems.length > 0) {
+        notify('error', `未保存：${problems.join('；')}`);
+        return { ok: false, problems };
+      }
+      return await track('monitoring', async () => {
+        try {
+          const body = await api.putMonitoring(normalized);
+          const committed = body.settings ?? null;
+          const draft = state.draft === null
+            ? draftFromSettings(committed)
+            : { ...state.draft, monitoring: monitoringOf(committed ?? { monitoring: normalized }) };
+          patch({ settings: committed, draft });
+          notify('success', '监控间隔已保存。已开始运行的任务保留它自己的快照，新任务使用新值。');
+          return { ok: true, monitoring: body.monitoring ?? normalized };
+        } catch (error) {
+          notify('error', describeError(error));
+          return { ok: false, error };
+        }
+      });
+    },
+
+    /**
+     * Refresh the task list without operator-facing noise.
+     *
+     * Used by the bounded auto-refresh only. It differs from {@link store.loadTasks}
+     * in three ways that matter for a background read: it never notifies on failure
+     * (a transient blip must not spam the page), it never clears a previously loaded
+     * list on error, and it is a pure read — no model call, no task action — so a
+     * visible page cannot cause work by being visible.
+     * @param {string} [reason] - `auto` for the timer, `manual` for an explicit click.
+     * @returns {Promise<{ ok: boolean, tasks?: object[] }>} outcome.
+     */
+    async refreshTasks(reason = 'auto') {
+      if (state.loading?.tasks === true) return { ok: false, skipped: 'in-flight' };
+      patch({ loading: { ...state.loading, tasks: true } });
+      try {
+        const body = await api.listTasks();
+        const tasks = Array.isArray(body.tasks) ? body.tasks : [];
+        // The selected detail is refreshed from the SAME list snapshot rather than a
+        // second request, so the panel never shows a detail older than its row, and
+        // the operator's selection is never changed by a background read.
+        const detail = state.taskDetail === null
+          ? null
+          : tasks.find((task) => task.taskId === state.taskDetail.taskId) ?? state.taskDetail;
+        patch({ tasks, taskDetail: detail });
+        return { ok: true, tasks, reason };
+      } catch (error) {
+        if (reason === 'manual') notify('error', describeError(error));
+        return { ok: false, error };
+      } finally {
+        if (!disposed) patch({ loading: { ...state.loading, tasks: false } });
+      }
     },
 
     /** Read the task list. */

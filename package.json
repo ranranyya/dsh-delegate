@@ -1,6 +1,6 @@
 {
   "name": "dsh-delegate",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "DSH plugin for switch-controlled local MCP delegation using configured providers, explicit model routing and optional read-only review.",
   "license": "MIT",
   "repository": {
@@ -57,6 +57,7 @@
     "docs/contracts-stage-b.md",
     "docs/redaction-contract.md",
     "docs/runtime-compatibility.md",
+    "docs/silent-wait.md",
     "docs/worker-permissions.md",
     "docs/workspace-contract.md"
   ],

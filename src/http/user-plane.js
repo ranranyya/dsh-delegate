@@ -103,6 +103,44 @@ export function userPlaneRoutes(deps) {
         return jsonResponse(200, { ok: true, delegation: deps.engine.posture() });
       },
     },
+    // One narrow route for the two silence thresholds.
+    //
+    // It is on the AUTHENTICATED operator plane, like every other settings write, and
+    // it is the only place a monitoring edit can enter. The MCP surface never gains a
+    // settings write: this route is reachable only from the operator's own page, and
+    // it cannot widen an authorization, a grant, a switch, a provider or an isolation
+    // mode — `setMonitoring` validates its own block and rewrites nothing else.
+    {
+      path: `${USER_PLANE_PREFIX}/monitoring`,
+      methods: ['POST'],
+      requestBody: BODY_MODE,
+      fetch: async (request) => {
+        const body = await readJsonRequest(request);
+        if (body.monitoring === undefined) {
+          throw new HttpError(400, 'MONITORING_MISSING', 'a monitoring block is required');
+        }
+        // `setMonitoring` refuses an invalid block with a `MONITORING_*` code. That
+        // code is the validator's, and the shared error translator would render an
+        // unlisted code as a 500; a refused TIMER is the caller's mistake, so it is
+        // re-thrown here as a 400 that keeps the original code and its field details.
+        // Nothing is written when this throws.
+        let committed;
+        try {
+          committed = await deps.settings.setMonitoring(body.monitoring);
+        } catch (error) {
+          const code = typeof error?.code === 'string' ? error.code : '';
+          if (!code.startsWith('MONITORING_')) throw error;
+          throw new HttpError(400, code, String(error?.message ?? 'the monitoring block is invalid'), error?.details ?? {});
+        }
+        return jsonResponse(200, {
+          ok: true,
+          monitoring: { ...committed.monitoring },
+          // The whole document is returned too, because the page adopts it after a
+          // narrow save and must not have to issue a second read to stay truthful.
+          settings: publicSettings(committed),
+        });
+      },
+    },
     // One path, two methods. `GET` reads the stored document, `POST` replaces it.
     // There is deliberately no `PUT`: the native registry cannot express it.
     {

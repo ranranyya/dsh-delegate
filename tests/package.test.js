@@ -53,25 +53,24 @@ const SUPPORTED_DSH_RANGE = SUPPORTED_DSH_VERSIONS.join(' || ');
  * The package version this build must declare everywhere a human writes it.
  *
  * Pinned rather than derived: `MANIFEST.version` is one of the places checked below,
- * so asserting itself would pass for any value. `1.0.0` is the first formal release;
- * it carries the commander's per-call
- * permission decision to the installable plugin (the sixth MCP tool
- * `delegate_permission_decide`), updates the managed Codex companion with the per-call
- * decision rules while keeping its activation, explicit-continuation, route-from-DSH and
- * source-path rules unchanged, and enumerates the published `0.1.13` agent template so an
- * unchanged `0.1.13` file is refreshed while a user-edited one never is. It follows the
- * `0.1.13` DSH 0.2.2 compatibility build.
+ * so asserting itself would pass for any value. `1.1.0` is the silent-waiting release:
+ * it adds the global `monitoring` thresholds (self-check and attention intervals),
+ * bounded activity metadata on every task view, the authenticated monitoring settings
+ * route and its Chinese controls, the task panel's bounded auto-refresh, the Codex
+ * companion's submit → `delegate_wait` rules with an explicit no-local-implementation
+ * boundary, and the managed MCP entry's owned `tool_timeout_sec` so one default
+ * 60-minute wait can complete. It follows the `1.0.0` per-call permission release.
  */
-const DELIVERABLE_VERSION = '1.0.0';
+const DELIVERABLE_VERSION = '1.1.0';
 
 /**
  * The published build this release upgrades *from*.
  *
  * Kept as its own constant because the release assertions below are relative: the
- * current version must be exactly one patch above this baseline, and the two are
- * different versions by construction.
+ * current version must be exactly one MINOR above this baseline (a feature release),
+ * and the two are different versions by construction.
  */
-const PREVIOUS_VERSION = '0.1.14';
+const PREVIOUS_VERSION = '1.0.0';
 
 // Published prior builds are retained only where the migration/ownership contract
 // names them. Other operator-facing and shipped code must not carry stale versions.
@@ -594,9 +593,9 @@ test(`the release is ${DELIVERABLE_VERSION}, the first formal major release afte
 
   const previous = semverParts(PREVIOUS_VERSION);
   const current = semverParts(MANIFEST.version);
-  assert.equal(current.major, previous.major + 1, `the formal release must advance the major version after ${PREVIOUS_VERSION}`);
-  assert.equal(current.minor, 0, 'the first formal release must reset the minor version');
-  assert.equal(current.patch, 0, 'the first formal release must reset the patch version');
+  assert.equal(current.major, previous.major, `a feature release keeps the major version after ${PREVIOUS_VERSION}`);
+  assert.equal(current.minor, previous.minor + 1, 'the feature release must advance the minor version');
+  assert.equal(current.patch, 0, 'a feature release must reset the patch version');
 
   const lock = JSON.parse(readFileSync(join(ROOT, 'package-lock.json'), 'utf8'));
   assert.equal(lock.version, DELIVERABLE_VERSION, 'package-lock.json#version must match package.json');

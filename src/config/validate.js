@@ -15,6 +15,7 @@ import {
   KNOWN_EFFORTS,
   LEGACY_CONVERSATION_MODES,
   LIMITS,
+  MONITORING_DEFAULTS,
   SCHEMA_VERSION,
   SUPPORTED_PROTOCOLS,
   defaultSettings,
@@ -419,6 +420,71 @@ export function validateReviewSettings(value, providers) {
   };
 }
 
+/**
+ * Validate the activity-monitoring block.
+ *
+ * Two silence thresholds, both in whole seconds, both bounded:
+ *
+ *  * `selfCheckSeconds` is when the engine performs ONE read-only local
+ *    inspection of the executor it already holds (alive, phase, pending request,
+ *    current tool) and reports it on an internal re-wait. It never starts an LLM
+ *    call and never touches the task's state, budget or deadline.
+ *  * `attentionSeconds` is when a wait stops keeping quiet and reports
+ *    `attention` to the commander instead of `heartbeat`.
+ *
+ * A missing block is the documented default (backwards compatible: documents
+ * written before this field existed keep loading). Everything else is refused
+ * rather than repaired — an unknown key (a typo such as `atentionSeconds` would
+ * otherwise silently keep the default), a wrong type, a non-integer, an
+ * out-of-range value, and any pair where the attention threshold is not strictly
+ * greater than the self-check one. A repaired value would make the two timers
+ * disagree with what the operator stored, which is exactly the class of silent
+ * mismatch this plugin refuses everywhere else.
+ * @param {unknown} value - candidate monitoring block.
+ * @returns {{ selfCheckSeconds: number, attentionSeconds: number }} normalized block.
+ */
+export function validateMonitoringSettings(value) {
+  if (value === undefined || value === null) {
+    return {
+      selfCheckSeconds: MONITORING_DEFAULTS.selfCheckSeconds,
+      attentionSeconds: MONITORING_DEFAULTS.attentionSeconds,
+    };
+  }
+  if (typeof value !== 'object' || Array.isArray(value)) {
+    throw new ConfigError('MONITORING_INVALID', 'monitoring settings must be an object', { field: 'monitoring' });
+  }
+  for (const key of Object.keys(value)) {
+    if (key !== 'selfCheckSeconds' && key !== 'attentionSeconds') {
+      throw new ConfigError('MONITORING_INVALID', `monitoring setting ${key} is not supported`, {
+        field: `monitoring.${key}`,
+        supported: ['selfCheckSeconds', 'attentionSeconds'],
+      });
+    }
+  }
+  const selfCheckSeconds = requireInt(
+    value.selfCheckSeconds === undefined ? MONITORING_DEFAULTS.selfCheckSeconds : value.selfCheckSeconds,
+    'MONITORING_INVALID',
+    'monitoring.selfCheckSeconds',
+    LIMITS.selfCheckSecondsMin,
+    LIMITS.selfCheckSecondsMax,
+  );
+  const attentionSeconds = requireInt(
+    value.attentionSeconds === undefined ? MONITORING_DEFAULTS.attentionSeconds : value.attentionSeconds,
+    'MONITORING_INVALID',
+    'monitoring.attentionSeconds',
+    LIMITS.attentionSecondsMin,
+    LIMITS.attentionSecondsMax,
+  );
+  if (attentionSeconds <= selfCheckSeconds) {
+    throw new ConfigError(
+      'MONITORING_TIMING_INVALID',
+      'monitoring.attentionSeconds must be greater than monitoring.selfCheckSeconds',
+      { field: 'monitoring.attentionSeconds', selfCheckSeconds, attentionSeconds },
+    );
+  }
+  return { selfCheckSeconds, attentionSeconds };
+}
+
 /** Validate legacy grant TTLs kept for backwards-compatible imports. */
 export function validateAuthorizationSettings(value) {
   const source = value ?? {};
@@ -689,6 +755,7 @@ export function validateSettings(value, options = {}) {
     worker,
     review,
     authorization: validateAuthorizationSettings(value.authorization),
+    monitoring: validateMonitoringSettings(value.monitoring),
     projectOverrides: validateProjectOverrides(value.projectOverrides, providers),
     presets: validatePresets(value.presets, providers),
     conversation: validateConversationSettings(value.conversation),

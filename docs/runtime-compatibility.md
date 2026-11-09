@@ -1,22 +1,24 @@
 # Runtime compatibility
 
-This document states which DSH runtimes this plugin build (`1.0.0`, package
-`dsh-delegate-1.0.0.tgz`) may be loaded into, what changed in the newest one, and what
+This document states which DSH runtimes this plugin build (`1.1.0`, package
+`dsh-delegate-1.1.0.tgz`) may be loaded into, what changed in the newest one, and what
 has and has not been verified on it. It is a compatibility note, not an acceptance
 report; the package is distributed through the GitHub Release.
 
-`1.0.0` adds the commander's per-call permission decision (a sixth MCP tool,
-`delegate_permission_decide`) and the release packaging deferred from the core batch: the
-version bump, the updated managed Codex companion and the `0.1.13` agent-template
-digest. The supported runtime range below and the execution implementation are carried
-over unchanged from `0.1.13`; the DSH `0.2.2` compatibility described here was introduced
-by `0.1.12` and is historical fact for this build, not a `0.1.14` feature.
+`1.1.0` adds silent waiting: the global `monitoring` thresholds (self-check and attention
+intervals), bounded activity metadata on every task view, the authenticated monitoring
+settings route and its Chinese controls, the task panel's bounded auto-refresh, the Codex
+companion's submit → `delegate_wait` rules, and the managed MCP entry's owned
+`tool_timeout_sec`. The supported runtime range below and the execution implementation are
+carried over unchanged from `1.0.0`; the DSH `0.2.2` compatibility described here was
+introduced by `0.1.12` and is historical fact for this build.
 
 **Not verified:** this build has not been installed on the production Desktop profile.
-The production Desktop profile must be upgraded to this build; exposing the sixth tool
-requires an MCP reconnect or a new session, and the real
-provider → commander → resume acceptance run is still pending. No unit-test count and no
-mock constitutes that run.
+The production Desktop profile must be upgraded to this build, and the Codex companion
+must be refreshed from the settings page and Codex reloaded before the new wait rules and
+the managed `tool_timeout_sec` take effect. The transport that returns `delegate_wait`
+results ships in the same release; until it is present the legacy `delegate_result` path
+still works. No unit-test count and no mock constitutes an acceptance run.
 
 ## 1. Supported versions
 

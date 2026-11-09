@@ -2,14 +2,23 @@
 //
 // Design rule taken from SPEC §10–11: an external MCP client may *exercise* an
 // authorization the operator already created, and may do nothing else. So this
-// server exposes six tools and maps each one onto one execution-plane route:
+// server exposes seven tools and maps each one onto one execution-plane route:
 //
 //   delegate_status            → GET  /dsh-delegate/x/status
 //   delegate_submit            → POST /dsh-delegate/x/tasks
 //   delegate_result            → POST /dsh-delegate/x/tasks/get
+//   delegate_wait              → POST /dsh-delegate/x/tasks/observe  (repeated)
 //   delegate_cancel            → POST /dsh-delegate/x/tasks/cancel
 //   delegate_permission_decide → POST /dsh-delegate/x/tasks/permission
 //   delegate_preflight         → POST /dsh-delegate/x/workspace/preflight
+//
+// `delegate_wait` is a read like `delegate_result`, and it is the one tool whose
+// single call may take a long time: it composes several BOUNDED observation
+// requests (each ≤ {@link OBSERVE_WAIT_MS}) into one host-visible wait, and returns
+// as soon as the task reaches a state the host must act on — a permission request,
+// a finished run, a failure, a cancellation — or when the caller's own deadline is
+// reached. It never calls `delegate_result`: a wait answer is compact by design, and
+// the full snapshot stays behind its own bounded projection.
 //
 // `delegate_permission_decide` is the one NARROW EXCEPTION to the sentence above,
 // and it is narrow in exactly one way: it consumes an ALREADY PENDING per-call
@@ -53,6 +62,7 @@
 // made it fail at link time with `ERR_MODULE_NOT_FOUND` before it could report
 // anything at all.
 import { diagnostic, redactText } from '../config/redact.js';
+import { waitForTask } from './wait.js';
 
 /** Protocol revisions this server can speak, newest first (as the SDK lists them). */
 export const SUPPORTED_PROTOCOL_VERSIONS = Object.freeze([
@@ -66,13 +76,57 @@ export const SUPPORTED_PROTOCOL_VERSIONS = Object.freeze([
 export const LATEST_PROTOCOL_VERSION = SUPPORTED_PROTOCOL_VERSIONS[0];
 
 /** Identifies this server in the handshake. */
-export const SERVER_INFO = Object.freeze({ name: 'dsh-delegate', version: '1.0.0' });
+export const SERVER_INFO = Object.freeze({ name: 'dsh-delegate', version: '1.1.0' });
 
 /** Bound on a tool result's text. A task view can be large; a model's context cannot. */
 export const MAX_TOOL_TEXT_CHARS = 20_000;
 
 /** Bound on one execution-plane request. */
 export const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
+
+/**
+ * Longest single observation request `delegate_wait` issues, in milliseconds.
+ *
+ * Deliberately equal to the execution plane's own bound (`MAX_OBSERVE_WAIT_MS`):
+ * the plane clamps anything larger, so a longer value here would only make the
+ * client believe it had asked for something the server does not do.
+ */
+export const OBSERVE_WAIT_MS = 25_000;
+
+/** Default deadline of one `delegate_wait` call, in seconds (one hour). */
+export const DEFAULT_WAIT_SECONDS = 3_600;
+
+/** Longest deadline one `delegate_wait` call may ask for, in seconds (one hour). */
+export const MAX_WAIT_SECONDS = 3_600;
+
+/** Shortest deadline one `delegate_wait` call may ask for, in seconds. */
+export const MIN_WAIT_SECONDS = 1;
+
+/**
+ * How many requests may be in flight at once on the stdio transport.
+ *
+ * A request that takes minutes (a wait) must not stop the host from sending
+ * `tools/call` for a status read, a cancel or a permission decision. Concurrency is
+ * bounded anyway: each in-flight request holds a socket, a promise and its own
+ * encoded reply, and an unbounded number of those is a memory bound the host, not
+ * this server, controls. Beyond the cap the request is REFUSED explicitly rather
+ * than queued silently, so a host learns its situation instead of wondering.
+ */
+export const MAX_INFLIGHT_REQUESTS = 32;
+
+/** How many call records are retained for tests/diagnostics. */
+export const MAX_CALL_LOG = 256;
+
+/**
+ * Reasons on which `delegate_wait` returns to the host.
+ *
+ * `heartbeat` is deliberately absent: it is the engine's internal "nothing changed
+ * yet" signal, consumed by the wait loop and never surfaced as an answer.
+ */
+export const ACTIONABLE_REASONS = Object.freeze(['attention', 'permission', 'ready', 'failed', 'cancelled', 'interrupted']);
+
+/** The reason a wait that reached its own deadline reports. */
+export const WAIT_LIMIT_REASON = 'wait-limit';
 
 /** JSON-RPC error codes used here (the standard set, not invented ones). */
 export const RPC_ERRORS = Object.freeze({
@@ -188,6 +242,38 @@ export const TOOLS = Object.freeze([
     }),
   }),
   Object.freeze({
+    name: 'delegate_wait',
+    title: 'Wait for a task to need you',
+    description: 'Follow ONE task this connection submitted and return as soon as it needs the host. '
+      + 'A single call blocks for up to waitSeconds (default 3600) and returns a COMPACT answer: '
+      + '`reason` is `permission` (a per-call request is pending), `attention` (no activity for about ten '
+      + 'minutes, so the run may be stuck), `ready` (the run ended and is awaiting host review), `failed`, '
+      + '`cancelled` or `interrupted`. '
+      + '`reason: "wait-limit"` means the deadline was reached and NOTHING changed: call delegate_wait again '
+      + 'with the same taskId — do not review, resubmit or restart the task. '
+      + 'Heartbeats are internal to this call and are never returned. '
+      + 'This tool reads; it never submits, cancels or decides anything, and it does not fetch the task\u2019s '
+      + 'diff or full result (use delegate_result for that, after an actionable reason). '
+      + 'On `permission`, the returned `permission` block carries the pending request with its requestId, '
+      + 'its exact fingerprint and the full existing redacted operation, so delegate_permission_decide can '
+      + 'be sent without another read.',
+    inputSchema: Object.freeze({
+      type: 'object',
+      properties: {
+        taskId: { type: 'string', description: 'Task identity returned by delegate_submit.' },
+        waitSeconds: {
+          type: 'integer',
+          minimum: MIN_WAIT_SECONDS,
+          maximum: MAX_WAIT_SECONDS,
+          description: 'How long this one call may wait, in seconds (default 3600). '
+            + 'A returned `wait-limit` means this deadline was reached, not that the task stalled.',
+        },
+      },
+      required: ['taskId'],
+      additionalProperties: false,
+    }),
+  }),
+  Object.freeze({
     name: 'delegate_cancel',
     title: 'Cancel task',
     description: 'Ask the harness to stop one task this connection submitted, and return its state afterwards.',
@@ -269,6 +355,7 @@ const TOOL_ROUTES = Object.freeze({
   delegate_status: 'status',
   delegate_submit: 'submit',
   delegate_result: 'result',
+  delegate_wait: 'observe',
   delegate_cancel: 'cancel',
   delegate_permission_decide: 'permission',
   delegate_preflight: 'preflight',
@@ -316,6 +403,17 @@ function validateArgs(tool, args) {
       // Strict: a model that sends the string "true" gets a refusal naming the
       // field instead of a silently truthy value reaching the plane.
       if (typeof field !== 'boolean') throw new McpError('MCP_ARGUMENT_TYPE', `${tool.name}.${key} must be a boolean`);
+      out[key] = field;
+    } else if (declared.type === 'integer') {
+      // Strict for the same reason: `"3600"` and `3600.5` are refused with the
+      // field named rather than silently coerced into a deadline nobody chose.
+      if (!Number.isInteger(field)) throw new McpError('MCP_ARGUMENT_TYPE', `${tool.name}.${key} must be an integer`);
+      if (typeof declared.minimum === 'number' && field < declared.minimum) {
+        throw new McpError('MCP_ARGUMENT_RANGE', `${tool.name}.${key} must be at least ${declared.minimum}`);
+      }
+      if (typeof declared.maximum === 'number' && field > declared.maximum) {
+        throw new McpError('MCP_ARGUMENT_RANGE', `${tool.name}.${key} must be at most ${declared.maximum}`);
+      }
       out[key] = field;
     } else if (declared.type === 'object') {
       if (field === null || typeof field !== 'object' || Array.isArray(field)) {
@@ -644,10 +742,16 @@ function projectWithStage(value, stage, collect) {
       projected.tasks = projected.tasks.map((task, index) => skeletonize(task, `tasks[${index}]`, cap, collect));
     }
     // Anything else at the top level (a status answer's grants, a list's extras)
-    // is trimmed rather than dropped, so nothing disappears unexplained.
+    // is trimmed rather than dropped, so nothing disappears unexplained. The
+    // exception is `permission`: a wait answer publishes the pending operation there,
+    // and a generic per-string cut would shorten the operation WITHOUT updating
+    // `argumentsComplete`/`allowBlocked`, publishing a shortened operation that still
+    // reads as complete. It is bounded by the permission rule instead.
     for (const [key, item] of Object.entries(projected)) {
       if (key === 'task' || key === 'tasks' || key === 'ok') continue;
-      projected[key] = trimAllStrings(item, key, cap, collect);
+      projected[key] = key === 'permission'
+        ? boundPermissionBlock(item, key, collect)
+        : trimAllStrings(item, key, cap, collect);
     }
   }
   return projected;
@@ -753,6 +857,102 @@ function pendingPermissionsOf(task, path, collect) {
 }
 
 /**
+ * The keys of a pending permission request that a decision is bound to.
+ *
+ * A value under one of these keys is copied VERBATIM: cutting an identity would
+ * make the request undecidable, and cutting the `completeness` flags would let a
+ * shortened operation read as a decidable one — which is exactly the property the
+ * per-call permission boundary depends on.
+ */
+const PERMISSION_IDENTITY_KEYS = Object.freeze([
+  'requestId', 'taskId', 'sessionId', 'toolName', 'callId', 'state', 'completeness',
+  'argumentsComplete', 'allowBlocked', 'reasonSource', 'boundsApplied', 'omitted',
+  'requestedAccess', 'argumentKeys', 'argumentsRedacted', 'fingerprint', 'standingModeUnchanged',
+]);
+
+/**
+ * The blobs of a pending permission request, and the cap applied to each.
+ *
+ * `reason` is the worker's claim and `arguments` is the operation; both are prose
+ * from a model, so both are bounded — but at a cap large enough for a real tool
+ * call. When the cap fires, `boundsApplied` gains this server's own marker and
+ * `argumentsComplete` is forced to `false` in {@link boundPermissionRequest}, so a
+ * shortened operation is never presented as complete.
+ */
+const PERMISSION_BLOB_CAP = 4_000;
+
+/**
+ * Bound one pending permission request without ever making it look decidable when
+ * it is not.
+ *
+ * The rule this encodes: `boundedJson` may shorten anything, but it may not change
+ * the MEANING of the permission surface. Identity fields and the completeness flags
+ * pass through untouched; the two prose blobs are capped, and a fired cap is
+ * recorded in `boundsApplied` and reflected in `argumentsComplete: false` /
+ * `allowBlocked`. The engine's own `completeness` label is left as it is (this
+ * projection never upgrades `truncated` to `complete`), and no path here can set any
+ * of those flags back to a permissive value.
+ * @param {object} pending - pending permission record.
+ * @param {string} path - JSON path for the truncation records.
+ * @param {object[]} collect - truncation records.
+ * @returns {object} bounded pending record.
+ */
+function boundPermissionRequest(pending, path, collect) {
+  if (pending === null || typeof pending !== 'object' || Array.isArray(pending)) return pending ?? null;
+  const out = {};
+  const ownCuts = [];
+  for (const [key, value] of Object.entries(pending)) {
+    if (PERMISSION_IDENTITY_KEYS.includes(key)) {
+      out[key] = value;
+      continue;
+    }
+    if ((key === 'arguments' || key === 'reason') && typeof value === 'string' && value.length > PERMISSION_BLOB_CAP) {
+      out[key] = boundedText(value, PERMISSION_BLOB_CAP, `${path}.${key}`, collect);
+      ownCuts.push(key);
+      continue;
+    }
+    out[key] = boundValue(value, `${path}.${key}`, 512, collect);
+  }
+  if (ownCuts.length > 0) {
+    // Both flags are only ever made LESS permissive. `completeness` is downgraded
+    // because the published operation is no longer the whole one; `argumentsComplete`
+    // becomes false for the same reason; `allowBlocked` gains a reason when the
+    // engine had not already supplied one.
+    out.completeness = pending.completeness === 'complete' ? 'truncated' : (pending.completeness ?? 'truncated');
+    out.argumentsComplete = false;
+    if (out.allowBlocked === null || out.allowBlocked === undefined) {
+      out.allowBlocked = 'the operation was shortened by the tool-text bound, so an allow cannot be granted on it';
+    }
+    const applied = Array.isArray(pending.boundsApplied) ? pending.boundsApplied.slice() : [];
+    if (!applied.includes('mcp-text')) applied.push('mcp-text');
+    out.boundsApplied = applied;
+    collect.push({
+      path: `${path}`,
+      field: 'permission',
+      detail: 'the published operation was shortened by the tool-text bound; it remains marked unapprovable',
+    });
+  }
+  return out;
+}
+
+/**
+ * Whether a pending operation, as it stands, can be decided `allow-once`.
+ *
+ * One place, one rule: the answer a host reads and the flag this server publishes
+ * must agree, so the rule is a function rather than a duplicated expression.
+ * @param {object} pendingOperation - pending operation (possibly bounded).
+ * @returns {boolean} true only for a whole, unblocked operation.
+ */
+export function isPermissionDecidable(pendingOperation) {
+  if (pendingOperation === null || typeof pendingOperation !== 'object') return false;
+  if (pendingOperation.state !== undefined && pendingOperation.state !== 'pending') return false;
+  if (pendingOperation.argumentsComplete !== true) return false;
+  if (pendingOperation.allowBlocked !== null && pendingOperation.allowBlocked !== undefined) return false;
+  if (pendingOperation.completeness !== undefined && pendingOperation.completeness !== 'complete') return false;
+  return true;
+}
+
+/**
  * Bound a leaf value for a skeleton.
  * @param {unknown} value - value.
  * @param {string} path - JSON path.
@@ -768,8 +968,54 @@ function boundValue(value, path, cap, collect) {
   }
   const out = {};
   for (const [key, item] of Object.entries(value)) {
-    out[key] = boundValue(item, `${path}.${key}`, cap, collect);
+    // A pending permission request nested in ANY task-shaped record (a list answer,
+    // a skeletonised task) still has to be decidable, so it is bounded by its own
+    // rule rather than by the generic per-string cap. Recognising it here, at every
+    // depth, is what makes the guarantee hold for every tool answer and not only
+    // for the shapes this file happens to special-case.
+    if (key === 'permission' && item !== null && typeof item === 'object' && !Array.isArray(item)) {
+      out[key] = boundPermissionBlock(item, `${path}.permission`, collect);
+      continue;
+    }    out[key] = boundValue(item, `${path}.${key}`, cap, collect);
   }
+  return out;
+}
+
+/**
+ * Bound a task's permission block, preserving its live pending request.
+ * @param {object} permission - permission block.
+ * @param {string} path - JSON path.
+ * @param {object[]} collect - truncation records.
+ * @returns {object} bounded block.
+ */
+function boundPermissionBlock(permission, path, collect) {
+  // A bare pending operation (the shape a wait answer publishes, and the shape the
+  // engine's `observeTask` contract describes) is bounded as a REQUEST, not as a
+  // block: recognising it by its own identity fields means the same rule applies
+  // however a particular answer happens to nest it.
+  if (typeof permission.requestId === 'string' && typeof permission.state === 'string'
+    && permission.state === 'pending') {
+    return boundPermissionRequest(permission, path, collect);
+  }
+  const out = {};
+  let preserved = false;
+  for (const [key, value] of Object.entries(permission)) {
+    if (key === 'pending' && value !== null && typeof value === 'object' && value.state === 'pending') {
+      out[key] = boundPermissionRequest(value, `${path}.pending`, collect);
+      preserved = true;
+      // A preserved request is DECISION MATERIAL, not history. It is restored the
+      // way the skeleton stage restores it: not reported as a cut merely because it
+      // was bounded on its own terms.
+      collect.push({
+        path: `${path}.pending`,
+        field: 'detail',
+        detail: 'the live pending request is carried in full except for its own blob caps, and stays marked unapprovable when shortened',
+      });
+      continue;
+    }
+    out[key] = boundValue(value, `${path}.${key}`, 512, collect);
+  }
+  if (preserved) out.waiting = true;
   return out;
 }
 
@@ -822,11 +1068,33 @@ function boundedJson(value) {
       fullResultIncluded: false,
       fields: dedupeRecords(records),
     };
+    // A wait answer publishes `permissionDecidable`, and a bound may have shortened
+    // the operation it describes. Recomputing the flag from the PUBLISHED operation
+    // is what stops a cut operation from being advertised as decidable.
+    if (projected.permission !== undefined && projected.permission !== null) {
+      projected.permissionDecidable = isPermissionDecidable(projected.permission);
+    }
     return JSON.stringify(redactDeepStrings(projected), null, 2);
   };
   for (const stage of stages) {
     const text = apply(stage);
     if (text.length <= MAX_TOOL_TEXT_CHARS) return { text, isError: false };
+  }
+
+  // The refusal path is reached only when nothing above fits. An answer that carries
+  // a LIVE pending permission request is different from any other oversized answer:
+  // dropping it would leave the task paused and undecidable from what the host was
+  // told. So before refusing, the answer is reduced to those requests alone — with
+  // their blobs re-capped to whatever the bound leaves — and published under an
+  // explicit `permissionOnly` marker that states the rest was not included. When
+  // even this does not fit, the refusal below stands: a trimmed request must never
+  // be presented as an answer.
+  const rescue = permissionRescue(value, compact.length);
+  if (rescue !== null) {
+    for (const cap of [4_000, 1_000, 400, 160, 0]) {
+      const text = rescue(cap);
+      if (text.length <= MAX_TOOL_TEXT_CHARS) return { text, isError: false };
+    }
   }
 
   // Nothing projected fits. The answer is refused as data, carrying the task
@@ -846,6 +1114,114 @@ function boundedJson(value) {
     'the critical fields alone exceed the tool-text bound, so no usable projection could be produced',
     { ...identity, fullTextChars: compact.length, boundChars: MAX_TOOL_TEXT_CHARS },
   );
+}
+
+/**
+ * Build a last-resort projection that keeps only the live pending permission
+ * requests of an oversized answer.
+ *
+ * The ORDER is fixed and the caps are tried by the caller: identity first, then a
+ * smaller operation blob. `completeness`/`argumentsComplete`/`allowBlocked` are
+ * always carried as the engine states them (or downgraded by the capping), so a
+ * shortened request still cannot be allowed.
+ * @param {unknown} value - the answer that did not fit.
+ * @param {number} fullTextChars - size of the original answer, for the record.
+ * @returns {((cap: number) => string) | null} renderer, or null when the answer
+ *   carries no live pending request.
+ */
+function permissionRescue(value, fullTextChars) {
+  const entries = [];
+  const collectTask = (task, path) => {
+    const block = task?.permission;
+    const pending = block?.pending;
+    if (pending === null || typeof pending !== 'object' || pending.state !== 'pending') return;
+    entries.push({ path, taskId: task.taskId, state: task.state, phase: task.phase, block, pending });
+  };
+  if (value?.task !== null && typeof value?.task === 'object' && !Array.isArray(value.task)) collectTask(value.task, 'task');
+  if (Array.isArray(value?.tasks)) value.tasks.forEach((task, index) => collectTask(task, `tasks[${index}]`));
+  // A WAIT answer publishes the pending operation directly as `permission` rather
+  // than under `task.permission.pending`. It is the one shape where the whole point
+  // of the answer is the operation, so it earns the same rescue: shorten the
+  // operation, never drop it and never let it read as complete.
+  const bare = value?.permission;
+  if (bare !== null && typeof bare === 'object' && bare.state === 'pending' && typeof bare.requestId === 'string') {
+    entries.push({
+      path: 'permission', taskId: value.taskId, state: value.state, phase: value.phase, block: null, pending: bare, bare: true,
+    });
+  }
+  if (entries.length === 0) return null;
+  return (cap) => {
+    const records = [];
+    const render = (entry) => {
+      const pending = boundPermissionRequest(
+        cap === 0 ? { ...entry.pending, arguments: '', reason: '' } : entry.pending,
+        `${entry.path === 'permission' ? 'permission' : `${entry.path}.permission.pending`}`,
+        records,
+      );
+      if (cap === 0) {
+        pending.arguments = null;
+        pending.argumentsComplete = false;
+        pending.completeness = 'truncated';
+        pending.allowBlocked = pending.allowBlocked ?? 'the operation could not be included within the tool-text bound';
+        records.push({ path: 'permission.arguments', field: 'text', keptChars: 0, detail: 'the operation did not fit' });
+      } else if (cap < 4_000 && typeof pending.arguments === 'string' && pending.arguments.length > cap) {
+        pending.arguments = boundedText(pending.arguments, cap, 'permission.arguments', records);
+        pending.argumentsComplete = false;
+        pending.completeness = pending.completeness === 'complete' ? 'truncated' : pending.completeness;
+        pending.allowBlocked = pending.allowBlocked ?? 'the operation was shortened by the tool-text bound, so an allow cannot be granted on it';
+      }
+      return pending;
+    };
+    if (entries.length === 1 && entries[0].bare === true) {
+      const payload = {
+        ok: value.ok,
+        taskId: entries[0].taskId,
+        state: entries[0].state,
+        phase: entries[0].phase,
+        reason: value.reason,
+        actionable: true,
+        permission: render(entries[0]),
+        permissionDecidable: false,
+        truncation: truncationBlock(records, fullTextChars, entries),
+      };
+      return JSON.stringify(redactDeepStrings(payload), null, 2);
+    }
+    const tasks = entries.map((entry) => {
+      const pending = render(entry);
+      const block = { bridged: entry.block?.bridged === true, waiting: true, pending };
+      return {
+        taskId: entry.taskId,
+        state: entry.state,
+        phase: entry.phase,
+        permissionOnly: true,
+        permission: block,
+      };
+    });
+    const payload = entries.length === 1 && entries[0].path === 'task'
+      ? { ok: value.ok, task: tasks[0], truncation: truncationBlock(records, fullTextChars, entries) }
+      : { ok: value.ok, tasks, truncation: truncationBlock(records, fullTextChars, entries) };
+    return JSON.stringify(redactDeepStrings(payload), null, 2);
+  };
+}
+
+/**
+ * The truncation record of a permission-only answer.
+ * @param {object[]} records - per-field cuts.
+ * @param {number} fullTextChars - size of the original answer.
+ * @param {object[]} entries - the requests that survived.
+ * @returns {object} truncation block.
+ */
+function truncationBlock(records, fullTextChars, entries) {
+  return {
+    truncated: true,
+    reason: 'the answer exceeded the tool-text bound; only the live pending permission request(s) were returned',
+    fullTextChars,
+    boundChars: MAX_TOOL_TEXT_CHARS,
+    fullResultIncluded: false,
+    permissionOnly: true,
+    tasksWithPendingPermission: entries.map((entry) => truncateScalar(entry.taskId)),
+    fields: dedupeRecords(records),
+  };
 }
 
 /**
@@ -923,10 +1299,16 @@ function dedupeRecords(records) {
  * Create the MCP request handler.
  *
  * `callExecution` is injected so this module holds no transport knowledge and can
- * be tested without a socket: it receives `(route, payload)` and resolves to the
- * execution plane's parsed `ok:true` body, throwing on any refusal.
- * @param {object} options - `callExecution`, optional `logger`.
- * @returns {{ handle: (message: unknown) => Promise<object | null>, tools: readonly object[], calls: object[] }} server.
+ * be tested without a socket: it receives `(route, payload, context?)` and resolves
+ * to the execution plane's parsed `ok:true` body, throwing on any refusal.
+ * `context.signal` is the caller's per-REQUEST cancellation, used by
+ * `delegate_wait` so `notifications/cancelled` ends that wait and nothing else.
+ *
+ * `now` and `sleep` are seams, not configuration: a test drives a twenty-minute
+ * wait in milliseconds by handing in its own clock, and production takes the real
+ * ones. Nothing else about the wait depends on them.
+ * @param {object} options - `callExecution`, optional `logger`, `now`, `sleep`.
+ * @returns {{ handle: Function, tools: readonly object[], calls: object[], isInitialized: () => boolean }} server.
  */
 export function createMcpServer(options) {
   if (typeof options?.callExecution !== 'function') {
@@ -934,18 +1316,34 @@ export function createMcpServer(options) {
   }
   const callExecution = options.callExecution;
   const logger = options.logger ?? null;
+  const now = typeof options.now === 'function' ? options.now : () => Date.now();
+  const sleep = typeof options.sleep === 'function'
+    ? options.sleep
+    : (ms) => new Promise((resolvePromise) => { setTimeout(resolvePromise, ms); });
   // Records what was asked for, so a test can prove which plane route a tool
-  // reached instead of trusting the tool result.
+  // reached instead of trusting the tool result. Bounded: a long session issues
+  // thousands of calls, and an unbounded array here would be a memory leak that
+  // only shows up in the field.
   const calls = [];
   let initialized = false;
 
   /**
+   * Remember one call without growing without bound.
+   * @param {object} record - call record.
+   * @returns {void}
+   */
+  function recordCall(record) {
+    calls.push(record);
+    if (calls.length > MAX_CALL_LOG) calls.splice(0, calls.length - MAX_CALL_LOG);
+  }
+  /**
    * Run one tool call and wrap the answer as MCP content.
    * @param {string} name - tool name.
    * @param {unknown} args - arguments.
+   * @param {{ signal?: AbortSignal }} [context] - per-request cancellation.
    * @returns {Promise<object>} `{ content, isError? }`.
    */
-  async function callTool(name, args) {
+  async function callTool(name, args, context = {}) {
     const route = TOOL_ROUTES[name];
     if (route === undefined) {
       throw new McpError('MCP_TOOL_UNKNOWN', `no tool named ${JSON.stringify(name)}`, {
@@ -966,9 +1364,11 @@ export function createMcpServer(options) {
         isError: true,
       };
     }
-    calls.push({ tool: name, route, payload });
+    recordCall({ tool: name, route, payload });
     try {
-      const result = await callExecution(route, payload);
+      const result = name === 'delegate_wait'
+        ? await waitAnswer(payload, context)
+        : await callExecution(route, payload);
       const bounded = boundedJson(result);
       // A structurally trimmed answer is a real answer, so `isError` stays unset;
       // only an answer that could not be delivered at all is reported as an error.
@@ -990,14 +1390,50 @@ export function createMcpServer(options) {
   }
 
   /**
+   * One `delegate_wait` call: a bounded loop of internal observations.
+   *
+   * The loop lives in `./wait.js`, and this function only supplies the pieces the
+   * loop must not own itself — the transport call, the clock and the caller's
+   * cancellation — so the loop can be tested without a server and a test can drive
+   * twenty minutes of activity in milliseconds.
+   * @param {object} payload - validated arguments.
+   * @param {{ signal?: AbortSignal }} context - per-request cancellation.
+   * @returns {Promise<object>} `{ ok: true, ...answer }`.
+   */
+  async function waitAnswer(payload, context) {
+    const waitSeconds = payload.waitSeconds ?? DEFAULT_WAIT_SECONDS;
+    const result = await waitForTask({
+      callExecution,
+      taskId: payload.taskId,
+      waitMs: waitSeconds * 1_000,
+      signal: context?.signal,
+      now,
+      sleep,
+    });
+    if (result?.error !== undefined) {
+      // The loop could not obtain an observation at all. That is a refusal with the
+      // harness's own code, raised so the standard refusal path shapes it — never an
+      // answer that would look like a task state.
+      throw new McpError(result.error.code, result.error.message);
+    }
+    return { ok: true, ...result };
+  }
+
+  /**
    * Answer one JSON-RPC message.
    *
    * Returns `null` for a notification (the protocol forbids a response) so the
    * transport writes nothing.
+   *
+   * `context.signal` cancels THIS request only. It is passed down to the one place
+   * a request can be long — the wait loop — so a host that gives up on a wait stops
+   * the observations it is making without touching the worker, the task or any
+   * other request.
    * @param {unknown} message - parsed JSON-RPC message.
+   * @param {{ signal?: AbortSignal }} [context] - per-request cancellation.
    * @returns {Promise<object | null>} response, or null.
    */
-  async function handle(message) {
+  async function handle(message, context = {}) {
     if (message === null || typeof message !== 'object' || Array.isArray(message)) {
       return errorResponse(null, RPC_ERRORS.invalidRequest, 'a JSON-RPC message must be an object');
     }
@@ -1036,10 +1472,17 @@ export function createMcpServer(options) {
               + 'pauses that call and reports it as `permission.pending` in delegate_result; while it waits the '
               + 'task stays `running` with phase `awaiting-permission`. Answer exactly one such request with '
               + 'delegate_permission_decide (`allow-once` or `reject`). That decision covers only that call, is '
-              + 'never a standing grant, and cannot approve anything else.',
+              + 'never a standing grant, and cannot approve anything else. To follow a task without polling, use '
+              + 'delegate_wait: one call blocks until the task needs you (permission, ready, failed, cancelled, '
+              + 'interrupted) or until its deadline, in which case it answers reason "wait-limit" and you call '
+              + 'it again with the same taskId instead of reviewing or resubmitting anything.',
           });
         }
         case 'notifications/initialized':
+          return null;
+        case 'notifications/cancelled':
+          // Handled by the transport, which owns the in-flight table: this server
+          // cannot see a request that is still running from inside a handler.
           return null;
         case 'ping':
           return result(id, {});
@@ -1055,7 +1498,7 @@ export function createMcpServer(options) {
           if (typeof name !== 'string' || name === '') {
             return errorResponse(id, RPC_ERRORS.invalidParams, 'tools/call requires a tool name');
           }
-          return result(id, await callTool(name, params?.arguments));
+          return result(id, await callTool(name, params?.arguments, context));
         }
         default:
           return errorResponse(id, RPC_ERRORS.methodNotFound, `this server does not implement ${JSON.stringify(method)}`);
@@ -1102,48 +1545,189 @@ function errorResponse(id, code, message) {
  * `Content-Length` framing here, and adding it would break the client. Malformed
  * input produces a parse error and the loop continues, because a single bad line
  * must not end a session the model is still using.
- * @param {object} options - `input`, `output` streams, `server`, optional `onError`.
- * @returns {Promise<void>} resolves when the input stream ends.
+ *
+ * Two properties of this loop are load-bearing and were added for `delegate_wait`:
+ *
+ *   1. **A request that takes minutes must not stop the others.** Each request is
+ *      dispatched and its reply written when it settles, so a host can send a
+ *      status read or a cancel while a wait is outstanding. Replies are written one
+ *      line at a time through a single writer, so two concurrent answers can never
+ *      interleave inside a line.
+ *   2. **Cancellation is per request.** `notifications/cancelled` aborts exactly the
+ *      request it names: that request's wait ends, its reply is a normal refusal,
+ *      and every other request (including another wait on the same task) continues.
+ *
+ * The concurrency bound is a refusal, not a queue: a host that sends a 33rd
+ * simultaneous request is told so explicitly. Stdin EOF stops accepting new work,
+ * aborts nothing on the worker side, and the loop returns only once every
+ * outstanding reply has been written, so nothing is truncated at shutdown.
+ * @param {object} options - `input`, `output` streams, `server`, optional `onError`,
+ *   `maxInflight`.
+ * @returns {Promise<void>} resolves when the input stream ends and replies are drained.
  */
 export async function serveStdio(options) {
   const { input, output, server } = options;
   const onError = options.onError ?? (() => {});
+  const maxInflight = Number.isInteger(options.maxInflight) && options.maxInflight > 0
+    ? options.maxInflight
+    : MAX_INFLIGHT_REQUESTS;
 
   /**
-   * Write exactly one line and wait for the stream to drain.
+   * Serialize every write so a line is never split by another request's answer.
+   *
+   * Each write waits for the previous one, and also for `drain` when the stream
+   * applies backpressure. A rejected write (a closed pipe) must not leave the queue
+   * permanently blocked, which is why the chain continues even after a failure.
    * @param {object} payload - JSON-RPC message.
-   * @returns {Promise<void>} resolves after the write flushed.
+   * @returns {Promise<void>} resolves after this line is written (or fails to be).
    */
-  const write = (payload) => new Promise((resolvePromise) => {
+  let writeChain = Promise.resolve();
+  const write = (payload) => {
     const line = `${JSON.stringify(payload)}\n`;
-    if (output.write(line) === false) output.once('drain', resolvePromise);
-    else resolvePromise();
-  });
-
-  let buffer = '';
-  for await (const chunk of input) {
-    buffer += chunk.toString('utf8');
-    let newline = buffer.indexOf('\n');
-    while (newline !== -1) {
-      const line = buffer.slice(0, newline).trim();
-      buffer = buffer.slice(newline + 1);
-      newline = buffer.indexOf('\n');
-      if (line === '') continue;
-      let message;
+    writeChain = writeChain.then(() => new Promise((resolvePromise) => {
+      let ok = true;
       try {
-        message = JSON.parse(line);
-      } catch {
-        await write(errorResponse(null, RPC_ERRORS.parse, 'the message is not valid JSON'));
-        continue;
+        ok = output.write(line) !== false;
+      } catch (error) {
+        onError(error);
+        resolvePromise();
+        return;
       }
+      if (ok) {
+        resolvePromise();
+        return;
+      }
+      output.once('drain', resolvePromise);
+      // A stream destroyed while waiting for `drain` never emits it; without this
+      // the writer would wait forever and EOF would hang instead of draining.
+      output.once('close', resolvePromise);
+    }));
+    return writeChain;
+  };
+
+  /** Requests currently in flight, by the JSON-RPC id as a map key. */
+  const inflight = new Map();
+  /** Every outstanding request promise, so EOF can drain them all. */
+  const pending = new Set();
+  let inputEnded = false;
+  /** Set once the transport is shutting down: no new work is accepted. */
+  let closed = false;
+
+  /**
+   * A stable map key for a request id. JSON-RPC ids are strings or numbers; a
+   * string `"1"` and a number `1` are distinct ids, so the type is part of the key.
+   * @param {unknown} id - request id.
+   * @returns {string} map key.
+   */
+  const idKey = (id) => `${typeof id}:${String(id)}`;
+
+  /**
+   * Ask one in-flight request to stop.
+   * @param {unknown} requestId - the id named by the notification.
+   * @returns {boolean} whether a request was actually cancelled.
+   */
+  const cancel = (requestId) => {
+    const entry = inflight.get(idKey(requestId));
+    if (entry === undefined) return false;
+    const error = new Error('the request was cancelled by the host');
+    error.name = 'AbortError';
+    error.code = 'MCP_REQUEST_CANCELLED';
+    entry.controller.abort(error);
+    return true;
+  };
+
+  /**
+   * Handle one parsed line: a request is started, a notification is acted on.
+   * @param {object} message - parsed JSON-RPC message.
+   * @returns {void}
+   */
+  const dispatch = (message) => {
+    if (message === null || typeof message !== 'object' || Array.isArray(message)) {
+      void write(errorResponse(null, RPC_ERRORS.invalidRequest, 'a JSON-RPC message must be an object'));
+      return;
+    }
+    const { id, method } = message;
+    if (method === 'notifications/cancelled') {
+      // Never answered: the protocol forbids a response to a notification. The
+      // cancellation request id travels in `params.requestId`.
+      cancel(message.params?.requestId);
+      return;
+    }
+    if (id === undefined || id === null) {
+      // Any other notification is handled for its effect only.
+      void (async () => {
+        try {
+          await server.handle(message);
+        } catch (error) {
+          onError(error);
+        }
+      })();
+      return;
+    }
+    const key = idKey(id);
+    if (inflight.has(key)) {
+      // Two live requests with one id would make the answers unassignable, and the
+      // second would silently replace the first's cancellation handle. Refusing is
+      // the only honest answer; the original request keeps running.
+      void write(errorResponse(id, RPC_ERRORS.invalidRequest, 'a request with this id is already in flight'));
+      return;
+    }
+    if (inflight.size >= maxInflight) {
+      void write(errorResponse(id, RPC_ERRORS.invalidRequest, `too many requests in flight (limit ${maxInflight})`));
+      return;
+    }
+
+    const controller = new AbortController();
+    inflight.set(key, { controller });
+    const run = (async () => {
       let response = null;
       try {
-        response = await server.handle(message);
+        response = await server.handle(message, { signal: controller.signal });
       } catch (error) {
         onError(error);
         response = errorResponse(message?.id ?? null, RPC_ERRORS.internal, 'the request could not be handled');
+      } finally {
+        inflight.delete(key);
       }
-      if (response !== null) await write(response);
+      if (response !== null && response !== undefined) await write(response);
+    })();
+    pending.add(run);
+    void run.finally(() => pending.delete(run));
+  };
+
+  let buffer = '';
+  try {
+    for await (const chunk of input) {
+      buffer += chunk.toString('utf8');
+      let newline = buffer.indexOf('\n');
+      while (newline !== -1) {
+        const line = buffer.slice(0, newline).trim();
+        buffer = buffer.slice(newline + 1);
+        newline = buffer.indexOf('\n');
+        if (line === '') continue;
+        let message;
+        try {
+          message = JSON.parse(line);
+        } catch {
+          await write(errorResponse(null, RPC_ERRORS.parse, 'the message is not valid JSON'));
+          continue;
+        }
+        // Awaited so the next line is not read before this one has been attributed,
+        // but the request it starts is NOT awaited: that is what keeps a long wait
+        // from blocking the transport.
+        dispatch(message);
+      }
     }
+  } catch (error) {
+    onError(error);
   }
+  inputEnded = true;
+  closed = true;
+
+  // Drain: every reply that was already being produced is written before the loop
+  // returns. Readers are ended here, but nothing is aborted on the worker side — a
+  // wait that ends because its host vanished is the host's decision, not a cancel.
+  while (pending.size > 0) await Promise.allSettled([...pending]);
+  await writeChain;
+  return { inflight: inputEnded, closed, drained: pending.size === 0 };
 }

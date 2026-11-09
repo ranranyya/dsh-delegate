@@ -36,18 +36,75 @@ export declare function readConfig(env: Record<string, string | undefined>): Mcp
 /**
  * Execution-plane route names the MCP tools dispatch to.
  *
- * `preflight` is the read-only workspace inspection behind `delegate_preflight`:
- * it maps to `POST /dsh-delegate/x/workspace/preflight` and creates nothing.
+ * Each name maps to one exact registered path:
+ *
+ * - `status`    → `GET  /dsh-delegate/x/status`
+ * - `submit`    → `POST /dsh-delegate/x/tasks`
+ * - `result`    → `POST /dsh-delegate/x/tasks/get`
+ * - `observe`   → `POST /dsh-delegate/x/tasks/observe` (bounded long-poll read)
+ * - `cancel`    → `POST /dsh-delegate/x/tasks/cancel`
+ * - `permission`→ `POST /dsh-delegate/x/tasks/permission`
+ * - `preflight` → `POST /dsh-delegate/x/workspace/preflight`
+ *
+ * `observe` backs `delegate_wait`; `preflight` is the read-only workspace
+ * inspection behind `delegate_preflight`, and it creates nothing.
  */
-export type ExecutionRoute = 'submit' | 'status' | 'result' | 'cancel' | 'preflight';
+export type ExecutionRoute = 'submit' | 'status' | 'result' | 'observe' | 'cancel' | 'permission' | 'preflight';
+
+/**
+ * Per-call context passed beside the route and payload.
+ *
+ * `signal` is the host's own cancellation of THIS request (for example a JSON-RPC
+ * `notifications/cancelled`). It is composed with the client's request timeout, so
+ * an aborted call ends the HTTP request and nothing else: the harness answers a
+ * disconnected observer without changing the task it was observing.
+ */
+export interface ExecutionCallContext {
+  signal?: AbortSignal;
+}
+
+/**
+ * One execution-plane answer. Every successful route answers `ok: true`; a refusal
+ * is thrown as an `McpError` carrying the harness's own code.
+ */
+export interface ExecutionAnswer {
+  ok: true;
+  [field: string]: unknown;
+}
+
+/**
+ * Backoff between attempts while the endpoint is unreachable, in milliseconds.
+ *
+ * The sum (8 s) is far below {@link ENDPOINT_RETRY_BUDGET_MS}; a permanently dead
+ * endpoint therefore produces a compact refusal instead of a hanging wait.
+ */
+export declare const ENDPOINT_RETRY_DELAYS_MS: readonly number[];
+
+/** Total budget for retrying one internal request, in milliseconds. */
+export declare const ENDPOINT_RETRY_BUDGET_MS: number;
+
+/**
+ * Injectable seams for tests. Production passes neither.
+ *
+ * `sleep` is used between endpoint retries; a test replaces it so a transient
+ * disconnect can be exercised without actually waiting seconds.
+ */
+export interface ExecutionClientOptions {
+  sleep?: (ms: number) => Promise<void>;
+}
 
 /**
  * Build the HTTP call the MCP tools use.
  *
  * Every refusal is normalized into an `McpError` carrying the harness's own code,
- * so a tool result says `GRANT_UNKNOWN` rather than `HTTP 404`.
+ * so a tool result says `GRANT_UNKNOWN` rather than `HTTP 404`. The runtime
+ * discovery record is reread before EACH internal request, so a wait survives a
+ * DSH restart onto another port; only the `observe` route retries an unreachable
+ * endpoint (bounded backoff), because repeating a submission would be unsafe.
  * @param config - value from {@link readConfig}.
+ * @param options - optional test seams.
  */
 export declare function createExecutionClient(
   config: McpConfig,
-): (route: ExecutionRoute, payload: object) => Promise<{ ok: true; [field: string]: unknown }>;
+  options?: ExecutionClientOptions,
+): (route: ExecutionRoute, payload: object, context?: ExecutionCallContext) => Promise<ExecutionAnswer>;

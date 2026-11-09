@@ -854,3 +854,70 @@ test('a refused native registration does not block remote discovery', async () =
     await cleanup(dir);
   }
 });
+
+// ---------------------------------------------------------------------------
+// Monitoring settings route
+// ---------------------------------------------------------------------------
+
+test('the monitoring route writes only the two thresholds and returns the committed document', async () => {
+  const { dir, deps, settings } = await fixture();
+  try {
+    const routes = wrapUserPlaneRoutes(deps);
+    const result = await call(routes, 'POST', `${USER_PLANE_PREFIX}/monitoring`, {
+      monitoring: { selfCheckSeconds: 120, attentionSeconds: 300 },
+    });
+    assert.equal(result.status, 200);
+    assert.deepEqual(result.body.monitoring, { selfCheckSeconds: 120, attentionSeconds: 300 });
+    // The committed document comes back so the page does not need a second read.
+    assert.deepEqual(result.body.settings.monitoring, { selfCheckSeconds: 120, attentionSeconds: 300 });
+
+    // It really persisted, and it rewrote nothing else.
+    const stored = await settings.read();
+    assert.deepEqual(stored.monitoring, { selfCheckSeconds: 120, attentionSeconds: 300 });
+    assert.equal(stored.delegationEnabled, false, 'the switch is untouched');
+    assert.equal(stored.worker.model, 'deepseek-chat', 'the worker selection is untouched');
+    assert.equal(stored.providers.length, 1);
+  } finally {
+    await cleanup(dir);
+  }
+});
+
+test('the monitoring route refuses invalid timers as a 400 and writes nothing', async () => {
+  const { dir, deps, settings } = await fixture();
+  try {
+    const routes = wrapUserPlaneRoutes(deps);
+    const before = await settings.read();
+
+    for (const [block, code] of [
+      [{ selfCheckSeconds: 600, attentionSeconds: 300 }, 'MONITORING_TIMING_INVALID'],
+      [{ selfCheckSeconds: 29, attentionSeconds: 600 }, 'MONITORING_INVALID'],
+      [{ selfCheckSeconds: 300, attentionSeconds: 7201 }, 'MONITORING_INVALID'],
+      [{ selfCheckSeconds: 300.5, attentionSeconds: 600 }, 'MONITORING_INVALID'],
+      [{ atentionSeconds: 900 }, 'MONITORING_INVALID'],
+    ]) {
+      const result = await call(routes, 'POST', `${USER_PLANE_PREFIX}/monitoring`, { monitoring: block });
+      // A refused TIMER is the caller's mistake, not a server fault.
+      assert.equal(result.status, 400, `${JSON.stringify(block)} must be a 400`);
+      assert.equal(result.body.error.code, code);
+      assert.equal(result.body.ok, false);
+    }
+    assert.deepEqual((await settings.read()).monitoring, before.monitoring, 'nothing was written');
+  } finally {
+    await cleanup(dir);
+  }
+});
+
+test('the monitoring route requires a block and rejects a body-less GET', async () => {
+  const { dir, deps } = await fixture();
+  try {
+    const routes = wrapUserPlaneRoutes(deps);
+    const missing = await call(routes, 'POST', `${USER_PLANE_PREFIX}/monitoring`, {});
+    assert.equal(missing.body.error.code, 'MONITORING_MISSING');
+    // Read-only access is not offered: this route is a write, and reads belong to
+    // `/settings` so there is exactly one document-shaped read.
+    const get = await call(routes, 'GET', `${USER_PLANE_PREFIX}/monitoring`);
+    assert.notEqual(get.status, 200);
+  } finally {
+    await cleanup(dir);
+  }
+});

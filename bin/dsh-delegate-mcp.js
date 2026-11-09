@@ -62,6 +62,10 @@ const ROUTES = Object.freeze({
   submit: Object.freeze({ method: 'POST', path: '/tasks' }),
   result: Object.freeze({ method: 'POST', path: '/tasks/get' }),
   cancel: Object.freeze({ method: 'POST', path: '/tasks/cancel' }),
+  // A bounded long-poll read used by `delegate_wait`. Spelled out like every other
+  // route: it is the one call a long wait repeats, so a guessed path would 404 on
+  // the only mechanism a host has to follow a task without polling `result`.
+  observe: Object.freeze({ method: 'POST', path: '/tasks/observe' }),
   // The one per-call permission decision. Spelled out like every other route: the
   // plane registers exactly this path, and a name-to-path guess would 404 with
   // `EXECUTION_ROUTE_UNKNOWN` on the one call that unblocks a paused worker.
@@ -72,24 +76,106 @@ const ROUTES = Object.freeze({
 });
 
 /**
+ * Backoff between attempts while the DSH endpoint cannot be reached, in ms.
+ *
+ * `delegate_wait` may spend minutes following one task, and over that time the DSH
+ * process can restart (a new port, or none for a moment). Treating that as a
+ * terminal MCP failure would make a host believe the delegation had ended. The
+ * schedule is deliberately short and finite: three sleeps, so a permanently dead
+ * endpoint produces a compact actionable error inside ~8 s instead of hanging.
+ */
+export const ENDPOINT_RETRY_DELAYS_MS = Object.freeze([1_000, 2_000, 5_000]);
+
+/**
+ * Total budget for retrying one internal request, in ms.
+ *
+ * The sum of {@link ENDPOINT_RETRY_DELAYS_MS} is 8 s, so this is never the binding
+ * constraint in practice; it is stated so a future change to the schedule cannot
+ * silently turn a bounded wait into an unbounded one.
+ */
+export const ENDPOINT_RETRY_BUDGET_MS = 30_000;
+
+/**
  * Build the HTTP call the MCP tools use.
  *
  * Every refusal is normalized into an `McpError` carrying the harness's own code,
  * so a tool result says `GRANT_UNKNOWN` rather than `HTTP 404`.
+ *
+ * `context.signal` is the caller's own cancellation (one MCP request, e.g. a
+ * `notifications/cancelled`). It is composed with the per-request timeout into a
+ * single signal, so an aborted wait ends the FETCH and nothing else: the harness
+ * answers a disconnected observer without changing the task it was observing. The
+ * timeout must remain in force on its own, so the composition is `AbortSignal.any`
+ * of the two rather than one replacing the other.
+ *
+ * Discovery is reread on EVERY internal request (not cached per call), which is
+ * what lets a wait survive a DSH restart onto a new port. Only unpolled failures
+ * are retried, and only for the observation route: an ordinary tool call keeps its
+ * single attempt, because repeating a submission is not a safe thing to do.
  * @param {object} config - value from {@link readConfig}.
- * @returns {(route: string, payload: object) => Promise<object>} call function.
+ * @param {object} [options] - `sleep` (injectable for tests), `now`.
+ * @returns {(route: string, payload: object, context?: { signal?: AbortSignal }) => Promise<object>} call function.
  */
-export function createExecutionClient(config) {
-  return async function callExecution(route, payload) {
+export function createExecutionClient(config, options = {}) {
+  const sleep = options.sleep ?? ((ms) => new Promise((resolvePromise) => { setTimeout(resolvePromise, ms); }));
+
+  /**
+   * Perform one request, with the retry policy of its route.
+   * @param {string} route - route name.
+   * @param {object} entry - route table entry.
+   * @param {object} payload - request body.
+   * @param {AbortSignal | undefined} callerSignal - the caller's own cancellation.
+   * @returns {Promise<object>} parsed `ok:true` body.
+   */
+  return async function callExecution(route, payload, context = {}) {
     const entry = ROUTES[route];
     if (entry === undefined) {
       // An unmapped route would otherwise be sent as a path the plane does not
       // serve, which surfaces as an HTTP 404 that looks like a harness fault.
       throw new McpError('MCP_ROUTE_UNMAPPED', `no execution-plane route is defined for ${JSON.stringify(route)}`);
     }
+    const callerSignal = context?.signal;
+    // A route that is safe to repeat may back off and try again; everything else
+    // gets exactly one attempt.
+    const retryable = route === 'observe';
+    const delays = retryable ? ENDPOINT_RETRY_DELAYS_MS : [];
+    let spent = 0;
+    for (let attempt = 0; ; attempt += 1) {
+      try {
+        return await attemptOnce(entry, payload, callerSignal, config);
+      } catch (error) {
+        const delay = delays[attempt];
+        const retry = error?.code === 'MCP_HARNESS_UNREACHABLE'
+          && typeof delay === 'number'
+          && spent + delay <= ENDPOINT_RETRY_BUDGET_MS
+          && callerSignal?.aborted !== true;
+        if (!retry) throw error;
+        spent += delay;
+        await sleep(delay);
+        if (callerSignal?.aborted === true) throw abortedError();
+      }
+    }
+  };
+
+  /**
+   * One attempt at one execution-plane request.
+   * @param {object} entry - route table entry.
+   * @param {object} payload - request body.
+   * @param {AbortSignal | undefined} callerSignal - cancellation.
+   * @param {object} configValue - client configuration.
+   * @returns {Promise<object>} parsed `ok:true` body.
+   */
+  async function attemptOnce(entry, payload, callerSignal, configValue) {
     const method = entry.method;
     const path = `${EXECUTION_PREFIX}${entry.path}`;
-    const baseUrl = config.baseUrl ?? (await readRuntimeEndpoint(config.discoveryFile)).baseUrl;
+    const baseUrl = configValue.baseUrl ?? (await readRuntimeEndpoint(configValue.discoveryFile)).baseUrl;
+    const timeout = AbortSignal.timeout(configValue.timeoutMs);
+    // `AbortSignal.any` is absent on a host that is older than the runtimes this
+    // package supports; the timeout alone then applies, which is the behaviour
+    // before this argument existed and still bounds every request.
+    const signal = callerSignal !== undefined && typeof AbortSignal.any === 'function'
+      ? AbortSignal.any([timeout, callerSignal])
+      : timeout;
     let response;
     try {
       response = await fetch(`${baseUrl}${path}`, {
@@ -99,9 +185,12 @@ export function createExecutionClient(config) {
           ...(method === 'POST' ? { 'content-type': 'application/json' } : {}),
         },
         ...(method === 'POST' ? { body: JSON.stringify(payload) } : {}),
-        signal: AbortSignal.timeout(config.timeoutMs),
+        signal,
       });
     } catch (error) {
+      // Our own cancellation is reported as such, with no URL and no socket text:
+      // the caller asked for this and knows which request it cancelled.
+      if (callerSignal?.aborted === true) throw abortedError();
       // The transport failure is reported without the URL: it may carry a port an
       // operator considers private, and it never helps the caller.
       throw new McpError(
@@ -113,6 +202,7 @@ export function createExecutionClient(config) {
     try {
       body = await response.json();
     } catch {
+      if (callerSignal?.aborted === true) throw abortedError();
       body = null;
     }
     if (body === null || typeof body !== 'object') {
@@ -126,7 +216,15 @@ export function createExecutionClient(config) {
       );
     }
     return body;
-  };
+  }
+}
+
+/**
+ * The one refusal a locally cancelled request throws.
+ * @returns {McpError} refusal carrying the stable code.
+ */
+function abortedError() {
+  return new McpError('MCP_REQUEST_CANCELLED', 'the request was cancelled by the host');
 }
 
 /**

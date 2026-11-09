@@ -82,6 +82,10 @@ function fixture(options = {}) {
  * `reject` for that single call. It cannot create or widen a grant, cannot change
  * settings/the switch/the provider/the isolation, and cannot pre-approve anything.
  * Anything else appearing here must be a decision, not a diff.
+ *
+ * `delegate_wait` is a bounded READ (it maps to the plane's `/tasks/observe` route):
+ * it follows one existing task and reports what a host must act on. It submits,
+ * cancels and decides nothing, and it does not fetch the task's diff.
  */
 const EXPECTED_TOOLS = [
   'delegate_cancel',
@@ -90,13 +94,14 @@ const EXPECTED_TOOLS = [
   'delegate_result',
   'delegate_status',
   'delegate_submit',
+  'delegate_wait',
 ];
 
 // ---------------------------------------------------------------------------
 // 1. The exposed surface cannot authorize, configure or touch credentials
 // ---------------------------------------------------------------------------
 
-test('the MCP surface exposes exactly six bounded tools and no control-plane tool', () => {
+test('the MCP surface exposes exactly seven bounded tools and no control-plane tool', () => {
   assert.deepEqual(TOOLS.map((tool) => tool.name).sort(), EXPECTED_TOOLS);
   // Named explicitly so the reason is in the failure message, not only in a diff.
   for (const forbidden of ['connection', 'grant', 'settings', 'credential', 'secret', 'authorize']) {
@@ -634,6 +639,144 @@ test('configuration defaults to live endpoint discovery and ignores legacy token
     assert.equal(error.code, 'MCP_CONFIG_INVALID');
     return true;
   });
+});
+
+// ---------------------------------------------------------------------------
+// The observe route's transport: endpoint change and bounded retry
+// ---------------------------------------------------------------------------
+//
+// `delegate_wait` may follow a task for an hour, and over that time the DSH process
+// can restart onto a new port. The client therefore rereads the discovery record
+// before EVERY internal request, and retries an unreachable `observe` on a bounded
+// backoff. Both properties are asserted here without waiting seconds: `sleep` is
+// injected, so the schedule is observed rather than endured.
+
+test('the observe client rereads the endpoint per request, so a restart is followed', async () => {
+  const { mkdtemp, rm } = await import('node:fs/promises');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const directory = await mkdtemp(join(tmpdir(), 'dsh-observe-endpoint-'));
+  const discoveryFile = join(directory, 'runtime-endpoint.json');
+  const seen = [];
+  const original = globalThis.fetch;
+  let firstLease;
+  let secondLease;
+  globalThis.fetch = async (url) => {
+    seen.push(String(url));
+    return new Response(JSON.stringify({
+      ok: true, task: { taskId: 't1' }, reason: 'heartbeat', permission: null, wait: {},
+    }), { status: 200, headers: { 'content-type': 'application/json' } });
+  };
+  try {
+    const client = createExecutionClient(readConfig({ DSH_DELEGATE_DISCOVERY_FILE: discoveryFile }));
+    firstLease = await publishRuntimeEndpoint({ filePath: discoveryFile, host: '127.0.0.1', port: 49211 });
+    await client('observe', { taskId: 't1', waitMs: 25_000 });
+    // The DSH process restarts onto another port between two observations.
+    secondLease = await publishRuntimeEndpoint({ filePath: discoveryFile, host: '127.0.0.1', port: 49212 });
+    await client('observe', { taskId: 't1', waitMs: 25_000 });
+    assert.deepEqual(seen, [
+      'http://127.0.0.1:49211/dsh-delegate/x/tasks/observe',
+      'http://127.0.0.1:49212/dsh-delegate/x/tasks/observe',
+    ], 'each observation must be addressed to the endpoint published at that moment');
+  } finally {
+    globalThis.fetch = original;
+    await firstLease?.dispose();
+    await secondLease?.dispose();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('an unreachable observe backs off 1s/2s/5s and then refuses compactly', async () => {
+  const sleeps = [];
+  let attempts = 0;
+  const original = globalThis.fetch;
+  globalThis.fetch = async () => {
+    attempts += 1;
+    throw Object.assign(new TypeError('fetch failed'), { name: 'TypeError' });
+  };
+  try {
+    const client = createExecutionClient(
+      { baseUrl: 'http://127.0.0.1:3210', discoveryFile: 'unused', timeoutMs: 5_000 },
+      { sleep: async (ms) => { sleeps.push(ms); } },
+    );
+    await assert.rejects(() => client('observe', { taskId: 't1', waitMs: 25_000 }), (error) => {
+      assert.equal(error.code, 'MCP_HARNESS_UNREACHABLE');
+      assert.match(error.message, /could not be reached/u);
+      // The refusal never names the URL or the port.
+      assert.equal(error.message.includes('3210'), false);
+      return true;
+    });
+    assert.deepEqual(sleeps, [1_000, 2_000, 5_000], 'the documented backoff schedule');
+    assert.equal(attempts, 4, 'one attempt plus one per documented delay');
+  } finally {
+    globalThis.fetch = original;
+  }
+});
+
+test('repeating an observe is the only route that retries, and a transient failure recovers', async () => {
+  const sleeps = [];
+  let attempts = 0;
+  const original = globalThis.fetch;
+  globalThis.fetch = async () => {
+    attempts += 1;
+    if (attempts < 2) throw Object.assign(new TypeError('fetch failed'), { name: 'TypeError' });
+    return new Response(JSON.stringify({ ok: true, task: { taskId: 't1' }, reason: 'ready', permission: null }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    });
+  };
+  try {
+    const client = createExecutionClient(
+      { baseUrl: 'http://127.0.0.1:3210', discoveryFile: 'unused', timeoutMs: 5_000 },
+      { sleep: async (ms) => { sleeps.push(ms); } },
+    );
+    const answer = await client('observe', { taskId: 't1', waitMs: 25_000 });
+    assert.equal(answer.reason, 'ready', 'a transient failure recovers instead of ending the wait');
+    assert.deepEqual(sleeps, [1_000]);
+
+    // A SUBMISSION must never be retried: repeating it could start two tasks.
+    attempts = -100;
+    await assert.rejects(() => client('submit', { workspacePath: '/w', prompt: 'go' }), (error) => {
+      assert.equal(error.code, 'MCP_HARNESS_UNREACHABLE');
+      return true;
+    });
+    assert.equal(attempts, -99, 'submit gets exactly one attempt');
+  } finally {
+    globalThis.fetch = original;
+  }
+});
+
+test('the client forwards the caller signal, and a cancelled request refuses locally', async () => {
+  const controller = new AbortController();
+  let sawSignal = null;
+  const original = globalThis.fetch;
+  globalThis.fetch = async (_url, init) => {
+    sawSignal = init.signal;
+    // Model a fetch that observes the abort, as the real one does.
+    await new Promise((resolvePromise) => {
+      if (init.signal.aborted) { resolvePromise(); return; }
+      init.signal.addEventListener('abort', resolvePromise, { once: true });
+    });
+    throw Object.assign(new Error('aborted'), { name: 'AbortError' });
+  };
+  try {
+    const client = createExecutionClient(
+      { baseUrl: 'http://127.0.0.1:3210', discoveryFile: 'unused', timeoutMs: 30_000 },
+      { sleep: async () => {} },
+    );
+    const pending = client('observe', { taskId: 't1', waitMs: 25_000 }, { signal: controller.signal });
+    controller.abort();
+    await assert.rejects(() => pending, (error) => {
+      assert.equal(error.code, 'MCP_REQUEST_CANCELLED', 'the caller\'s own cancellation has its own code');
+      return true;
+    });
+    // The signal handed to fetch combines the request timeout with the caller's, so
+    // aborting the caller ends the HTTP request without waiting out the timeout.
+    assert.ok(sawSignal !== null, 'a composed signal must reach fetch');
+    assert.equal(sawSignal.aborted, true);
+  } finally {
+    globalThis.fetch = original;
+  }
 });
 
 test('the execution client rereads the DSH endpoint before every tool call', async () => {

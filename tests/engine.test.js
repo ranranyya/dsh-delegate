@@ -16,7 +16,7 @@ import { mkdir, realpath } from 'node:fs/promises';
 import { join } from 'node:path';
 
 import { AuthorizationRegistry } from '../src/auth/grants.js';
-import { JobEngine, JOB_CODES, TASK_STATES } from '../src/jobs/engine.js';
+import { JobEngine, JOB_CODES, OBSERVE_TASK_REASONS, TASK_STATES } from '../src/jobs/engine.js';
 import { SettingsService } from '../src/config/settings.js';
 import { WorkspaceLocks } from '../src/workspace/locks.js';
 import { REVIEW_STATES } from '../src/review/reviewer.js';
@@ -149,7 +149,8 @@ function reviewComposer(presets) {
  * The workspace must exist because the engine resolves it before use; a
  * nonexistent path is itself a refusal and has its own test.
  * @param {object} [options] - `agents`, `git`, `settings`, `worktrees`,
- *   `providerRegistry`, `ensureRoutes`, `agentPresets`, `preflightTimeoutMs`.
+ *   `providerRegistry`, `ensureRoutes`, `agentPresets`, `preflightTimeoutMs`,
+ *   `sessionController`, `sessionStore`, `now`, `wait`, `observeSliceMs`.
  * @returns {Promise<object>} harness with engine, auth, workspace and cleanup.
  */
 async function harness(options = {}) {
@@ -209,6 +210,11 @@ async function harness(options = {}) {
     ...(options.worktrees === undefined ? {} : { worktrees: options.worktrees }),
     ...(options.preflightTimeoutMs === undefined ? {} : { preflightTimeoutMs: options.preflightTimeoutMs }),
     ...(options.sessionStore === undefined ? {} : { sessionStore: options.sessionStore }),
+    // Observation seams. A test that exercises silent waiting injects a clock and a
+    // wait it can advance, so twenty minutes of idleness costs no wall time.
+    ...(options.now === undefined ? {} : { now: options.now }),
+    ...(options.wait === undefined ? {} : { wait: options.wait }),
+    ...(options.observeSliceMs === undefined ? {} : { observeSliceMs: options.observeSliceMs }),
     authorizationMode: options.authorizationMode ?? 'grants',
     delegationEnabled: options.delegationEnabled === true,
     logger: { info() {}, warn() {} },
@@ -1226,5 +1232,504 @@ test('dispose cancels live tasks and marks the plugin unusable', async () => {
     assert.equal(h.engine.locks.isLocked(h.workspace), false);
   } finally {
     await cleanup(h.dir);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Silent waiting and concentrated host review: engine-owned monitoring
+// ---------------------------------------------------------------------------
+
+/**
+ * A controllable clock and a wait seam for a live run.
+ *
+ * The agent a test drives never settles, so every observation below happens while
+ * the task is genuinely `running`. The delay is applied through the injected wait,
+ * so an interval costs no wall time.
+ * @param {number} [start] - first clock value.
+ * @returns {object} `{ now, wait, advance, clockMs }`.
+ */
+function observedClock(start = 5_000_000) {
+  const state = { current: start };
+  return {
+    state,
+    now: () => state.current,
+    async wait(ms, options = {}) {
+      await Promise.resolve();
+      if (options?.signal?.aborted === true) throw Object.assign(new Error('aborted'), { name: 'AbortError' });
+      state.current += ms;
+    },
+    advance(ms) {
+      state.current += ms;
+    },
+    get clockMs() {
+      return state.current;
+    },
+  };
+}
+
+/**
+ * A task record whose monitor is fed by hand, as the runner would feed it.
+ * @param {object} engine - the harness engine.
+ * @param {string} taskId - the started task.
+ * @returns {object} the live task record.
+ */
+function liveTask(engine, taskId) {
+  const task = engine.tasks.get(taskId);
+  assert.ok(task !== undefined, 'the started task must exist');
+  return task;
+}
+
+/**
+ * Wait until a task actually holds a driven executor.
+ *
+ * A fixed delay is a race: admission has several awaits, so the exact instant the
+ * run reaches its native call varies with machine load. The observable fact is the
+ * task STATE `running` plus a live monitor, which together mean admission finished
+ * and the engine is driving the executor — the phase after that varies with what the
+ * (faked) executor does next, so it is not asserted here.
+ * @param {object} engine - the harness engine.
+ * @param {string} taskId - the started task.
+ * @param {number} [attempts] - polling bound.
+ * @returns {Promise<object>} the live task record.
+ */
+async function waitForExecute(engine, taskId, attempts = 400) {
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    const task = engine.tasks.get(taskId);
+    if (task !== undefined && task.state === 'running' && task.monitor !== null && task.monitor !== undefined) return task;
+    await new Promise((resolvePromise) => { setTimeout(resolvePromise, 5); });
+  }
+  assert.fail('the run never started its executor');
+}
+
+test('a settled task freezes the monitoring thresholds it ran under', async () => {
+  const h = await harness();
+  try {
+    const { connectionId, grant } = h.authorize();
+    const started = await h.engine.start({
+      connectionId,
+      grantId: grant.grantId,
+      workspacePath: h.workspace,
+      prompt: 'go',
+    });
+    const settled = await settle(h.engine, started.taskId);
+    assert.equal(settled.effective.monitoring.selfCheckSeconds, 300);
+    assert.equal(settled.effective.monitoring.attentionSeconds, 600);
+    // The activity summary is published on an ordinary view, and carries no text.
+    assert.ok(settled.activity !== null);
+    assert.equal(typeof settled.activity.activityEvents, 'number');
+    assert.equal(JSON.stringify(settled.activity).includes('implemented the change'), false,
+      'the activity summary must not carry the run text');
+  } finally {
+    await h.close();
+  }
+});
+
+test('a task keeps its frozen thresholds when settings change mid-run', async () => {
+  const h = await harness({ sessionController: busySessionController() });
+  try {
+    const { connectionId, grant } = h.authorize();
+    const started = await h.engine.start({
+      connectionId,
+      grantId: grant.grantId,
+      workspacePath: h.workspace,
+      prompt: 'long job',
+    });
+    await h.settings.setMonitoring({ selfCheckSeconds: 60, attentionSeconds: 120 });
+    const live = liveTask(h.engine, started.taskId);
+    assert.equal(live.effective.monitoring.selfCheckSeconds, 300, 'the running task kept its own snapshot');
+    assert.equal(live.effective.monitoring.attentionSeconds, 600);
+    await h.engine.cancel(started.taskId, 'test-end');
+  } finally {
+    await h.close();
+  }
+});
+
+test('the runner feeds the monitor, and reasoning-only progress counts', async () => {
+  const plan = { reasoningBlock: 'thinking hard about the problem' };
+  const h = await harness({ agents: fakeAgents({ respond: plan }) });
+  try {
+    const { connectionId, grant } = h.authorize();
+    const started = await h.engine.start({
+      connectionId,
+      grantId: grant.grantId,
+      workspacePath: h.workspace,
+      prompt: 'reason only',
+    });
+    const settled = await settle(h.engine, started.taskId);
+    assert.equal(settled.execution.reasoningOnly, true);
+    const activity = settled.activity;
+    assert.ok(activity !== null);
+    assert.equal(activity.activityEvents > 0, true, 'a reasoning block is genuine activity');
+    assert.equal(activity.kinds['reasoning-delta'] ?? 0, 0);
+    // Nothing of the reasoning text is anywhere in the summary.
+    assert.equal(JSON.stringify(activity).includes('thinking hard'), false);
+  } finally {
+    await h.close();
+  }
+});
+
+test('observing an unknown or another connection\'s task is one identical refusal', async () => {
+  const h = await harness({ sessionController: busySessionController() });
+  try {
+    const mine = h.authorize();
+    const theirs = h.authorize();
+    const started = await h.engine.start({
+      connectionId: mine.connectionId,
+      grantId: mine.grant.grantId,
+      workspacePath: h.workspace,
+      prompt: 'long job',
+    });
+    await new Promise((resolvePromise) => { setTimeout(resolvePromise, 30); });
+
+    const collect = async (taskId, connectionId) => {
+      try {
+        await h.engine.observeTask(taskId, { connectionId, waitMs: 1 });
+      } catch (error) {
+        return { code: error.code, message: error.message, details: JSON.stringify(error.details) };
+      }
+      assert.fail('the observation should have been refused');
+    };
+    const unknown = await collect('task-does-not-exist', mine.connectionId);
+    const foreign = await collect(started.taskId, theirs.connectionId);
+    const anonymous = await collect(started.taskId, null);
+    assert.equal(unknown.code, JOB_CODES.taskNotFound);
+    // Indistinguishable in everything that could reveal existence: the code, the
+    // message, and the shape of the details. The details echo only the id the
+    // caller itself supplied, which is why the ids differ and nothing else does.
+    assert.equal(foreign.code, unknown.code);
+    assert.equal(foreign.message, unknown.message);
+    assert.deepEqual(Object.keys(JSON.parse(foreign.details)), Object.keys(JSON.parse(unknown.details)));
+    assert.equal(JSON.parse(foreign.details).taskId, started.taskId, 'the echo is the caller\'s own argument');
+    assert.equal(anonymous.code, JOB_CODES.taskNotFound);
+    await h.engine.cancel(started.taskId, 'test-end');
+  } finally {
+    await h.close();
+  }
+});
+
+test('a silent run reports heartbeat, then attention after the frozen threshold', async () => {
+  const clock = observedClock();
+  const h = await harness({ sessionController: busySessionController(), now: clock.now, wait: clock.wait, observeSliceMs: 1_000 });
+  try {
+    const { connectionId, grant } = h.authorize();
+    const started = await h.engine.start({
+      connectionId,
+      grantId: grant.grantId,
+      workspacePath: h.workspace,
+      prompt: 'long job',
+    });
+    const task = await waitForExecute(h.engine, started.taskId);
+    // Anchor the episode on one real event, as the runner would.
+    task.monitor.onEvent({ type: 'text-delta', data: { text: 'working' } }, clock.clockMs);
+
+    // Well under the threshold: the observation is silent.
+    clock.advance(120_000);
+    const quiet = await h.engine.observeTask(started.taskId, { connectionId, waitMs: 1_000 });
+    assert.equal(quiet.reason, OBSERVE_TASK_REASONS.heartbeat);
+    assert.equal(quiet.task.state, 'running');
+    // The phase is whatever the driven executor is doing; what matters is that it\n    // is a live, executing task rather than a finished one.\n    assert.equal(typeof quiet.task.phase, 'string');
+
+    // Past the threshold: attention, once.
+    clock.advance(600_000);
+    const attention = await h.engine.observeTask(started.taskId, { connectionId, waitMs: 1_000 });
+    assert.equal(attention.reason, OBSERVE_TASK_REASONS.attention);
+    assert.equal(attention.activity.idleForMs >= 600_000, true);
+
+    // The episode's latch: the next request stays silent.
+    clock.advance(1_000);
+    const cooled = await h.engine.observeTask(started.taskId, { connectionId, waitMs: 1_000 });
+    assert.equal(cooled.reason, OBSERVE_TASK_REASONS.heartbeat);
+    await h.engine.cancel(started.taskId, 'test-end');
+  } finally {
+    await h.close();
+  }
+});
+
+test('an observation returns a compact summary with the self-check diagnostic', async () => {
+  const clock = observedClock();
+  const h = await harness({ sessionController: busySessionController(), now: clock.now, wait: clock.wait });
+  try {
+    const { connectionId, grant } = h.authorize();
+    const started = await h.engine.start({
+      connectionId,
+      grantId: grant.grantId,
+      workspacePath: h.workspace,
+      prompt: 'long job',
+    });
+    const task = await waitForExecute(h.engine, started.taskId);
+    task.monitor.onEvent({ type: 'text-delta', data: { text: 'working' } }, clock.clockMs);
+    clock.advance(300_000);
+
+    const observation = await h.engine.observeTask(started.taskId, { connectionId, waitMs: 25_000 });
+    assert.equal(observation.reason, OBSERVE_TASK_REASONS.heartbeat);
+    const { task: summary } = observation;
+    for (const field of ['taskId', 'state', 'phase', 'elapsedMs', 'lastActivityAt', 'currentTool', 'idleForMs']) {
+      assert.equal(Object.hasOwn(summary, field), true, `the summary must state ${field}`);
+    }
+    assert.equal(summary.taskId, started.taskId);
+    assert.equal(summary.route.providerId, 'relay');
+    assert.equal(summary.route.model, 'deepseek-chat');
+    assert.equal(summary.route.monitoring.selfCheckSeconds, 300);
+    // The five-minute self-check ran inside the wait and is reported.
+    assert.equal(observation.selfCheck.verdict, 'executor-alive-silent');
+    assert.equal(summary.selfCheck.verdict, 'executor-alive-silent');
+    assert.equal(observation.wait.waitMs, 25_000);
+    // No transcript, no execution text, no diff on a running summary.
+    assert.equal(Object.hasOwn(summary, 'execution'), false);
+    assert.equal(Object.hasOwn(summary, 'diff'), false);
+    assert.equal(Object.hasOwn(summary, 'prompt'), false);
+    await h.engine.cancel(started.taskId, 'test-end');
+  } finally {
+    await h.close();
+  }
+});
+
+test('a pending permission is reported with its full decidable view', async () => {
+  const clock = observedClock();
+  const h = await harness({ sessionController: busySessionController(), now: clock.now, wait: clock.wait });
+  try {
+    const { connectionId, grant } = h.authorize();
+    const started = await h.engine.start({
+      connectionId,
+      grantId: grant.grantId,
+      workspacePath: h.workspace,
+      prompt: 'long job',
+    });
+    const task = await waitForExecute(h.engine, started.taskId);
+    const pendingView = {
+      requestId: 'permission-1',
+      taskId: started.taskId,
+      toolName: 'bash',
+      callId: 'call-1',
+      state: 'pending',
+      arguments: '{"command":"npm test"}',
+      argumentsRedacted: true,
+      completeness: 'complete',
+      argumentsComplete: true,
+      boundsApplied: [],
+      allowBlocked: null,
+      fingerprint: 'f'.repeat(64),
+      standingModeUnchanged: true,
+    };
+    h.engine.onPermissionPending(task, pendingView);
+
+    const observation = await h.engine.observeTask(started.taskId, { connectionId, waitMs: 25_000 });
+    assert.equal(observation.reason, OBSERVE_TASK_REASONS.permission);
+    assert.ok(observation.permission !== null, 'the permission reason must carry the request');
+    // The WHLE operation travels: without the fingerprint and completeness facts a
+    // decision could not be made.
+    assert.equal(observation.permission.fingerprint, 'f'.repeat(64));
+    assert.equal(observation.permission.completeness, 'complete');
+    assert.equal(observation.permission.arguments, '{"command":"npm test"}');
+    assert.equal(observation.permission.callId, 'call-1');
+    assert.equal(observation.permission.toolName, 'bash');
+    await h.engine.cancel(started.taskId, 'test-end');
+  } finally {
+    await h.close();
+  }
+});
+
+test('a terminal task reports its outcome, never a heartbeat', async () => {
+  const h = await harness();
+  try {
+    const { connectionId, grant } = h.authorize();
+    const started = await h.engine.start({
+      connectionId,
+      grantId: grant.grantId,
+      workspacePath: h.workspace,
+      prompt: 'go',
+    });
+    await settle(h.engine, started.taskId);
+    const observation = await h.engine.observeTask(started.taskId, { connectionId, waitMs: 25_000 });
+    assert.equal(observation.reason, OBSERVE_TASK_REASONS.ready);
+    assert.equal(observation.task.state, 'awaiting-host-review');
+    assert.equal(observation.permission, null);
+  } finally {
+    await h.close();
+  }
+});
+
+test('an aborted observation releases only the reader and leaves the worker running', async () => {
+  const clock = observedClock();
+  const h = await harness({ sessionController: busySessionController(), now: clock.now, wait: clock.wait });
+  try {
+    const { connectionId, grant } = h.authorize();
+    const started = await h.engine.start({
+      connectionId,
+      grantId: grant.grantId,
+      workspacePath: h.workspace,
+      prompt: 'long job',
+    });
+    const task = await waitForExecute(h.engine, started.taskId);
+    task.monitor.onEvent({ type: 'text-delta', data: { text: 'working' } }, clock.clockMs);
+
+    const controller = new AbortController();
+    const pending = h.engine.observeTask(started.taskId, { connectionId, waitMs: 25_000, signal: controller.signal });
+    clock.advance(25_000);
+    controller.abort();
+    const observation = await pending;
+    assert.equal(observation.reason, OBSERVE_TASK_REASONS.interrupted);
+    // The worker is untouched: same state, same phase, still holding its slot.
+    assert.equal(task.state, 'running');
+    assert.equal(typeof task.phase, 'string');
+    assert.equal(task.endedAt, null);
+    assert.equal(task.slotHeld, true);
+    assert.equal(task.cancelRequested, false);
+    assert.equal(h.engine.observers.size, 0, 'the observer registration is released');
+    await h.engine.cancel(started.taskId, 'test-end');
+  } finally {
+    await h.close();
+  }
+});
+
+test('disposing the engine releases every observation and stops the monitors', async () => {
+  const clock = observedClock();
+  const h = await harness({ sessionController: busySessionController(), now: clock.now, wait: clock.wait });
+  const { connectionId, grant } = h.authorize();
+  const started = await h.engine.start({
+    connectionId,
+    grantId: grant.grantId,
+    workspacePath: h.workspace,
+    prompt: 'long job',
+  });
+  const pending = h.engine.observeTask(started.taskId, { connectionId, waitMs: 25_000 });
+  await h.engine.dispose();
+  const observation = await pending;
+  assert.equal(observation.reason, OBSERVE_TASK_REASONS.interrupted);
+  assert.equal(h.engine.observers.size, 0);
+  await cleanup(h.dir);
+});
+
+test('the task view publishes bounded activity without any model text', async () => {
+  const h = await harness({ agents: fakeAgents({ respond: { reasoning: 'PRIVATE THOUGHTS', text: 'PRIVATE ANSWER' } }) });
+  try {
+    const { connectionId, grant } = h.authorize();
+    const started = await h.engine.start({
+      connectionId,
+      grantId: grant.grantId,
+      workspacePath: h.workspace,
+      prompt: 'go',
+    });
+    const settled = await settle(h.engine, started.taskId);
+    const serialized = JSON.stringify(settled.activity);
+    assert.equal(serialized.includes('PRIVATE THOUGHTS'), false);
+    assert.equal(serialized.includes('PRIVATE ANSWER'), false);
+    assert.equal(settled.activity.events > 0, true);
+  } finally {
+    await h.close();
+  }
+});
+
+test('one observation never exceeds its documented bound, whatever it finds', async () => {
+  // A caller (the HTTP adapter) promises <=25 s. An internal re-wait would double
+  // that and blow the adapter's own request timeout, so exactly ONE bounded wait is
+  // allowed per call — a heartbeat must be returned, not silently extended.
+  const clock = observedClock();
+  const h = await harness({ sessionController: busySessionController(), now: clock.now, wait: clock.wait });
+  try {
+    const { connectionId, grant } = h.authorize();
+    const started = await h.engine.start({
+      connectionId,
+      grantId: grant.grantId,
+      workspacePath: h.workspace,
+      prompt: 'long job',
+    });
+    const task = await waitForExecute(h.engine, started.taskId);
+    task.monitor.onEvent({ type: 'text-delta', data: { text: 'working' } }, clock.clockMs);
+
+    const before = clock.clockMs;
+    const observation = await h.engine.observeTask(started.taskId, { connectionId, waitMs: 25_000 });
+    const elapsed = clock.clockMs - before;
+    assert.equal(observation.reason, OBSERVE_TASK_REASONS.heartbeat);
+    assert.equal(elapsed <= 25_000, true, `one call must not exceed 25 s (observed ${elapsed} ms)`);
+    assert.equal(observation.wait.waitedMs <= 25_000, true);
+    await h.engine.cancel(started.taskId, 'test-end');
+  } finally {
+    await h.close();
+  }
+});
+
+test('an observation started before execute() keeps receiving the run\'s events', async () => {
+  // A task can be observed while still `pending` (admitted, thresholds frozen). If
+  // `execute` replaced the monitor, that observer would watch an object that never
+  // receives another event and stay silent forever.
+  const clock = observedClock();
+  const h = await harness({ sessionController: busySessionController(), now: clock.now, wait: clock.wait });
+  try {
+    const { connectionId, grant } = h.authorize();
+    const started = await h.engine.start({
+      connectionId,
+      grantId: grant.grantId,
+      workspacePath: h.workspace,
+      prompt: 'long job',
+    });
+    const task = await waitForExecute(h.engine, started.taskId);
+    const monitor = task.monitor;
+    assert.ok(monitor !== null && monitor !== undefined);
+
+    // The monitor the observation used is the SAME object the executor feeds.
+    task.monitor = monitor;
+    monitor.onEvent({ type: 'text-delta', data: { text: 'delivered' } }, clock.clockMs);
+    assert.equal(monitor.activity.activityEvents(), 1, 'events reach the one monitor');
+    assert.equal(h.engine.ensureMonitor(task), monitor, 'ensureMonitor never replaces a live monitor');
+
+    clock.advance(590_000);
+    const observation = await h.engine.observeTask(started.taskId, { connectionId, waitMs: 1_000 });
+    // 590 s of silence is under the 600 s threshold, so it is still silent — which
+    // is only true if the observed monitor is the one that recorded the activity.
+    assert.equal(observation.reason, OBSERVE_TASK_REASONS.heartbeat);
+    assert.equal(observation.activity.activityEvents, 1);
+    await h.engine.cancel(started.taskId, 'test-end');
+  } finally {
+    await h.close();
+  }
+});
+
+test('a settled task with a stale permission block reports the outcome, not a decision', async () => {
+  // A run stopped while a request was outstanding keeps the block as history. It
+  // must not be offered as a live decision forever.
+  const h = await harness();
+  try {
+    const { connectionId, grant } = h.authorize();
+    const started = await h.engine.start({
+      connectionId,
+      grantId: grant.grantId,
+      workspacePath: h.workspace,
+      prompt: 'go',
+    });
+    const settled = await settle(h.engine, started.taskId);
+    assert.equal(settled.state, 'awaiting-host-review');
+    const task = h.engine.tasks.get(started.taskId);
+    // Simulate the stale block a stopped run leaves behind.
+    task.permission.pending = { requestId: 'permission-stale', state: 'pending' };
+
+    const observation = await h.engine.observeTask(started.taskId, { connectionId, waitMs: 25_000 });
+    assert.equal(observation.reason, OBSERVE_TASK_REASONS.ready, 'the outcome outranks the stale block');
+    assert.equal(observation.permission, null, 'no decision is offered for a call that no longer exists');
+  } finally {
+    await h.close();
+  }
+});
+
+test('a settled task reports a frozen idle span', async () => {
+  const h = await harness();
+  try {
+    const { connectionId, grant } = h.authorize();
+    const started = await h.engine.start({
+      connectionId,
+      grantId: grant.grantId,
+      workspacePath: h.workspace,
+      prompt: 'go',
+    });
+    const settled = await settle(h.engine, started.taskId);
+    assert.equal(settled.activity.finalizedAt, settled.endedAt, 'the record is frozen at the end');
+
+    // A later read cannot grow: the same query returns the same spans.
+    const first = h.engine.get(started.taskId).activity;
+    await new Promise((resolvePromise) => { setTimeout(resolvePromise, 30); });
+    const second = h.engine.get(started.taskId).activity;
+    assert.deepEqual(second, first, 'terminal metadata does not drift');
+  } finally {
+    await h.close();
   }
 });

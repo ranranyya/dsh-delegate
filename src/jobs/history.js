@@ -146,6 +146,16 @@ const FORBIDDEN_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
 const MAX_PERMISSION_EVIDENCE = 8;
 
 /**
+ * How many distinct activity kinds one stored record keeps counts for.
+ *
+ * The live classifier owns a closed vocabulary far smaller than this, so the cap
+ * only ever bounds a document written by a FUTURE build that learned more kinds —
+ * a stored record must never be able to grow with model output, and the count map
+ * is the one field keyed by something other than a fixed name.
+ */
+const MAX_ACTIVITY_KINDS = 24;
+
+/**
  * One bounded, versioned job history document.
  *
  * Writes are serialized through an internal queue and land through a temp file
@@ -525,12 +535,30 @@ function projectView(view, maxEntryBytes) {
     // then re-redacted, so a stored record inherits the same masking the live view
     // had — including key-aware masking of anything credential-named.
     permission: permissionView(view.permission, ctx),
+    // The bounded progress summary. Stored so a restart can show what the run was
+    // doing when it stopped and how much activity it had — and stored through the
+    // same allow-list discipline as everything else, so no model text, reasoning,
+    // tool argument or diff can enter through it. `waitingOn` is what lets an
+    // interrupted record say "it was waiting on a tool call", which is the same
+    // fact as `permission.interrupted` for a paused approval but is a different
+    // story for an ordinary long-running command.
+    activity: activityView(view.activity),
     error: errorView(view.error, ctx),
     cancelledBy: label(view.cancelledBy),
     hostAcceptance: acceptanceView(view.hostAcceptance),
     // A completed job is not an accepted one. This is fixed, never copied.
     selfApproved: false,
   };
+
+  // A live state is normalized to `interrupted` by `markInterrupted` on the next
+  // load, which also closes its outstanding permission request. A terminal record
+  // never passes through that path, so its permission block must be closed HERE:
+  // the process that could decide the request is gone as soon as this record is
+  // durable, and a stored `pending` would otherwise remain apparently decidable
+  // forever. Keep the terminal task state untouched; only the request becomes
+  // history. `decidedBy: 'restart'` is the existing public vocabulary for this
+  // normalization and covers both crash recovery and terminal-record projection.
+  if (!LIVE_STATES.has(entry.state)) markPermissionInterrupted(entry);
 
   const redacted = redactDeep(entry);
   fitEntry(redacted, ctx);
@@ -562,6 +590,10 @@ function markInterrupted(entry, now) {
   // A permission wait that was open when the process stopped is part of the same
   // fact: the request is history only and can never be decided or replayed.
   markPermissionInterrupted(entry);
+  // The same for the activity summary: a span that was still open is closed here,
+  // so a restart reports "interrupted while a tool was running" instead of an idle
+  // duration that keeps growing for a run nobody is watching.
+  markActivityInterrupted(entry);
   return entry;
 }
 
@@ -591,6 +623,16 @@ function effectiveView(value) {
     // session id is stored here, so history is not a way back into a conversation.
     conversation: isPlainObject(value.conversation)
       ? { policy: label(value.conversation.policy) }
+      : null,
+    // The silence thresholds this task froze at admission. Stored because they are
+    // the only way a stored activity block can be interpreted: "idle for 12 minutes"
+    // means something different under a 10-minute attention threshold than under a
+    // two-hour one, and the live settings may have changed since.
+    monitoring: isPlainObject(value.monitoring)
+      ? {
+        selfCheckSeconds: count(value.monitoring.selfCheckSeconds),
+        attentionSeconds: count(value.monitoring.attentionSeconds),
+      }
       : null,
     provenance: {
       projectPath: path(provenance.projectPath),
@@ -915,7 +957,111 @@ function markPermissionInterrupted(entry) {
   return entry;
 }
 
-/** @returns {object | null} bounded error record. */
+/**
+ * Bounded projection of one task's activity summary.
+ *
+ * Every field is a count, a timestamp or an identifier. The tool name and call id
+ * are identifiers the native session log already carries; the argument text and
+ * result body are NOT reachable from here because the live summary never holds
+ * them. `kinds` is rebuilt from a closed key allow-list rather than copied, so a
+ * widened live shape cannot smuggle a new field into the document.
+ * @param {unknown} value - task `activity` block.
+ * @returns {object | null} bounded copy, or null when the task never ran.
+ */
+function activityView(value) {
+  if (!isPlainObject(value)) return null;
+  const tool = isPlainObject(value.currentTool) ? value.currentTool : null;
+  const lastTool = isPlainObject(value.lastTool) ? value.lastTool : null;
+  const selfCheck = isPlainObject(value.selfCheck) ? value.selfCheck : null;
+  const kinds = {};
+  if (isPlainObject(value.kinds)) {
+    for (const [key, countValue] of Object.entries(value.kinds).slice(0, MAX_ACTIVITY_KINDS)) {
+      const number = count(countValue);
+      if (number === null) continue;
+      if (key.length === 0 || key.length > MAX_LABEL_CHARS) continue;
+      setOwn(kinds, key, number);
+    }
+  }
+  return {
+    lastActivityAt: time(value.lastActivityAt),
+    // The idle span and what the run was doing during it. `waitingOn: 'tool'` is
+    // the one case where a long span is WORK rather than silence, and recording it
+    // is what stops a restarted record from describing a build as a stall.
+    idleForMs: count(value.idleForMs),
+    waitingOn: knownValue(value.waitingOn, ['idle', 'tool']),
+    currentTool: tool === null
+      ? null
+      : {
+        name: label(tool.name),
+        callId: label(tool.callId),
+        startedAt: time(tool.startedAt),
+        elapsedMs: count(tool.elapsedMs),
+      },
+    lastTool: lastTool === null
+      ? null
+      : { name: label(lastTool.name), durationMs: count(lastTool.durationMs) },
+    events: count(value.events),
+    activityEvents: count(value.activityEvents),
+    toolCallsStarted: count(value.toolCallsStarted),
+    toolCallsFinished: count(value.toolCallsFinished),
+    selfCheckSeconds: count(value.selfCheckSeconds),
+    attentionSeconds: count(value.attentionSeconds),
+    // Present when the elapsed values were frozen at the run's end, so a reader can
+    // tell a final span from one still being measured.
+    finalizedAt: time(value.finalizedAt),
+    selfCheck: selfCheck === null
+      ? null
+      : {
+        episode: count(selfCheck.episode),
+        checkedAt: time(selfCheck.checkedAt),
+        verdict: label(selfCheck.verdict),
+      },
+    // A stored record whose run was interrupted while a tool was in flight keeps the
+    // cut-off call as evidence instead of dropping it.
+    ...(isPlainObject(value.interruptedTool)
+      ? {
+        interruptedTool: {
+          name: label(value.interruptedTool.name),
+          callId: label(value.interruptedTool.callId),
+          startedAt: time(value.interruptedTool.startedAt),
+          elapsedMs: count(value.interruptedTool.elapsedMs),
+        },
+      }
+      : {}),
+    kinds,
+  };
+}
+
+/**
+ * Mark a live task's activity summary as belonging to an interrupted run.
+ *
+ * `markInterrupted` already rewrote the state; this makes the silence describe what
+ * it actually was, so a restarted record cannot present a tool that was mid-flight
+ * as "idle for four hours". The span is closed at the recorded end time and the
+ * outstanding tool call is marked cut off rather than deleted — it is evidence that
+ * something was running when the process stopped.
+ * @param {object} entry - projected entry.
+ * @returns {object} the same entry.
+ */
+function markActivityInterrupted(entry) {
+  const activity = entry?.activity;
+  if (!isPlainObject(activity)) return entry;
+  if (isPlainObject(activity.currentTool)) {
+    activity.interruptedTool = { ...activity.currentTool };
+  }
+  activity.currentTool = null;
+  activity.waitingOn = null;
+  activity.idleForMs = null;
+  activity.interrupted = true;
+  return entry;
+}
+
+/**
+ * Bounded error record.
+ * @param {unknown} value - error value.
+ * @param {object} ctx - cut context.
+ * @returns {object | null} bounded error record.
+ */
 function errorView(value, ctx) {
   if (value === null || value === undefined) return null;
   if (typeof value === 'string') {

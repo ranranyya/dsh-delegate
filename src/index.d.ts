@@ -197,6 +197,113 @@ export interface DelegateTaskPermission {
 }
 
 /**
+ * Bounded activity metadata for one task.
+ *
+ * Every field is a count, a timestamp or an identifier. Model text, reasoning,
+ * tool arguments and tool results have no field here: the monitor that produces
+ * this summary never retains them, so no projection of it can leak them.
+ */
+export interface DelegateTaskActivity {
+  /** Clock time of the last genuine progress, or `null` before any. */
+  lastActivityAt: number | null;
+  /**
+   * The true silence span. It is never substituted with a tool's elapsed time: an
+   * open tool call that emits nothing is still silence, which is why a hung tool
+   * reaches the attention threshold like any other silent executor.
+   */
+  idleForMs: number | null;
+  /** Whether the run is silent between model turns or executing a tool. */
+  waitingOn: 'idle' | 'tool' | null;
+  /** The native tool call in flight, bounded to its identifiers. */
+  currentTool: { name: string | null; callId: string | null; startedAt: number; elapsedMs: number } | null;
+  /** The most recent tool call and how long it took. */
+  lastTool: { name: string | null; durationMs: number | null } | null;
+  /** Total events observed, and how many of them were genuine progress. */
+  events: number;
+  activityEvents: number;
+  toolCallsStarted: number;
+  toolCallsFinished: number;
+  /** The thresholds this task froze at admission. */
+  selfCheckSeconds: number;
+  attentionSeconds: number;
+  /**
+   * `null` while the run is live. Once the task ended it holds the recorded end, and
+   * every elapsed value above is measured against it — a stored or queried record
+   * therefore does not keep growing.
+   */
+  finalizedAt: number | null;
+  /** The last self-check verdict, which explains a silent run. */
+  selfCheck: { episode: number | null; checkedAt: number | null; verdict: string | null } | null;
+  /** Counts per event kind, bounded. */
+  kinds: Record<string, number>;
+  /** Present only in a STORED record: the run did not survive a restart. */
+  interrupted?: true;
+  /** Present only in a STORED record: the tool that was cut off by the restart. */
+  interruptedTool?: { name: string | null; callId: string | null; startedAt: number | null; elapsedMs: number | null } | null;
+}
+
+/** Why one observation of a running task returned. */
+export type DelegateObserveReason =
+  | 'heartbeat'
+  | 'attention'
+  | 'permission'
+  | 'ready'
+  | 'failed'
+  | 'cancelled'
+  | 'interrupted';
+
+/** The compact task summary one observation returns. */
+export interface DelegateObservationSummary {
+  taskId: string;
+  state: 'pending' | 'running' | 'awaiting-host-review' | 'failed' | 'cancelled';
+  phase: string;
+  createdAt: number | null;
+  startedAt: number | null;
+  endedAt: number | null;
+  elapsedMs: number;
+  lastActivityAt: number | null;
+  currentTool: DelegateTaskActivity['currentTool'];
+  idleForMs: number | null;
+  waitingOn: DelegateTaskActivity['waitingOn'];
+  activity: DelegateTaskActivity | null;
+  selfCheck: { episode: number | null; checkedAt: number | null; verdict: string | null } | null;
+  /** The route this task froze at admission, never a re-resolved one. */
+  route: {
+    providerId: string | null;
+    providerRoute: string | null;
+    model: string | null;
+    reasoningEffort: string | null;
+    isolation: string | null;
+    monitoring: { selfCheckSeconds: number | null; attentionSeconds: number | null };
+  } | null;
+  connectionId: string | null;
+  /** Always false: execution completion is not host acceptance. */
+  selfApproved: false;
+  hostAcceptance: null;
+}
+
+/** Result of one bounded observation of a delegated task. */
+export interface DelegateObservation {
+  task: DelegateObservationSummary;
+  reason: DelegateObserveReason;
+  /**
+   * The FULL redacted pending request, present only for `reason: 'permission'`.
+   * Carries the exact fingerprint and completeness facts a decision needs; it is
+   * never shortened into an undecidable summary.
+   */
+  permission: DelegatePendingPermission | null;
+  activity: DelegateTaskActivity | null;
+  selfCheck: { episode: number | null; checkedAt: number | null; verdict: string | null } | null;
+  /**
+   * The wait that produced this result. `activitySinceWait` reports that the run
+   * moved during the wait; it is NOT a reason to wake the host, so such an
+   * observation still ends as `heartbeat` unless a threshold or an outcome says
+   * otherwise.
+   */
+  wait: { waitMs: number; waitedMs: number; activitySinceWait: boolean };
+}
+
+/**
  * Mount the delegation service.
  *
  * After this resolves the plugin holds no grant, owns no agent, and refuses to
