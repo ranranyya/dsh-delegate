@@ -11,7 +11,7 @@
 // the declaration lie.
 
 /** Stable Cordis plugin name; also the settings/document namespace. */
-export declare const name: 'dsh-delegate';
+export declare const name: 'dsh-taskdispatch';
 
 /**
  * Injected native services. While any of these is absent Cordis does not activate

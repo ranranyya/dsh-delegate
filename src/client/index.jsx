@@ -112,7 +112,7 @@ export const PLUGIN_CONFIG_SLOT = 'plugins.bundle.config';
  * name. The Plugins manager looks the entry up by `pkg.name`, so any other key
  * registers a page that never renders.
  */
-export const PLUGIN_BUNDLE_KEY = 'dsh-delegate';
+export const PLUGIN_BUNDLE_KEY = 'dsh-taskdispatch';
 
 /** Required client services: slot registration only. */
 export const inject = ['slots'];

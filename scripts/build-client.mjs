@@ -72,7 +72,7 @@ const OUTPUT = join(ROOT, 'lib', 'client.js');
 const SCRATCH_ROOT = join(ROOT, '.cache');
 
 /** Registration id: the package name, which is how the loader indexes bundles. */
-const CLIENT_ID = 'dsh-delegate';
+const CLIENT_ID = 'dsh-taskdispatch';
 
 /**
  * Specifiers this bundle may request at runtime.

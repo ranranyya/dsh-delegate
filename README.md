@@ -1,4 +1,13 @@
-# dsh-delegate
+# DSH TaskDispatch
+
+**让 Claude Code 或 Codex 指挥 DSH 完成任务，在 DSH 插件中配置 API、执行模型和思考强度。**
+
+你向指挥端提出目标；指挥端规划、拆分、派工和审查，DSH 根据插件设置执行。插件可选择 DSH 已接入的 API 提供方、执行模型及其支持的思考强度，并配置超时、并发与工作区隔离；额外模型审查可单独开关和配置。任务交付后集中审查，需要改进时续接同一任务对话。
+
+- [详细中文介绍](docs/INTRODUCTION.zh.md) · [English introduction](docs/INTRODUCTION.md)
+- [从 DSH Delegate 迁移到 1.3.0](docs/taskdispatch-upgrade.md)：新包名为 `dsh-taskdispatch`，保留旧数据和 MCP 技术标识，不要同时启用新旧插件。
+- [在 DSH“发现”中搜索和安装](docs/plugin-market.md)：添加本项目的自定义索引，安装源固定到本项目的 Git 提交。
+- [Claude Code 手动 MCP 接入](docs/claude-code.md)；Codex 继续使用设置页的安装/修复按钮。Claude Code 的一键安装按钮和真实客户端验收尚未完成。
 
 DeepSeek Harness（DSH）的委托插件：让 MCP 宿主在你开启本机总开关后，调用 DSH
 已配置的接口执行任务，执行结果回到宿主（例如 Codex）自行验收。
@@ -6,8 +15,8 @@ DeepSeek Harness（DSH）的委托插件：让 MCP 宿主在你开启本机总�
 新安装时本机调用总开关默认关闭。开关状态会保存在插件设置中，重启后恢复保存值；
 关闭时拒绝新的委派任务，并请求停止正在运行的任务。
 
-> **发布状态：`1.2.0`（静默等待与独立控制通道的修订版本）。** 源码仓库和可下载的 Release
-> 位于 [GitHub](https://github.com/ranranyya/dsh-delegate)。npm 尚未作为安装渠道发布；
+> **发布版本：`1.3.0`（TaskDispatch 更名与插件索引发行版）。** 源码仓库和可下载的 Release
+> 位于 [GitHub](https://github.com/ranranyya/dsh-taskdispatch)。npm 尚未作为安装渠道发布；
 > GitHub Release 附带的 `.tgz` 是推荐的安装包。`1.1.0` 的静默等待说明见
 > [`docs/silent-wait.md`](./docs/silent-wait.md)；`1.2.0` 修正了其中三处真实问题（等待中断的
 > 语义、串行宿主下的控制能力、已安装 Codex 集成升级遗漏），见第 7.4 节。
@@ -41,12 +50,12 @@ Desktop 侧的包操作只能交给应用完成——不要在 Desktop 的正式
 
    ```bash
    npm pack
-   #    → dsh-delegate-1.2.0.tgz
+   #    → dsh-taskdispatch-1.3.0.tgz
    ```
 
 2. 打开 Desktop 的 **Plugins manager**，用它的 add-plugin（添加插件）入口选择上一步生成的
    `.tgz`（或本仓库目录）完成安装。
-3. 安装后打开 **Plugins → Installed plugins → dsh-delegate**：配置页就在该条目下（见第 3 节）。
+3. 安装后打开 **Plugins → Installed plugins → dsh-taskdispatch**：配置页就在该条目下（见第 3 节）。
 4. 确认该插件行处于启用状态；Desktop 侧的重载与启用由应用控制，不通过 CLI 触发。
 
 ### 2.2 web profile（CLI，仅限非 Desktop）
@@ -56,7 +65,7 @@ Desktop 侧的包操作只能交给应用完成——不要在 Desktop 的正式
 
 ```bash
 # 装进一个 profile（例：web）
-dsh plugin --profile web add ./dsh-delegate-1.2.0.tgz && dsh plugin --profile web why dsh-delegate
+dsh plugin --profile web add ./dsh-taskdispatch-1.3.0.tgz && dsh plugin --profile web why dsh-taskdispatch
 
 # 启动（首次启动会自动把插件 bundle 追加到 dsh.profile.bundles）
 dsh --profile web
@@ -69,14 +78,14 @@ dsh --profile web
 ### 说明与注意
 
 - **不要装进你正在用的正式 profile 做试验。** 建议先用一次性 profile：
-  `dsh plugin --profile dsh-delegate-try add ./dsh-delegate-1.2.0.tgz`，再把
+  `dsh plugin --profile dsh-delegate-try add ./dsh-taskdispatch-1.3.0.tgz`，再把
   `DSH_HOME` 指向临时目录做隔离验证。该命令同样只用于 CLI profile。
 - 该包声明了 `@deepseek-ai/dsh-*` 的 peer，若你的包管理器默认自动安装 peer，
   安装过程会尝试解析这些版本。可显式关闭：`npm_config_auto_install_peers=false`
   （pnpm）或 `--legacy-peer-deps`（npm）。宿主运行时已经提供这些包，插件运行时
   通过 DSH 的 runtime resolution 解析它们。
 - 包的 `dsh.bundle.patch`（`cordis.patch.yml`）只做一件事：插入 id 为
-  `dsh-delegate` 的插件行。安装完仍需要**启用**该插件行（见下）。
+  `dsh-taskdispatch` 的插件行。安装完仍需要**启用**该插件行（见下）。
 
 ### 启用 / 重载
 
@@ -90,9 +99,9 @@ dsh --profile web
 ## 3. 界面位置
 
 配置页注册在 Plugins manager 的 **keyed** 槽位 `plugins.bundle.config` 上，key 即包名
-`dsh-delegate`：
+`dsh-taskdispatch`：
 
-- **Desktop**：**Plugins → Installed plugins → dsh-delegate**，打开该条目的配置页。
+- **Desktop**：**Plugins → Installed plugins → dsh-taskdispatch**，打开该条目的配置页。
 - **CLI web profile**：同一个 Plugins 页面，入口相同。
 
 它**不是**设置对话框里的独立导航项：旧的 `settings.section`（设置 → 「DSH 委托」）已
@@ -133,8 +142,8 @@ dsh --profile web
 
 ## 6. MCP（stdio）接入
 
-包内可执行文件 `bin/dsh-delegate-mcp.js`（bin 名 `dsh-delegate-mcp`）实现了六个工具：
-`delegate_status` / `delegate_preflight` / `delegate_submit` / `delegate_result` / `delegate_cancel` /
+包内可执行文件 `bin/dsh-delegate-mcp.js`（bin 名 `dsh-delegate-mcp`）实现了七个工具：
+`delegate_status` / `delegate_preflight` / `delegate_submit` / `delegate_wait` / `delegate_result` / `delegate_cancel` /
 `delegate_permission_decide`。
 它**不提供**授权、配置写入或凭据读写工具。`delegate_permission_decide` 是唯一一条窄例外：
 它只能回答一个**已经挂起**的「单次调用授权请求」，给 `allow-once`（仅这一次调用可继续）或
@@ -499,19 +508,19 @@ Codex 子智能体现在按「提交 → `delegate_wait` 同一任务」运作�
 ## 8. 升级 / 导出 / 卸载 / 回滚
 
 ```bash
-# Desktop：在 Plugins manager 里对已安装的 dsh-delegate 执行更新 / 卸载
+# Desktop：在 Plugins manager 里对已安装的 dsh-taskdispatch 执行更新 / 卸载
 # （先 npm pack 出新 .tgz，再用 add-plugin 添加新版本）。
 # 不要在 Desktop 的正式 profile 下执行下面的 CLI 命令。
 
 # CLI web profile 的升级：换成本地新包或（将来）新版本
-dsh plugin --profile web add ./dsh-delegate-1.2.0.tgz
+dsh plugin --profile web add ./dsh-taskdispatch-1.3.0.tgz
 
 # 导出：界面里"导出非敏感配置"按钮，或用只读 API
 #   GET /api/dsh-delegate/settings
 # 导出物只含 provider/worker/review 等非敏感字段，可保存为复用预设。
 
 # CLI web profile 的卸载
-dsh plugin --profile web remove dsh-delegate
+dsh plugin --profile web remove dsh-taskdispatch
 ```
 
 - Desktop 的安装、升级、卸载都属于应用自己的插件操作；npm/`dsh plugin` 命令会被保留

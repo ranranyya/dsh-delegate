@@ -98,7 +98,7 @@ function fakeClientContext() {
 
 test('the bundle registers under the package name the module loader indexes', () => {
   assert.equal(MODULE.id, MANIFEST.name);
-  assert.equal(MODULE.id, 'dsh-delegate');
+  assert.equal(MODULE.id, 'dsh-taskdispatch');
 });
 
 test('the module requests only platform modules', () => {
@@ -108,7 +108,7 @@ test('the module requests only platform modules', () => {
 test('the exported contract names the bundle config slot and its exact key', () => {
   const client = MODULE.exports;
   assert.equal(client.PLUGIN_CONFIG_SLOT, 'plugins.bundle.config');
-  assert.equal(client.PLUGIN_BUNDLE_KEY, 'dsh-delegate');
+  assert.equal(client.PLUGIN_BUNDLE_KEY, 'dsh-taskdispatch');
   // The key is matched against the bundle package name by the manager's ledger,
   // so the two must not drift apart.
   assert.equal(client.PLUGIN_BUNDLE_KEY, MANIFEST.name);
@@ -135,7 +135,7 @@ test('registerBundleConfiguration occupies plugins.bundle.config, keyed by dsh-d
   assert.equal(ctx.unused.length, 1, 'the injection must register exactly one entry');
   const { options, component } = ctx.unused[0];
   assert.equal(options.name, 'plugins.bundle.config');
-  assert.equal(options.key, 'dsh-delegate');
+  assert.equal(options.key, 'dsh-taskdispatch');
   // The manager's bundle page passes `{ view: 'page' }`; a registration may
   // declare neither `id`, `order` nor `label` here (those belong to list slots).
   assert.equal(options.id, undefined);

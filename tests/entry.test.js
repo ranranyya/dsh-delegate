@@ -90,7 +90,7 @@ useDirectoryClassifier(async (paths) => {
 });
 
 test('the entry declares a name and the services the harness must provide', () => {
-  assert.equal(entry.name, 'dsh-delegate');
+  assert.equal(entry.name, 'dsh-taskdispatch');
   assert.deepEqual(entry.inject, ['agents', 'sessions', 'llm', 'tools', 'webServer', 'connection']);
   assert.equal(typeof entry.apply, 'function');
 });

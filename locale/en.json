@@ -1,0 +1,7 @@
+{
+  "meta": {
+    "title": "DSH TaskDispatch",
+    "description": "Let Claude Code or Codex direct DSH tasks. Choose configured APIs, execution models and reasoning effort in the DSH plugin; follow progress, decide permissions and review delivered results.",
+    "detail": "docs/INTRODUCTION.md"
+  }
+}

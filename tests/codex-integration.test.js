@@ -67,7 +67,7 @@ import { USER_PLANE_PREFIX, wrapUserPlaneRoutes } from '../src/http/user-plane.j
 import { PREFLIGHT_ISOLATIONS, PREFLIGHT_REASONS } from '../src/workspace/preflight.js';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
-const DELIVERABLE_VERSION = '1.2.0';
+const DELIVERABLE_VERSION = '1.3.0';
 // The baseline the current release upgrades *from*, pinned rather than derived: an
 // expectation that followed `DELIVERABLE_VERSION` would assert nothing.
 const PREVIOUS_VERSION = '0.1.14';
@@ -250,7 +250,7 @@ function otherInstallationFixture({
   const script = join(root, 'bin', 'dsh-delegate-mcp.js');
   writeFileSync(script, '// an older installation of this package\n');
   /** @type {Record<string, unknown>} */
-  const manifest = { name, version: '1.1.0' };
+  const manifest = { name, version: '1.1.0', repository: { url: 'https://github.com/ranranyya/dsh-delegate.git' } };
   if (omitBin !== true) manifest.bin = bin;
   writeFileSync(join(root, 'package.json'), `${JSON.stringify(manifest, null, 2)}\n`);
   return {
@@ -819,7 +819,7 @@ test('install writes the agent file and the MCP entry, and repeating it changes 
     const agent = readFileSync(fixture.agentPath, 'utf8');
     assert.match(agent, /^name = "dsh-delegate"$/mu);
     assert.match(agent, new RegExp(`^version = "${DELIVERABLE_VERSION.replace(/\./gu, '\\.')}"$`, 'mu'));
-    assert.match(agent, /managed by the DSH Delegate plugin/u);
+    assert.match(agent, /managed by the DSH TaskDispatch plugin/u);
 
     const configBefore = readFileSync(fixture.configPath, 'utf8');
     const second = await runCodexAction('install', { codexHome: fixture.home, env: isolatedEnv(fixture.home), version: DELIVERABLE_VERSION });
@@ -1395,6 +1395,12 @@ test('the published 0.1.13 agent is refreshed when unchanged and preserved when 
  */
 const HISTORICAL_AGENT_FIXTURES = Object.freeze([
   {
+    version: '1.2.0',
+    path: join(ROOT, 'tests', 'fixtures', 'codex-agent-1.2.0.toml'),
+    packed: '8479c8ab418d71b15fb30880aa5149fb1070d194e8444a110a2a614cebf4eaf4',
+    lf: '947f3fb8a8e9ae5cc6fb3c9d379c69b595af4c46f89ac77f69aa1edf696a8f8e',
+  },
+  {
     version: '1.0.0',
     path: join(ROOT, 'tests', 'fixtures', 'codex-agent-1.0.0.toml'),
     packed: 'b1fd531598087564b26df14d3261515e961012f3fd010ea493f222da7bbaf415',
@@ -1940,7 +1946,7 @@ test('remove keeps an agent file that changed after it was inspected', async () 
   try {
     await runCodexAction('install', { codexHome: fixture.home, env: isolatedEnv(fixture.home), version: DELIVERABLE_VERSION });
     const managed = readFileSync(fixture.agentPath, 'utf8');
-    assert.match(managed, /managed by the DSH Delegate plugin/u);
+    assert.match(managed, /managed by the DSH TaskDispatch plugin/u);
 
     // The deterministic seam: this is the status a `remove` would act on — the same
     // document an operator saw a moment earlier. The file is rewritten *after* that
@@ -3621,7 +3627,7 @@ test('the companion inspects the workspace before dispatching and makes an expli
   // 3. A clean repository takes the configured worktree; the template must not let
   //    the agent edit that configuration to make a run fit.
   assert.match(template, /reason `PREFLIGHT_CLEAN_REPOSITORY`/u);
-  assert.match(template, /worktree isolation configured in the DSH Delegate\s+plugin settings/u);
+  assert.match(template, /worktree isolation configured in the DSH TaskDispatch\s+plugin settings/u);
 
   // 4. A dirty repository is decided by the coordinator from the task and paths.
   //    It must not silently downgrade, and must not probe by submitting.

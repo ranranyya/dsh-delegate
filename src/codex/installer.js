@@ -305,6 +305,9 @@ export const KNOWN_AGENT_TEMPLATES = [
     version: '1.1.0',
     sha256: '93d580bd849bb6d2c30c2db6286695ef3e0356896a88e552abae5f03eafc7601',
   },
+  // Exact published 1.2.0 bytes (archive fixture, LF and CRLF forms).
+  { version: '1.2.0', sha256: '8479c8ab418d71b15fb30880aa5149fb1070d194e8444a110a2a614cebf4eaf4' },
+  { version: '1.2.0', sha256: '947f3fb8a8e9ae5cc6fb3c9d379c69b595af4c46f89ac77f69aa1edf696a8f8e' },
 ];
 
 /** The `version = "…"` line of an agent file, at column 0. */
@@ -360,7 +363,7 @@ const PACKAGE_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..'
  * This package's own name, the identity an older installation's `package.json` must
  * declare before its entry point can be adopted by an automatic migration.
  */
-const PACKAGE_NAME = 'dsh-delegate';
+const PACKAGE_NAME = 'dsh-taskdispatch';
 const TEMPLATE_PATH = join(PACKAGE_ROOT, 'codex', AGENT_FILENAME);
 const PACKAGE_MANIFEST_PATH = join(PACKAGE_ROOT, 'package.json');
 
@@ -1535,6 +1538,24 @@ function doesManifestMapEntry(manifest, rootDir) {
  * @param {string} packageName - package name the root's manifest must declare.
  * @returns {Promise<boolean>} true only when the root is provably this package.
  */
+function isOwnPackageManifest(manifest, packageName) {
+  // A rename must not adopt the unrelated public npm package with our old name.
+  // Both identities need our repository provenance in addition to the existing
+  // real-file and exact bin-mapping proof. Custom test identities stay exact.
+  if (packageName !== PACKAGE_NAME) return manifest.name === packageName;
+  if (!['dsh-taskdispatch', 'dsh-delegate'].includes(manifest.name)) return false;
+  const repository = typeof manifest.repository === 'string'
+    ? manifest.repository : manifest.repository?.url;
+  if (typeof repository !== 'string') return false;
+  try {
+    const url = new URL(repository.replace(/^git\+/u, ''));
+    if (url.protocol !== 'https:' || url.hostname !== 'github.com' || url.port
+      || url.username || url.password || url.search || url.hash) return false;
+    const path = url.pathname.replace(/\/$/u, '').replace(/\.git$/u, '');
+    return ['/ranranyya/dsh-delegate', '/ranranyya/dsh-taskdispatch'].includes(path);
+  } catch { return false; }
+}
+
 async function isOtherInstallationOfThisPackage(script, packageName) {
   if (typeof script !== 'string' || !isAbsolute(script)) return false;
   // Normalise the spelling once: the proof is about the file the path names, and every
@@ -1564,7 +1585,7 @@ async function isOtherInstallationOfThisPackage(script, packageName) {
     if (!samePlatformPath(realCandidate, realEntry, process.platform)) return false;
     const manifest = JSON.parse(await readFile(manifestPath, 'utf8'));
     if (manifest === null || typeof manifest !== 'object' || Array.isArray(manifest)) return false;
-    if (manifest.name !== packageName) return false;
+    if (!isOwnPackageManifest(manifest, packageName)) return false;
     return doesManifestMapEntry(manifest, rootDir);
   } catch {
     // Anything unreadable, missing or malformed is "cannot be proved", never "assume ours".

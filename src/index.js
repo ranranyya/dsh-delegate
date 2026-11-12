@@ -62,7 +62,7 @@ import { PermissionBridge, PERMISSION_DEFAULT_TIMEOUT_MS } from './runtime/permi
 import { redactText, isSecretKey } from './config/redact.js';
 
 /** Stable Cordis plugin name; also the settings/document namespace. */
-export const name = 'dsh-delegate';
+export const name = 'dsh-taskdispatch';
 
 /**
  * Injected native services. Listing them explicitly means the plugin is not
@@ -511,7 +511,7 @@ export async function apply(ctx, config = {}) {
 }
 
 /** Version reported by the runtime facts block. Mirrors `package.json`. */
-const PLUGIN_VERSION = '1.2.0';
+const PLUGIN_VERSION = '1.3.0';
 
 /**
  * Read the native approval service without turning absence into a throw.

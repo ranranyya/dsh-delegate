@@ -60,7 +60,7 @@ const SUPPORTED_DSH_RANGE = SUPPORTED_DSH_VERSIONS.join(' || ');
  * upgrades an already installed managed Codex MCP entry that is merely stale. It
  * follows the `1.1.0` release.
  */
-const DELIVERABLE_VERSION = '1.2.0';
+const DELIVERABLE_VERSION = '1.3.0';
 
 /**
  * The published build this release upgrades *from*.
@@ -69,7 +69,7 @@ const DELIVERABLE_VERSION = '1.2.0';
  * current version must be exactly one MINOR above this baseline (a feature release),
  * and the two are different versions by construction.
  */
-const PREVIOUS_VERSION = '1.1.0';
+const PREVIOUS_VERSION = '1.2.0';
 
 // Published prior builds are retained only where the migration/ownership contract
 // names them. Other operator-facing and shipped code must not carry stale versions.
@@ -85,7 +85,7 @@ const HISTORICAL_VERSION_PATHS = new Set([
  * A published build may only be named next to a historical-contract document when its
  * bytes are still recognized by the migrator; otherwise the mention is a stale label.
  */
-const MIGRATABLE_AGENT_VERSIONS = ['0.1.6', '0.1.7', '0.1.8', '0.1.9', '0.1.10', '0.1.11', '0.1.12', '0.1.13', '0.1.14', '1.0.0', '1.1.0'];
+const MIGRATABLE_AGENT_VERSIONS = ['0.1.6', '0.1.7', '0.1.8', '0.1.9', '0.1.10', '0.1.11', '0.1.12', '0.1.13', '0.1.14', '1.0.0', '1.1.0', '1.2.0'];
 /** A semver value: `MAJOR.MINOR.PATCH` with an optional prerelease suffix. */
 const SEMVER = /^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)(?:-[0-9A-Za-z.-]+)?$/u;
 
@@ -201,7 +201,7 @@ const PACKED = expandAllowlist(MANIFEST.files, KNOWN_FILES);
 // ---------------------------------------------------------------------------
 
 test('the manifest keeps its identity, license and runtime constraints', () => {
-  assert.equal(MANIFEST.name, 'dsh-delegate');
+  assert.equal(MANIFEST.name, 'dsh-taskdispatch');
   assert.match(MANIFEST.version, /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/u);
   assert.equal(MANIFEST.license, 'MIT');
   assert.equal(MANIFEST.type, 'module');
@@ -227,8 +227,8 @@ test('the plugin half declares a bundle patch, which exists inside the archive',
   // The patch mounts exactly one row, id `dsh-delegate`, with no config block and
   // nothing that looks like a pre-issued authorization or a disabled row.
   assert.match(body, /^[- ]*insert:$/mu);
-  assert.match(body, /^\s+- id: dsh-delegate$/mu);
-  assert.match(body, /^\s+name: dsh-delegate$/mu);
+  assert.match(body, /^\s+- id: dsh-taskdispatch$/mu);
+  assert.match(body, /^\s+name: dsh-taskdispatch$/mu);
   assert.doesNotMatch(body, /\bconfig\b|\bdisabled\b|\bgrant|\btoken|\bauthoriz/iu);
   // Exactly one inserted row: a second would mount the service twice.
   assert.equal(body.match(/^\s+- id:/gmu)?.length, 1);
@@ -257,7 +257,7 @@ test('the client half declares platform web and a resolvable ./client export', (
   // served but never composed for this package.
   const bundle = readFileSync(join(ROOT, 'lib', 'client.js'), 'utf8');
   assert.match(bundle, /__ModuleLoader__\.load\(/u);
-  assert.match(bundle, /id: "dsh-delegate"/u);
+  assert.match(bundle, /id: "dsh-taskdispatch"/u);
   assert.match(bundle, /factory: \(require\) =>/u);
 
   // Every module the registration requests must be in the frozen platform table,
@@ -290,7 +290,7 @@ test('the client bundle registers the bundle configuration page, keyed exactly d
   // asserted once and every use site is asserted to reference the constant. A
   // duplicated string literal would let the two halves drift apart silently.
   assert.match(bundle, /var PLUGIN_CONFIG_SLOT = "plugins\.bundle\.config";/u);
-  assert.match(bundle, /var PLUGIN_BUNDLE_KEY = "dsh-delegate";/u);
+  assert.match(bundle, /var PLUGIN_BUNDLE_KEY = "dsh-taskdispatch";/u);
   assert.match(bundle, /name: PLUGIN_CONFIG_SLOT/u);
   assert.match(bundle, /key: PLUGIN_BUNDLE_KEY/u);
   // The page must be attached through `ctx.slots.inject(<constant>, ...)`: the
@@ -304,7 +304,7 @@ test('the client bundle registers the bundle configuration page, keyed exactly d
   // The key must be the package name the manager matches on, not a bundle id
   // from the patch row (`dsh-delegate` happens to be both here; the assertion is
   // against the manifest so a rename of either side fails loudly).
-  assert.equal(MANIFEST.name, 'dsh-delegate');
+  assert.equal(MANIFEST.name, 'dsh-taskdispatch');
 
   // The old Settings page must not linger: a second full page inside the
   // Settings dialog would duplicate the same controls with a second store.
@@ -597,7 +597,7 @@ test('the release metadata is one version everywhere it is written by hand', () 
   // dedicated message tests, so it is not turned back into a version literal here.
   assert.match(discovery, /dsh-delegate build/u, 'the discovery refusal must name the plugin build');
   assert.doesNotMatch(discovery, /\b0\.1\.\d+\b/u, 'the discovery refusal must not pin a release version');
-  assert.match(readme, new RegExp(`dsh-delegate-${escape(MANIFEST.version)}\\.tgz`, 'u'));
+  assert.match(readme, new RegExp(`dsh-taskdispatch-${escape(MANIFEST.version)}\\.tgz`, 'u'));
   // Every *release* literal in the package is this version. The 0.2.x references are
   // DSH runtime versions quoted in comments, not this package's own version.
   for (const path of ['src/index.js', 'src/mcp/server.js', 'src/runtime/endpoint-discovery.js']) {
@@ -632,7 +632,7 @@ test(`the release is ${DELIVERABLE_VERSION}, the correction release after ${PREV
   assert.match(template, new RegExp(`^version = "${escape(DELIVERABLE_VERSION)}"$`, 'mu'));
 
   const readme = readFileSync(join(ROOT, 'README.md'), 'utf8');
-  assert.match(readme, new RegExp(`dsh-delegate-${escape(DELIVERABLE_VERSION)}\\.tgz`, 'u'));
+  assert.match(readme, new RegExp(`dsh-taskdispatch-${escape(DELIVERABLE_VERSION)}\\.tgz`, 'u'));
   const contract = readFileSync(join(ROOT, 'docs', 'codex-integration.md'), 'utf8');
   assert.match(contract, new RegExp(`implemented in ${escape(DELIVERABLE_VERSION)}`, 'u'), 'the Codex contract names the release it describes');
   assert.match(contract, new RegExp(`"packageVersion": "${escape(DELIVERABLE_VERSION)}"`, 'u'));

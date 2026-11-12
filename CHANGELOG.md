@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.3.0 — DSH TaskDispatch identity and public plugin index
+
+- Public package/bundle identity changes from `dsh-delegate` to `dsh-taskdispatch`; the display title is **DSH TaskDispatch**. Existing data paths, endpoint discovery, environment variables, MCP `delegate_*` tools, binaries and the managed Codex agent/server identifiers remain stable.
+- Add English/Chinese plugin metadata, an SVG icon, a Chinese product introduction and manual Claude Code MCP instructions. The intro emphasizes configuring DSH's already-connected APIs, models and supported reasoning effort. No new context-window selector or Claude one-click installer is claimed.
+- Enumerate the exact published 1.2.0 agent-template bytes so existing managed integrations remain refreshable. Explicit moved-install adoption requires this project's old/new repository provenance as well as real files and the exact bin mapping; an unrelated same-name npm package is refused.
+- Add a dependency-free, exact-commit format-1 DSH plugin-index generator and an official-actions GitHub Pages deployment workflow. Search requires adding the project's custom index; this does not claim universal official marketplace inclusion or npm publication.
+- Package identity migration requires stopping/uninstalling the old bundle while retaining plugin data, then installing the new bundle and explicitly repairing the managed Codex entry. Do not activate both bundles at once. Full real Desktop migration/restart and real Claude Code acceptance remain separate checks.
+
 ## 1.2.0 — waiting that cannot be mistaken for completion, and an independent control channel
 
 Fixes the three problems the 1.1.0 real acceptance run reported: an `interrupted`
