@@ -7,6 +7,7 @@ import {
   CONVERSATION_POLICY_LABEL,
   conversationOf,
 } from '../src/client/api.js';
+import { WAIT_REASON_LABELS, codexMcpDriftText, taskStateLabel } from '../src/client/api.js';
 
 function configuredDraft(provider) {
   const draft = defaultDraft();
@@ -312,6 +313,47 @@ test('only pending and running tasks are live for refresh purposes', () => {
   assert.equal(hasLiveTasks([]), false);
   assert.equal(hasLiveTasks([{ state: 'failed' }]), false);
   assert.equal(hasLiveTasks([{ state: 'failed' }, { state: 'running' }]), true);
+});
+
+test('a real interrupted history is shown as ended, never as still running', () => {
+  // The state a restart leaves behind. The panel must say it will not continue; the
+  // word "running" must not appear in either label.
+  const label = taskStateLabel('interrupted');
+  assert.match(label, /中断/u);
+  assert.match(label, /不会继续执行/u);
+  assert.doesNotMatch(label, /执行中|仍在运行/u);
+  // The WAIT reason covers a LIVE task, a restart history AND an unreadable record, so
+  // the label must not claim either outcome: it points at the fields that decide.
+  assert.match(WAIT_REASON_LABELS.interrupted, /等待被中断/u);
+  assert.doesNotMatch(WAIT_REASON_LABELS.interrupted, /任务本身没有停止/u,
+    'an unknown record must not be described as definitely not stopped');
+  assert.doesNotMatch(WAIT_REASON_LABELS.interrupted, /任务仍在运行/u,
+    'and not as definitely still running either');
+  assert.match(WAIT_REASON_LABELS.interrupted, /terminal/u, 'the label names the field that decides');
+  // A progress line for such a record promises no further progress.
+  const progress = taskProgress({
+    taskId: 'task-1',
+    state: 'interrupted',
+    phase: 'execute',
+    activity: { lastActivityAt: 1, idleForMs: 5_000, waitingOn: 'idle', currentTool: null, events: 3, activityEvents: 2 },
+  });
+  assert.match(progress.detail, /不会继续执行/u);
+  assert.equal(progress.available, true);
+});
+
+test('an outdated managed MCP entry is described by the facts that are stale', () => {
+  assert.match(codexMcpDriftText({ drift: ['tool_timeout_sec'] }), /工具超时/u);
+  assert.match(codexMcpDriftText({ drift: ['tool_timeout_sec'] }), /工具超时/u);
+  // No client is GUARANTEED to truncate a long call: the real 1.1 acceptance never proved
+  // that attribution, so the label states a possibility instead of promising it.
+  assert.doesNotMatch(codexMcpDriftText({ drift: ['tool_timeout_sec'] }), /会提前中断/u);
+  assert.match(codexMcpDriftText({ drift: ['tool_timeout_sec'] }), /可能/u);
+  assert.match(codexMcpDriftText({ drift: ['args'] }), /入口脚本路径/u);
+  assert.match(codexMcpDriftText({ drift: ['tool_timeout_sec', 'args'] }), /工具超时.*入口脚本路径/u);
+  assert.equal(codexMcpDriftText({ drift: [] }), '托管 MCP 条目需要更新');
+  assert.equal(codexMcpDriftText({}), '托管 MCP 条目需要更新');
+  // An unknown fact is shown by its own name rather than hidden.
+  assert.equal(codexMcpDriftText({ drift: ['mystery'] }), 'mystery');
 });
 
 test('a background refresh publishes the list and the selected detail without a second read', async () => {

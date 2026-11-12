@@ -24,7 +24,7 @@ import { execFile } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { dirname, join, resolve } from 'node:path';
+import { dirname, join, posix, resolve, win32 } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import {
@@ -32,6 +32,8 @@ import {
   KNOWN_AGENT_TEMPLATES,
   MCP_MARKER,
   MCP_SERVER_NAME,
+  adoptMovedInstall,
+  adoptProvedMovedInstall,
   applyMcpEntry,
   classifyMcpEntry,
   createFileExclusive,
@@ -41,29 +43,40 @@ import {
   hostRuntimeKind,
   inspectCodexBoundary,
   isNodeExecutableName,
+  isOwnedEntryScript,
+  isOwnedStaleEntry,
+  packageEntryRoot,
+  samePlatformPath,
   packagedNodePath,
   parseDirectoryVerdict,
+  readCodexStatus,
   removeMcpEntry,
   removeManagedAgentFile,
   resolveCodexHome,
   resolveMcpScript,
   resolveNodeExecutable,
+  refreshKnownAgentTemplate,
   runCodexAction,
   useDirectoryClassifier,
 } from '../src/codex/installer.js';
 import { TomlDocument, readTomlValues } from '../src/codex/toml.js';
-import { createCodexSeam } from '../src/codex/seam.js';
+import { createCodexSeam, defaultBackupDirectory, installationRecordPath, resolveStartupTarget } from '../src/codex/seam.js';
 import { TomlDocument as Document } from '../src/codex/toml.js';
 import { writeFileAtomic } from '../src/config/store.js';
 import { USER_PLANE_PREFIX, wrapUserPlaneRoutes } from '../src/http/user-plane.js';
 import { PREFLIGHT_ISOLATIONS, PREFLIGHT_REASONS } from '../src/workspace/preflight.js';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
-const DELIVERABLE_VERSION = '1.1.0';
+const DELIVERABLE_VERSION = '1.2.0';
 // The baseline the current release upgrades *from*, pinned rather than derived: an
 // expectation that followed `DELIVERABLE_VERSION` would assert nothing.
 const PREVIOUS_VERSION = '0.1.14';
 const HISTORICAL_TEMPLATE_VERSION = '0.1.13';
+/**
+ * A version label no release ever shipped, used to prove that relabelling the current
+ * template does not produce an enumerable "known build".
+ */
+const AGENT_RELABEL_PROBE_VERSION = '0.1.0';
 /**
  * The SHA-256 of the published 0.1.12 template, over the packed (CRLF) bytes.
  *
@@ -100,16 +113,17 @@ const AGENT_0_1_13_FIXTURE = join(ROOT, 'tests', 'fixtures', 'codex-agent-0.1.13
 const AGENT_0_1_13_DIGEST = 'b3a1d2f0520774c0067ea733f27fd47c67c5f5ac44394d0eec2564c7959700aa';
 const AGENT_0_1_14_DIGEST = '11379c0152f3fb2bd4da1170812e51fe68006d98f6378c720cbadcee9ee4750c';
 /**
- * The published 1.0.0 companion, as packed (CRLF).
+ * The two LEGACY pinned 1.0.0 identities (unknown provenance).
  *
- * 1.1.0 replaced the repeat-result polling rules with `delegate_wait` and added the
- * explicit "do not implement locally while a delegated worker runs" boundary, so the
- * body changed and this is a *distinct* published build. It is reconstructed from the
- * current template by restamping the version line, which is exactly how it was
- * derived: 1.1.0 changed only the instruction body afterwards, so the reconstructed
- * bytes equal the shipped 1.0.0 bytes and the pinned digest proves it.
+ * They are deliberately NOT the Git release bytes: the Git-verified 1.0.0 fixture hashes
+ * to `b1fd5315…` (packed CRLF) and `0cce7557…` (LF), and those identities are enumerated
+ * separately and asserted by the fixture tests. These two digests were enumerated by an
+ * earlier build and are retained so an installation created by that build stays
+ * structurally refreshable/removable instead of flipping to "somebody else's file". They
+ * are exact content identities, not reconstructions of today's template.
  */
-const AGENT_1_0_0_DIGEST = 'a8c888afaa0a1a6a0abfcb56670ffbdb67697f07e54871ece78c8adffb15c149';
+const AGENT_1_0_0_LEGACY_DIGEST = 'a8c888afaa0a1a6a0abfcb56670ffbdb67697f07e54871ece78c8adffb15c149';
+const AGENT_1_0_0_LEGACY_DIGEST_ALT = 'f51831e2ff265c9ba63a4760e245787060de7bd91dcc9663a11729fb472e5f62';
 /**
  * The 0.1.13 template text, which is the body every release from 0.1.10 to 0.1.13 shipped.
  *
@@ -134,9 +148,10 @@ const AGENT_0_1_7_LEGACY_FIXTURE = join(ROOT, 'tests', 'fixtures', 'codex-agent-
  * Releases older than the current one that are still enumerated for migration.
  *
  * Pinned constants rather than derived values: `KNOWN_AGENT_TEMPLATES` is what is being
- * asserted, so a digest computed from it would assert nothing. Each release changed only
- * the version line in the companion file, so its exact bytes are rebuilt from the current
- * template by rewriting that line (see {@link stampedTemplate}).
+ * asserted, so a digest computed from it would assert nothing. 0.1.10–0.1.13 shipped one
+ * body and differ only in the version line, so these are rebuilt from the pinned 0.1.13
+ * FIXTURE (see {@link stampedTemplate}) — never from today's template, whose body changed
+ * in 0.1.14.
  */
 const AGENT_0_1_11_VERSION = '0.1.11';
 const AGENT_0_1_11_DIGEST = 'b6ca7c3258fc00c1c1682abf099994b9f5abe650acc3ecf9635eec4a35520151';
@@ -145,8 +160,9 @@ const AGENT_0_1_11_DIGEST = 'b6ca7c3258fc00c1c1682abf099994b9f5abe650acc3ecf9635
  *
  * These are enumerated in `KNOWN_AGENT_TEMPLATES`; each pair is pinned here so the
  * assertions compare against a fixed identity instead of recomputing the very list
- * under test. They are rebuilt from the current template by rewriting only its version
- * line, which is the only byte that differs between these releases.
+ * under test. They are rebuilt from the pinned 0.1.13 FIXTURE — the last release that
+ * shipped that body — by rewriting only its version line; the current template's body is
+ * different, so deriving them from it would fabricate bytes no release ever published.
  */
 const AGENT_0_1_7_REBUILD_VERSION = '0.1.7';
 const AGENT_0_1_7_REBUILD_DIGEST = 'e3689492ee0f24d2defd2a9254b653e7bc54c258dd38fb0c2fc70ce5b386f2b3';
@@ -163,6 +179,18 @@ const AGENT_0_1_9_REBUILD_DIGEST = 'b5db667d114baf881f59c9367a80137379960b1fccb5
 // tests below install their own classifier to report a junction, which is exactly what
 // a real Windows install would answer.
 useDirectoryClassifier(nodeClassifier());
+
+/**
+ * Why the backup-window regressions are skipped off Windows.
+ *
+ * They inject their concurrent edit from the directory-classifier hook, which the product
+ * only consults for the Windows attribute read (the POSIX path answers from `lstat` and
+ * never calls an injectable hook). The behaviour under test is platform-neutral; only the
+ * deterministic injection point is Windows-specific.
+ */
+const WINDOWS_CLASSIFIER_SKIP = process.platform === 'win32'
+  ? false
+  : 'the backup-window hook is the Windows attribute read; this platform exposes no deterministic injection there';
 
 /**
  * The managed MCP block exactly as the installer writes it, marker included.
@@ -198,9 +226,58 @@ function codexHomeFixture() {
   };
 }
 
-/** Environment with no DSH/Codex overrides except an explicit Codex home. */
+/**
+ * A REAL second installation of this package, for the moved-install migration.
+ *
+ * The migration only adopts a differing script path when that path is provably another
+ * installation of this package: an absolute `<root>/bin/dsh-delegate-mcp.js` where
+ * `<root>/package.json` declares `name: "dsh-delegate"` AND maps its published
+ * `bin["dsh-delegate-mcp"]` entry to that very file. This builds exactly that on disk, so
+ * a test proves the real proof rather than a name that merely looks like one.
+ *
+ * `bin`/`omitBin` exist for the NEGATIVE cases: a same-layout wrapper with a missing,
+ * wrong, absolute or out-of-package mapping must never be adopted.
+ * @param {object} [options] - `name`, `bin` mapping (default: the real one), `omitBin`.
+ * @returns {{ root: string, script: string, cleanup: () => void }} the installation.
+ */
+function otherInstallationFixture({
+  name = 'dsh-delegate',
+  bin = { 'dsh-delegate-mcp': 'bin/dsh-delegate-mcp.js' },
+  omitBin = false,
+} = {}) {
+  const root = mkdtempSync(join(tmpdir(), 'dsh-delegate-oldpkg-'));
+  mkdirSync(join(root, 'bin'), { recursive: true });
+  const script = join(root, 'bin', 'dsh-delegate-mcp.js');
+  writeFileSync(script, '// an older installation of this package\n');
+  /** @type {Record<string, unknown>} */
+  const manifest = { name, version: '1.1.0' };
+  if (omitBin !== true) manifest.bin = bin;
+  writeFileSync(join(root, 'package.json'), `${JSON.stringify(manifest, null, 2)}\n`);
+  return {
+    root,
+    script,
+    cleanup() {
+      rmSync(root, { recursive: true, force: true });
+    },
+  };
+}
+
+/**
+ * Environment with no DSH/Codex overrides except an explicit Codex home.
+ *
+ * `DSH_HOME` is redirected INTO the same scratch directory as the Codex home. The seam
+ * records the Codex home a successful explicit install used under
+ * `$DSH_HOME/data/dsh-delegate`, and derives its default backup directory from the same
+ * root: with an empty `DSH_HOME` every `seam.run('install')` would write that record into
+ * the operator's real `~/.dsh`, which a test must never do.
+ */
 function isolatedEnv(home) {
-  return { CODEX_HOME: home, DSH_HOME: '', DSH_DELEGATE_DISCOVERY_FILE: '', DSH_DELEGATE_BASE_URL: '' };
+  return {
+    CODEX_HOME: home,
+    DSH_HOME: join(home, '.dsh-test-home'),
+    DSH_DELEGATE_DISCOVERY_FILE: '',
+    DSH_DELEGATE_BASE_URL: '',
+  };
 }
 
 /**
@@ -989,9 +1066,9 @@ test(`the published 0.1.11 agent is refreshed to ${DELIVERABLE_VERSION} by start
   // still be migrated, so its coverage is kept — generalized over the version it
   // upgrades to rather than frozen at one release.
   //
-  // The companion body has not changed since 0.1.10, so these bytes are rebuilt from the
-  // current template by rewriting only its version line, then proved against the pinned
-  // published digest.
+  // 0.1.11 shipped the 0.1.13-body companion (the versions after it changed the body),
+  // so its bytes are rebuilt from the pinned 0.1.13 FIXTURE by rewriting only its
+  // version line, then proved against the pinned published digest.
   const fixture = codexHomeFixture();
   const template = readFileSync(join(ROOT, 'codex', 'dsh-delegate.toml'), 'utf8');
   assertShippedTemplate(template);
@@ -1003,11 +1080,17 @@ test(`the published 0.1.11 agent is refreshed to ${DELIVERABLE_VERSION} by start
       KNOWN_AGENT_TEMPLATES.some((entry) => entry.version === AGENT_0_1_11_VERSION && entry.sha256 === AGENT_0_1_11_DIGEST),
       `the published ${AGENT_0_1_11_VERSION} template must stay enumerated, or a skipped release can never be refreshed`,
     );
-    // No entry in the list may be the current build under an older label.
-    assert.ok(
-      KNOWN_AGENT_TEMPLATES.every((entry) => entry.sha256 !== digest(template) || entry.version === DELIVERABLE_VERSION),
-      'a known build may never share the current template bytes under another version',
-    );
+    // No enumerated build may match the current template with a RELABELLED version
+    // line: such a "build" was never published. (The current template is itself not
+    // enumerated either, because it is compared as the live template, not as history.)
+    const RELABEL_MARKER = `version = "${AGENT_RELABEL_PROBE_VERSION}"`;
+    for (const entry of KNOWN_AGENT_TEMPLATES) {
+      const relabelled = template.replace(/^version = ".*"$/mu, RELABEL_MARKER);
+      assert.notEqual(entry.sha256, digest(relabelled), 'a relabelled current template is never a known build');
+    }
+    // Sanity: the relabelled probe really differs from the shipped file, so the
+    // assertion above is not vacuous.
+    assert.notEqual(template.replace(/^version = ".*"$/mu, RELABEL_MARKER), template);
 
     // 1. Startup refresh: the only automatic write, and it happens exactly once.
     mkdirSync(dirname(fixture.agentPath), { recursive: true });
@@ -1301,39 +1384,105 @@ test('the published 0.1.13 agent is refreshed when unchanged and preserved when 
   }
 });
 
-test('the published 1.0.0 agent is refreshed to this build and preserved when customized', async () => {
-  // 1.1.0 replaced the repeat-result polling rules with `delegate_wait` and added the
-  // "do not implement locally" boundary, so the instruction BYTES changed and the
-  // 1.0.0 file is a distinct published build. It must stay enumerated, or every
-  // 1.0.0 installation would be reported as somebody else's file and never update.
-  const fixture = codexHomeFixture();
-  const template = readFileSync(join(ROOT, 'codex', AGENT_FILENAME), 'utf8');
-  assertShippedTemplate(template);
-  const prior = stampedTemplate(template, DELIVERABLE_VERSION, '1.0.0', 'crlf');
-  try {
-    assert.equal(digest(prior), AGENT_1_0_0_DIGEST, 'the reconstructed 1.0.0 bytes are the published template');
-    assert.ok(
-      KNOWN_AGENT_TEMPLATES.some((entry) => entry.version === '1.0.0' && entry.sha256 === AGENT_1_0_0_DIGEST),
-      'the published 1.0.0 template must stay enumerated for this upgrade',
-    );
+/**
+ * The two real release companions this build must upgrade.
+ *
+ * Both files are the PUBLISHED bytes, not reconstructions: 1.0.0 is
+ * `git show 2750047:codex/dsh-delegate.toml` and 1.1.0 is
+ * `git show 2d71708:codex/dsh-delegate.toml`, saved as fixtures. A release that shipped
+ * a different body can never be reached by relabelling today's template, so the fixture
+ * is the only honest input for these tests.
+ */
+const HISTORICAL_AGENT_FIXTURES = Object.freeze([
+  {
+    version: '1.0.0',
+    path: join(ROOT, 'tests', 'fixtures', 'codex-agent-1.0.0.toml'),
+    packed: 'b1fd531598087564b26df14d3261515e961012f3fd010ea493f222da7bbaf415',
+    lf: '0cce75574107049413f4ddbdf7d8e6cddea92d45a0c4e0fa41b169cb790e5e13',
+  },
+  {
+    version: '1.1.0',
+    path: join(ROOT, 'tests', 'fixtures', 'codex-agent-1.1.0.toml'),
+    packed: '7d3ea5c54647a92cebaa0521741eb27f5141f7b2127b47009195fdb976dae4fb',
+    lf: '93d580bd849bb6d2c30c2db6286695ef3e0356896a88e552abae5f03eafc7601',
+  },
+]);
 
-    mkdirSync(dirname(fixture.agentPath), { recursive: true });
-    writeFileSync(fixture.agentPath, prior);
-    const migrated = await createCodexSeam({ codexHome: fixture.home, env: isolatedEnv(fixture.home), version: DELIVERABLE_VERSION }).refreshKnownAgent();
-    assert.deepEqual(migrated.changed, ['agent']);
-    assert.equal(readFileSync(fixture.agentPath, 'utf8'), template);
+for (const release of HISTORICAL_AGENT_FIXTURES) {
+  test(`the published ${release.version} agent is upgraded by startup and by install, from its real bytes`, async () => {
+    const fixture = codexHomeFixture();
+    const published = readFileSync(release.path, 'utf8');
+    const template = readFileSync(join(ROOT, 'codex', AGENT_FILENAME), 'utf8');
+    try {
+      // The fixtures really are the published bytes, and every one of them is enumerated
+      // as an exact identity — both the packed (CRLF) form and the same file as LF text.
+      assert.equal(digest(published), release.packed, `${release.version} fixture is the packed release`);
+      const lfForm = published.replaceAll('\r\n', '\n');
+      assert.equal(digest(lfForm), release.lf, `${release.version} fixture in its LF form`);
+      assert.ok(published.includes('\r\n'), 'the packed form really is CRLF');
+      for (const sha256 of [release.packed, release.lf]) {
+        assert.ok(
+          KNOWN_AGENT_TEMPLATES.some((entry) => entry.version === release.version && entry.sha256 === sha256),
+          `${release.version} must stay enumerated so an existing installation can be upgraded`,
+        );
+      }
+      assert.notEqual(published, template, `the ${release.version} body differs from this build\'s`);
 
-    writeFileSync(fixture.agentPath, prior);
-    const status = await runCodexAction('status', { codexHome: fixture.home, env: isolatedEnv(fixture.home), version: DELIVERABLE_VERSION });
-    assert.equal(status.status.agent.state, 'outdated');
+      // 1. Startup upgrades the byte-exact published file, and nothing else.
+      mkdirSync(dirname(fixture.agentPath), { recursive: true });
+      writeFileSync(fixture.agentPath, published);
+      const before = await runCodexAction('status', { codexHome: fixture.home, env: isolatedEnv(fixture.home), version: DELIVERABLE_VERSION });
+      assert.equal(before.status.agent.state, 'outdated', `${release.version} is outdated, never modified`);
+      assert.equal(before.status.agent.managed, true);
 
-    const edited = prior.replace('name = "dsh-delegate"', '# keep my edit\nname = "dsh-delegate"');
-    writeFileSync(fixture.agentPath, edited);
-    const refused = await runCodexAction('install', { codexHome: fixture.home, env: isolatedEnv(fixture.home), version: DELIVERABLE_VERSION });
-    assert.equal(refused.status.agent.state, 'modified');
-    assert.equal(readFileSync(fixture.agentPath, 'utf8'), edited);
-  } finally {
-    fixture.cleanup();
+      const seam = createCodexSeam({ codexHome: fixture.home, env: isolatedEnv(fixture.home), version: DELIVERABLE_VERSION });
+      const startupTarget = await seam.startupTarget();
+      const migrated = await seam.refreshManagedIntegration({ startupTarget });
+      assert.deepEqual(migrated.changed, ['agent']);
+      assert.deepEqual(migrated.refused, []);
+      assert.equal(readFileSync(fixture.agentPath, 'utf8'), template, 'the file becomes exactly this build\'s agent');
+      assert.equal(existsSync(fixture.configPath), false, 'startup must not create config.toml');
+
+      // 2. Repeating it is a no-op, and the explicit install refreshes the same bytes.
+      const again = await createCodexSeam({ codexHome: fixture.home, env: isolatedEnv(fixture.home), version: DELIVERABLE_VERSION })
+        .refreshManagedIntegration();
+      assert.deepEqual(again.changed, [], 'an already-current file is never rewritten');
+      writeFileSync(fixture.agentPath, lfForm);
+      const installed = await runCodexAction('install', { codexHome: fixture.home, env: isolatedEnv(fixture.home), version: DELIVERABLE_VERSION });
+      assert.ok(installed.changed.includes('agent'), 'the LF form of the same release is refreshed too');
+      assert.equal(readFileSync(fixture.agentPath, 'utf8'), template);
+
+      // 3. An operator edit on top of the published bytes is THEIRS: the version line is
+      //    not the proof, so no action may write, refresh or remove it.
+      const edited = published.replace('name = "dsh-delegate"', '# my own note\r\nname = "dsh-delegate"');
+      assert.notEqual(edited, published);
+      writeFileSync(fixture.agentPath, edited);
+      const editedStatus = await runCodexAction('status', { codexHome: fixture.home, env: isolatedEnv(fixture.home), version: DELIVERABLE_VERSION });
+      assert.equal(editedStatus.status.agent.state, 'modified', `an edited ${release.version} file is not a known build`);
+      const afterEdit = await createCodexSeam({ codexHome: fixture.home, env: isolatedEnv(fixture.home), version: DELIVERABLE_VERSION })
+        .refreshManagedIntegration();
+      assert.deepEqual(afterEdit.changed, [], 'startup never rewrites an edited agent');
+      for (const action of ['install', 'repair', 'remove']) {
+        const outcome = await runCodexAction(action, { codexHome: fixture.home, env: isolatedEnv(fixture.home), version: DELIVERABLE_VERSION });
+        assert.equal(outcome.changed.includes('agent'), false, `${action} must not write the edited agent`);
+        assert.equal(readFileSync(fixture.agentPath, 'utf8'), edited, `${action} must leave it byte-identical`);
+      }
+    } finally {
+      fixture.cleanup();
+    }
+  });
+}
+
+test('the published 1.0.0 and 1.1.0 fixtures are never packed', () => {
+  // They are test inputs, not product data: a published archive that shipped a prior
+  // release's companion would hand a reviewer bytes this build does not install.
+  const manifest = JSON.parse(readFileSync(join(ROOT, 'package.json'), 'utf8'));
+  for (const release of HISTORICAL_AGENT_FIXTURES) {
+    const relative = release.path.slice(ROOT.length + 1).split('\\').join('/');
+    assert.ok(relative.startsWith('tests/'), 'the fixtures live under tests/');
+    for (const pattern of manifest.files) {
+      assert.equal(pattern.startsWith('tests/'), false, `the package must not include ${pattern}`);
+    }
   }
 });
 
@@ -1375,6 +1524,9 @@ test('only an enumerated published build is refreshable, and it is refreshed exa
     // the duration of this test; the list is the only thing that grants "outdated".
     const prior = readFileSync(join(ROOT, 'codex', AGENT_FILENAME), 'utf8')
       .replace(/^version = ".*"$/mu, 'version = "0.1.5"');
+    // Remember the shipped list so the temporary entry can be removed without wiping
+    // the product identities (including the legacy 1.0.0 ones) for later tests.
+    const knownBefore = [...KNOWN_AGENT_TEMPLATES];
     KNOWN_AGENT_TEMPLATES.push({ version: '0.1.5', sha256: digest(prior) });
     try {
       mkdirSync(dirname(fixture.agentPath), { recursive: true });
@@ -1388,13 +1540,15 @@ test('only an enumerated published build is refreshable, and it is refreshed exa
       assert.match(readFileSync(fixture.agentPath, 'utf8'), new RegExp(`^version = "${DELIVERABLE_VERSION}"$`, 'mu'));
 
       // Once the digest is no longer known, the same old file is somebody else's.
-      KNOWN_AGENT_TEMPLATES.length = 0;
+      // Restore the SHIPPED list, not an empty one: the temporary entry is removed and
+      // every product identity (including the legacy 1.0.0 ones) stays for later tests.
+      KNOWN_AGENT_TEMPLATES.splice(0, KNOWN_AGENT_TEMPLATES.length, ...knownBefore);
       writeFileSync(fixture.agentPath, prior);
       const refused = await runCodexAction('install', { codexHome: fixture.home, env: isolatedEnv(fixture.home), version: DELIVERABLE_VERSION });
       assert.equal(refused.status.agent.state, 'modified');
       assert.equal(readFileSync(fixture.agentPath, 'utf8'), prior);
     } finally {
-      KNOWN_AGENT_TEMPLATES.length = 0;
+      KNOWN_AGENT_TEMPLATES.splice(0, KNOWN_AGENT_TEMPLATES.length, ...knownBefore);
     }
   } finally {
     fixture.cleanup();
@@ -1927,15 +2081,23 @@ test('a CRLF config.toml is installed into, updated and removed from without los
     assert.match(afterInstall, new RegExp(`^${MCP_MARKER.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&')}\\r$`, 'mu'));
     assert.match(afterInstall, /^\[mcp_servers\.dsh-delegate\]\r$/mu);
 
-    // Update path: stale args in a CRLF file are rewritten in place.
-    writeFileSync(fixture.configPath, afterInstall.replace(
-      /^args = \[.*\]\r$/mu,
-      `args = [${JSON.stringify('E:/old/profile/bin/dsh-delegate-mcp.js')}]\r`,
-    ));
-    await runCodexAction('repair', { codexHome: fixture.home, env: isolatedEnv(fixture.home) });
-    const afterRepair = readFileSync(fixture.configPath, 'utf8');
-    assert.equal(/(^|[^\r])\n/u.test(afterRepair), false, 'a repair must not normalize the file to LF');
-    assert.doesNotMatch(afterRepair, /E:\/old\/profile/u);
+    // Update path: a REAL second installation of this package is proved and adopted; a
+    // path that only looks like one is kept. This is the migrated-install case.
+    const oldInstall = otherInstallationFixture();
+    try {
+      writeFileSync(fixture.configPath, afterInstall.replace(
+        /^args = \[.*\]\r$/mu,
+        `args = [${JSON.stringify(oldInstall.script)}]\r`,
+      ));
+      const stale = await runCodexAction('status', { codexHome: fixture.home, env: isolatedEnv(fixture.home) });
+      assert.equal(stale.status.mcp.state, 'conflict', 'a bare status read never adopts a moved install');
+      await runCodexAction('repair', { codexHome: fixture.home, env: isolatedEnv(fixture.home) });
+      const afterRepair = readFileSync(fixture.configPath, 'utf8');
+      assert.equal(/(^|[^\r])\n/u.test(afterRepair), false, 'a repair must not normalize the file to LF');
+      assert.equal(afterRepair.includes(oldInstall.root), false, 'repair adopted the verified moved install');
+    } finally {
+      oldInstall.cleanup();
+    }
 
     // Remove path: only the managed entry and its marker go; the rest is byte-exact.
     await runCodexAction('remove', { codexHome: fixture.home, env: isolatedEnv(fixture.home) });
@@ -1949,26 +2111,985 @@ test('a CRLF config.toml is installed into, updated and removed from without los
 
 test('a stale entry written by this plugin is updated in place, not duplicated', async () => {
   const fixture = codexHomeFixture();
+  // A REAL second installation of this package, which is the only differing path the
+  // migration may adopt: the old version of this test used a path that merely looked
+  // like one, which is exactly what the review refused to call proof.
+  const oldInstall = otherInstallationFixture();
   try {
-    await runCodexAction('install', { codexHome: fixture.home, env: isolatedEnv(fixture.home) });
+    await runCodexAction('install', { codexHome: fixture.home, env: isolatedEnv(fixture.home), backupDir: join(fixture.home, 'backup') });
     const installed = readFileSync(fixture.configPath, 'utf8');
     // Rewrite the entry as if the plugin had moved (an upgrade to another profile).
     writeFileSync(fixture.configPath, installed.replace(
       /^args = \[.*\]$/mu,
-      `args = [${JSON.stringify('E:/old/profile/bin/dsh-delegate-mcp.js')}]`,
+      `args = [${JSON.stringify(oldInstall.script)}]`,
     ));
 
     const status = await runCodexAction('status', { codexHome: fixture.home, env: isolatedEnv(fixture.home) });
-    assert.equal(status.status.mcp.state, 'outdated');
+    assert.equal(status.status.mcp.state, 'conflict',
+      'a moved install is NOT silently adoptable by a status read');
 
     await runCodexAction('repair', { codexHome: fixture.home, env: isolatedEnv(fixture.home) });
     const repaired = readFileSync(fixture.configPath, 'utf8');
     assert.equal(repaired.match(/^\[mcp_servers\.dsh-delegate\]$/gmu)?.length, 1, 'exactly one entry');
-    assert.doesNotMatch(repaired, /E:\/old\/profile/u);
+    assert.equal(repaired.includes(oldInstall.root), false,
+      'the explicit repair adopted the PROVED moved installation');
+  } finally {
+    oldInstall.cleanup();
+    fixture.cleanup();
+  }
+});
+// ---------------------------------------------------------------------------
+// 6. The installed-integration upgrade: an ALREADY INSTALLED managed entry that is
+//    merely stale is updated at startup; nothing is ever created or adopted.
+// ---------------------------------------------------------------------------
+//
+// The real acceptance defect: a managed `mcp_servers.dsh-delegate` table written by an
+// earlier release carries `command`/`args` but no `tool_timeout_sec`, so Codex may cut one
+// long `delegate_wait` off at its own tool timeout. These tests pin the safe, idempotent
+// upgrade — and the changes the review demanded: a proven script identity, a config
+// digest re-checked before the write, and a backup that is a PRECONDITION.
+
+/**
+ * A managed entry written by an earlier release: marker, command, args, no timeout.
+ * @param {object} [options] - `node`, `script`, `timeout`, `extra`.
+ * @returns {string} config text.
+ */
+function priorManagedConfig({ node = resolveNodeExecutable(), script = null, timeout = null, extra = '' } = {}) {
+  const entry = desiredMcpCommand({ node, script: script ?? join(ROOT, 'bin', 'dsh-delegate-mcp.js') });
+  const lines = [
+    '# operator section, must survive byte for byte',
+    'model = "kept"',
+    '',
+    MCP_MARKER,
+    `[mcp_servers.${MCP_SERVER_NAME}]`,
+    `command = ${JSON.stringify(entry.command)}`,
+    `args = [${JSON.stringify(entry.args[0])}]`,
+  ];
+  if (timeout !== null) lines.push(`tool_timeout_sec = ${String(timeout)}`);
+  lines.push('');
+  lines.push('[mcp_servers.other]');
+  lines.push('command = "elsewhere"');
+  lines.push(extra);
+  lines.push('');
+  return lines.join('\n');
+}
+
+/** A scratch backup directory for one test. */
+function backupFixture() {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-delegate-backup-'));
+  return { dir, cleanup() { rmSync(dir, { recursive: true, force: true }); } };
+}
+
+test('startup upgrades an already-installed managed MCP entry that is missing the owned timeout', async () => {
+  const fixture = codexHomeFixture();
+  const backup = backupFixture();
+  try {
+    await runCodexAction('install', { codexHome: fixture.home, env: isolatedEnv(fixture.home), version: DELIVERABLE_VERSION });
+    const prior = priorManagedConfig();
+    writeFileSync(fixture.configPath, prior, 'utf8');
+    const before = await runCodexAction('status', { codexHome: fixture.home, env: isolatedEnv(fixture.home), version: DELIVERABLE_VERSION });
+    assert.equal(before.status.mcp.state, 'outdated', 'the fixture must really describe a stale managed entry');
+    assert.deepEqual(before.status.mcp.drift, ['tool_timeout_sec']);
+
+    const seam = createCodexSeam({ codexHome: fixture.home, env: isolatedEnv(fixture.home), version: DELIVERABLE_VERSION, backupDir: backup.dir });
+    const outcome = await seam.refreshManagedIntegration({ startupTarget: await seam.startupTarget() });
+    assert.deepEqual(outcome.changed, ['mcp'], 'the stale managed entry is upgraded in place');
+    assert.deepEqual(outcome.refused, []);
+    const written = readFileSync(fixture.configPath, 'utf8');
+    assert.match(written, /^tool_timeout_sec = 3660$/mu, 'the owned timeout is now written');
+    assert.equal(written.split(MCP_MARKER).length - 1, 1, 'exactly one ownership marker');
+    assert.match(written, /^# operator section, must survive byte for byte$/mu);
+    assert.match(written, /^model = "kept"$/mu);
+    assert.match(written, /^\[mcp_servers\.other\]$/mu);
+    assert.match(written, /^command = "elsewhere"$/mu);
+    assert.ok(written.indexOf('tool_timeout_sec') < written.indexOf('[mcp_servers.other]'),
+      'the timeout is added inside our own table, never after another section');
+    assert.equal(outcome.status.mcp.state, 'configured');
+    // The pre-write copy really exists, and it really is the original document.
+    const copies = readdirSync(backup.dir);
+    assert.equal(copies.length, 1);
+    assert.equal(readFileSync(join(backup.dir, copies[0]), 'utf8'), prior);
+
+    // Idempotent: a second startup writes nothing at all.
+    const again = await seam.refreshManagedIntegration({ startupTarget: await seam.startupTarget() });
+    assert.deepEqual(again.changed, [], 'an already-current entry is not rewritten');
+    assert.equal(readFileSync(fixture.configPath, 'utf8'), written);
+    // And an explicit install is still the button's action, also idempotent from here.
+    const installed = await runCodexAction('install', { codexHome: fixture.home, env: isolatedEnv(fixture.home), version: DELIVERABLE_VERSION });
+    assert.deepEqual(installed.changed, []);
+    assert.equal(readFileSync(fixture.configPath, 'utf8'), written);
+  } finally {
+    fixture.cleanup();
+    backup.cleanup();
+  }
+});
+
+test('an explicit repair adopts a PROVED older installation path, together with the timeout, in one write', async () => {
+  // The realistic upgrade shape: the plugin now lives somewhere else, so `args[0]` names
+  // the OLD copy. That copy is adopted only because it is a real installation of this
+  // package (its `package.json` declares our name AND maps its bin entry to that file) —
+  // never because its path looks like one, and never by the unattended startup path at
+  // all: only the explicit repair adopts it.
+  const fixture = codexHomeFixture();
+  const backup = backupFixture();
+  const oldInstall = otherInstallationFixture();
+  try {
+    writeFileSync(fixture.configPath, priorManagedConfig({ script: oldInstall.script }), 'utf8');
+    const status = await runCodexAction('status', { codexHome: fixture.home, env: isolatedEnv(fixture.home), version: DELIVERABLE_VERSION });
+    assert.equal(status.status.mcp.state, 'conflict', 'a bare status read never adopts a moved install');
+
+    // The unattended startup check refuses it and leaves the file alone.
+    const seam = createCodexSeam({ codexHome: fixture.home, env: isolatedEnv(fixture.home), version: DELIVERABLE_VERSION, backupDir: backup.dir });
+    const startup = await seam.refreshManagedIntegration({ startupTarget: await seam.startupTarget() });
+    assert.deepEqual(startup.changed, [], 'startup never adopts a path it cannot prove from the plan');
+    assert.equal(readFileSync(fixture.configPath, 'utf8'), priorManagedConfig({ script: oldInstall.script }));
+
+    // The explicit repair performs the PROOF and adopts it, writing timeout + path at once.
+    await runCodexAction('repair', { codexHome: fixture.home, env: isolatedEnv(fixture.home), version: DELIVERABLE_VERSION });
+    const written = readFileSync(fixture.configPath, 'utf8');
+    assert.equal(written.includes(oldInstall.root), false, 'the stale script path is replaced');
+    assert.match(written, /^tool_timeout_sec = 3660$/mu);
+    assert.equal(classifyMcpEntry(new Document(written), status.status.mcp.desired).state, 'configured');
+  } finally {
+    oldInstall.cleanup();
+    fixture.cleanup();
+    backup.cleanup();
+  }
+});
+
+test('a POSIX package root keeps its absolute root when the entry path is parsed', () => {
+  // The old implementation split on '/' and filtered empty segments, so the leading '/'
+  // of `/opt/pkg/bin/dsh-delegate-mcp.js` disappeared and the "root" became the RELATIVE
+  // `opt/pkg` — a real POSIX installation could therefore never be proved. These are the
+  // explicit path rules, so the regression runs the same on every host, not only on a
+  // machine whose temporary directory happens to look POSIX.
+  assert.equal(packageEntryRoot('/opt/dsh-delegate/bin/dsh-delegate-mcp.js', posix), '/opt/dsh-delegate');
+  assert.equal(packageEntryRoot('/opt/dsh-delegate/lib/dsh-delegate-mcp.js', posix), null, 'bin/ is required');
+  assert.equal(packageEntryRoot('relative/bin/dsh-delegate-mcp.js', posix), null, 'a relative path names nothing');
+  assert.equal(packageEntryRoot('/bin/dsh-delegate-mcp.js', posix), null, 'the filesystem root is not a package root');
+  assert.equal(packageEntryRoot('C:\\pkg\\dsh-delegate\\bin\\dsh-delegate-mcp.js', win32), 'C:\\pkg\\dsh-delegate');
+  assert.equal(packageEntryRoot('C:\\bin\\dsh-delegate-mcp.js', win32), null);
+  // Linux compares path case exactly: two case variants are different programs there.
+  assert.equal(samePlatformPath('/opt/DSH/bin/x', '/opt/dsh/bin/x', 'linux'), false);
+  assert.equal(samePlatformPath('/opt/DSH/bin/x', '/opt/dsh/bin/x', 'win32'), true);
+});
+
+test('only a real package whose manifest maps its bin to the entry is adoptable as a moved install', async () => {
+  // The proof is the package identity read from disk: the root, its bin directory and the
+  // entry must be real, non-link objects, and the manifest must BOTH declare this package's
+  // name AND map `bin["dsh-delegate-mcp"]` to that exact entry. A same-layout wrapper with
+  // a copied name and a missing/wrong/absolute/out-of-package mapping is never adopted.
+  const installed = (await resolveMcpScript()).script;
+  const positive = [
+    otherInstallationFixture(),
+    otherInstallationFixture({ bin: { 'dsh-delegate-mcp': './bin/dsh-delegate-mcp.js' } }),
+  ];
+  const negatives = [
+    ['missing bin mapping', otherInstallationFixture({ omitBin: true })],
+    ['wrong bin mapping', otherInstallationFixture({ bin: { 'dsh-delegate-mcp': 'bin/other.js' } })],
+    ['out-of-package bin mapping', otherInstallationFixture({ bin: { 'dsh-delegate-mcp': '../outside.js' } })],
+    ['absolute bin mapping', otherInstallationFixture({ bin: { 'dsh-delegate-mcp': resolve(tmpdir(), 'outside.js') } })],
+    ['trailing-slash bin mapping', otherInstallationFixture({ bin: { 'dsh-delegate-mcp': 'bin/dsh-delegate-mcp.js/' } })],
+    ['wrong package name', otherInstallationFixture({ name: 'not-dsh-delegate' })],
+  ];
+  const all = [...positive, ...negatives.map(([, fixture]) => fixture)];
+  try {
+    for (const fixture of positive) {
+      assert.equal(await isOwnedEntryScript(fixture.script, installed), true,
+        `a real manifest with a bin mapping is accepted: ${fixture.root}`);
+    }
+    for (const [label, fixture] of negatives) {
+      assert.equal(await isOwnedEntryScript(fixture.script, installed), false, `${label} must be refused`);
+    }
+  } finally {
+    for (const fixture of all) fixture.cleanup();
+  }
+});
+
+test('a moved installation reached through a linked package root is refused', async () => {
+  const installed = (await resolveMcpScript()).script;
+  const real = otherInstallationFixture();
+  const scratch = mkdtempSync(join(tmpdir(), 'dsh-delegate-linked-root-'));
+  const link = join(scratch, 'linked-root');
+  try {
+    // A real junction: `lstat` reports it as an ordinary directory, so only the platform
+    // attribute read (stated here through the documented classifier hook) proves it.
+    symlinkSync(real.root, link, 'junction');
+    const candidate = join(link, 'bin', 'dsh-delegate-mcp.js');
+    const undo = useDirectoryClassifier(nodeClassifier((path) => path === resolve(link)));
+    try {
+      assert.equal(await isOwnedEntryScript(candidate, installed), false,
+        'a package root that is a junction is not a provable installation');
+      // Sanity: the same files under their real root ARE provable, so the refusal is the link.
+      assert.equal(await isOwnedEntryScript(real.script, installed), true);
+    } finally {
+      undo();
+    }
+  } finally {
+    real.cleanup();
+    rmSync(scratch, { recursive: true, force: true });
+  }
+});
+
+test('an explicit repair refuses a same-layout wrapper, a relative path and a missing old path', async () => {
+  // The explicit adoption path is the ONLY one that may change a recorded script, so its
+  // refusals are part of the contract: a wrapper whose manifest does not map the entry, a
+  // relative path (names no location) and a path that no longer exists are all left alone.
+  const missingRoot = join(tmpdir(), `dsh-delegate-gone-${Date.now()}`);
+  const wrapper = otherInstallationFixture({ bin: { 'dsh-delegate-mcp': 'bin/other.js' } });
+  const cases = [
+    ['wrapper with a wrong bin mapping', wrapper.script],
+    ['relative recorded path', 'relative/bin/dsh-delegate-mcp.js'],
+    ['missing recorded path', join(missingRoot, 'bin', 'dsh-delegate-mcp.js')],
+  ];
+  try {
+    for (const [label, script] of cases) {
+      const fixture = codexHomeFixture();
+      const prior = priorManagedConfig({ script });
+      try {
+        writeFileSync(fixture.configPath, prior, 'utf8');
+        const repaired = await runCodexAction('repair', { codexHome: fixture.home, env: isolatedEnv(fixture.home), version: DELIVERABLE_VERSION });
+        assert.equal(repaired.changed.includes('mcp'), false, `${label}: never replaced`);
+        assert.ok(
+          repaired.refused.some((entry) => entry.target === 'mcp' && entry.code === 'MCP_ENTRY_CONFLICT'),
+          `${label}: ${JSON.stringify(repaired.refused)}`,
+        );
+        assert.equal(readFileSync(fixture.configPath, 'utf8'), prior, `${label}: the entry is left byte-identical`);
+        assert.equal(repaired.status.mcp.state, 'conflict', `${label}: still reported as a conflict`);
+      } finally {
+        fixture.cleanup();
+      }
+    }
+  } finally {
+    wrapper.cleanup();
+  }
+});
+
+test('a config edit between the moved-install proof and its write is refused, keeping the edit', async () => {
+  // The explicit adoption path proves the old path with several filesystem probes and only
+  // then writes. The digest check is what makes that window safe: the proof describes the
+  // bytes that were read, so a file that changed afterwards must not be rewritten.
+  const fixture = codexHomeFixture();
+  const oldInstall = otherInstallationFixture();
+  try {
+    const prior = priorManagedConfig({ script: oldInstall.script });
+    writeFileSync(fixture.configPath, prior, 'utf8');
+    const before = await readCodexStatus({ codexHome: fixture.home, env: isolatedEnv(fixture.home), version: DELIVERABLE_VERSION });
+    assert.equal(before.mcp.state, 'conflict', 'a bare read never adopts the moved install');
+    const adopted = await adoptProvedMovedInstall(before);
+    assert.notEqual(adopted, null, 'the moved installation is provable from the current document');
+
+    // THE WINDOW: the operator edits an unrelated setting after the proof.
+    const edited = prior.replace('model = "kept"', 'model = "changed"');
+    assert.notEqual(edited, prior);
+    writeFileSync(fixture.configPath, edited, 'utf8');
+    const outcome = { changed: [], refused: [] };
+    await adoptMovedInstall(adopted, outcome, before);
+
+    assert.deepEqual(outcome.changed, [], 'nothing may be written from a proof of the previous bytes');
+    assert.ok(
+      outcome.refused.some((entry) => entry.target === 'mcp' && entry.code === 'MCP_ENTRY_CONFLICT' && entry.reason === 'config-changed'),
+      JSON.stringify(outcome.refused),
+    );
+    assert.equal(readFileSync(fixture.configPath, 'utf8'), edited, 'the concurrent edit survives');
+  } finally {
+    oldInstall.cleanup();
+    fixture.cleanup();
+  }
+});
+
+test('a boundary link that appears between the moved-install proof and its write is refused', async () => {
+  const fixture = codexHomeFixture();
+  const oldInstall = otherInstallationFixture();
+  try {
+    const prior = priorManagedConfig({ script: oldInstall.script });
+    writeFileSync(fixture.configPath, prior, 'utf8');
+    const before = await readCodexStatus({ codexHome: fixture.home, env: isolatedEnv(fixture.home), version: DELIVERABLE_VERSION });
+    const adopted = await adoptProvedMovedInstall(before);
+    assert.notEqual(adopted, null, 'the moved installation is provable first');
+
+    // THE WINDOW: the home becomes a link (a junction, as Windows would report it) after
+    // the proof. The write must be refused rather than followed.
+    const undo = useDirectoryClassifier(nodeClassifier((candidate) => candidate === resolve(fixture.home)));
+    const outcome = { changed: [], refused: [] };
+    try {
+      await adoptMovedInstall(adopted, outcome, before);
+    } finally {
+      undo();
+    }
+    assert.deepEqual(outcome.changed, [], 'nothing is written through the link');
+    assert.ok(
+      outcome.refused.some((entry) => entry.code === 'AGENT_PATH_CONFLICT' && entry.reason === 'codex-home-is-link'),
+      JSON.stringify(outcome.refused),
+    );
+    assert.equal(readFileSync(fixture.configPath, 'utf8'), prior, 'the config is byte-identical');
+  } finally {
+    oldInstall.cleanup();
+    fixture.cleanup();
+  }
+});
+
+test('startup NEVER creates the MCP entry, and never touches an unmanaged or modified one', async () => {
+  const cases = [
+    { name: 'absent', config: 'model = "kept"\n', expectState: 'not-configured' },
+    {
+      name: 'unmanaged same-name entry',
+      config: '[mcp_servers.dsh-delegate]\ncommand = "/usr/bin/node"\nargs = ["/somewhere/dsh-delegate-mcp.js"]\n',
+      expectState: 'conflict',
+    },
+    {
+      name: 'managed but operator-edited shape',
+      config: `${MCP_MARKER}\n[mcp_servers.dsh-delegate]\ncommand = "C:/tools/my-node.exe"\nargs = ["C:/mine.js"]\ntool_timeout_sec = 3660\n`,
+      expectState: 'conflict',
+    },
+  ];
+  for (const entry of cases) {
+    const fixture = codexHomeFixture();
+    const backup = backupFixture();
+    try {
+      writeFileSync(fixture.configPath, entry.config, 'utf8');
+      const seam = createCodexSeam({ codexHome: fixture.home, env: isolatedEnv(fixture.home), version: DELIVERABLE_VERSION, backupDir: backup.dir });
+      const outcome = await seam.refreshManagedIntegration({ startupTarget: await seam.startupTarget() });
+      assert.deepEqual(outcome.changed, [], `${entry.name}: startup must change nothing`);
+      assert.equal(outcome.status.mcp.state, entry.expectState, `${entry.name}: state`);
+      assert.equal(readFileSync(fixture.configPath, 'utf8'), entry.config, `${entry.name}: the config is byte-identical`);
+      assert.deepEqual(readdirSync(backup.dir), [], `${entry.name}: nothing was backed up because nothing was written`);
+    } finally {
+      fixture.cleanup();
+      backup.cleanup();
+    }
+  }
+});
+
+test('a config that changed after the check is refused, even when the entry still LOOKS stale', async () => {
+  // THE race, reproduced deterministically. Between the check and the write the operator
+  // changes the OWNED timeout to 120 — the entry is still marked, still this plugin's
+  // command/script, and still `outdated`, so a re-classification alone would happily
+  // overwrite it. The digest comparison is what refuses.
+  const fixture = codexHomeFixture();
+  const backup = backupFixture();
+  try {
+    await runCodexAction('install', { codexHome: fixture.home, env: isolatedEnv(fixture.home), version: DELIVERABLE_VERSION });
+    const prior = priorManagedConfig();
+    writeFileSync(fixture.configPath, prior, 'utf8');
+    const before = await runCodexAction('status', { codexHome: fixture.home, env: isolatedEnv(fixture.home), version: DELIVERABLE_VERSION });
+    assert.equal(before.status.mcp.state, 'outdated');
+    assert.equal(typeof before.status.mcp.fingerprint, 'string', 'the plan records a config digest');
+
+    const concurrentlyEdited = prior.replace('args = [', 'tool_timeout_sec = 120\nargs = [');
+    assert.notEqual(concurrentlyEdited, prior);
+    writeFileSync(fixture.configPath, concurrentlyEdited, 'utf8');
+
+    // Drive the write path with the ORIGINAL plan: exactly the window in question.
+    const outcome = await refreshKnownAgentTemplate({
+      codexHome: fixture.home,
+      env: isolatedEnv(fixture.home),
+      version: DELIVERABLE_VERSION,
+      refreshMcp: true,
+      backupDir: backup.dir,
+      plan: before.status,
+    });
+    assert.deepEqual(outcome.changed, [], 'nothing may be written from a stale plan');
+    assert.ok(
+      outcome.refused.some((entry) => entry.target === 'mcp' && entry.reason === 'config-changed'),
+      JSON.stringify(outcome.refused),
+    );
+    assert.equal(readFileSync(fixture.configPath, 'utf8'), concurrentlyEdited, 'the operator edit survives');
+    assert.deepEqual(readdirSync(backup.dir), [], 'no backup was taken for a refused write');
+  } finally {
+    fixture.cleanup();
+    backup.cleanup();
+  }
+});
+
+test('a config edit while the backup runs is refused after it, and the edit is kept', { skip: WINDOWS_CLASSIFIER_SKIP }, async () => {
+  // The backup is not instantaneous: it probes the whole ancestor chain (and, on Windows,
+  // reads file attributes). A config written during that window must not be overwritten by
+  // the `next` document computed BEFORE the backup — the post-backup digest re-check is
+  // what makes that observable window safe.
+  const fixture = codexHomeFixture();
+  const backup = backupFixture();
+  const original = priorManagedConfig();
+  const edited = original.replace('model = "kept"', 'model = "edited-while-backing-up"');
+  assert.notEqual(edited, original, 'the injected edit really changes the document');
+  try {
+    await runCodexAction('install', { codexHome: fixture.home, env: isolatedEnv(fixture.home), version: DELIVERABLE_VERSION });
+    writeFileSync(fixture.configPath, original, 'utf8');
+    const backupRoot = resolve(backup.dir);
+    let fired = false;
+    // The plan, the write gate and the first digest check have all passed by the time the
+    // backup inspects its own directory, so this is exactly the post-plan window.
+    const undo = useDirectoryClassifier(async (paths) => {
+      if (!fired && paths.some((path) => path.startsWith(backupRoot))) {
+        fired = true;
+        writeFileSync(fixture.configPath, edited, 'utf8');
+      }
+      return await nodeClassifier()(paths);
+    });
+    let outcome;
+    try {
+      outcome = await refreshKnownAgentTemplate({
+        codexHome: fixture.home,
+        env: isolatedEnv(fixture.home),
+        version: DELIVERABLE_VERSION,
+        refreshMcp: true,
+        backupDir: backup.dir,
+      });
+    } finally {
+      undo();
+    }
+    assert.equal(fired, true, 'the edit really happened during the backup window');
+    assert.deepEqual(outcome.changed, [], 'nothing is written after the backup');
+    assert.ok(
+      outcome.refused.some((entry) => entry.code === 'MCP_ENTRY_CONFLICT' && entry.reason === 'config-changed'),
+      JSON.stringify(outcome.refused),
+    );
+    assert.equal(readFileSync(fixture.configPath, 'utf8'), edited, 'the concurrent edit survives byte for byte');
+    // The backup was taken (from the pre-edit document) before the refusal was decided.
+    const copies = readdirSync(backup.dir);
+    assert.equal(copies.length, 1, 'exactly one pre-write copy');
+    assert.equal(readFileSync(join(backup.dir, copies[0]), 'utf8'), original, 'the copy holds the bytes the plan described');
+  } finally {
+    backup.cleanup();
+    fixture.cleanup();
+  }
+});
+
+test('a boundary link that appears while the backup runs is refused before the write', { skip: WINDOWS_CLASSIFIER_SKIP }, async () => {
+  const fixture = codexHomeFixture();
+  const backup = backupFixture();
+  const original = priorManagedConfig();
+  try {
+    await runCodexAction('install', { codexHome: fixture.home, env: isolatedEnv(fixture.home), version: DELIVERABLE_VERSION });
+    writeFileSync(fixture.configPath, original, 'utf8');
+    const backupRoot = resolve(backup.dir);
+    const home = resolve(fixture.home);
+    let fired = false;
+    let homeIsLink = false;
+    const undo = useDirectoryClassifier(async (paths) => {
+      if (!fired && paths.some((path) => path.startsWith(backupRoot))) {
+        fired = true;
+        homeIsLink = true;
+      }
+      return await nodeClassifier((candidate) => homeIsLink && candidate === home)(paths);
+    });
+    let outcome;
+    try {
+      outcome = await refreshKnownAgentTemplate({
+        codexHome: fixture.home,
+        env: isolatedEnv(fixture.home),
+        version: DELIVERABLE_VERSION,
+        refreshMcp: true,
+        backupDir: backup.dir,
+      });
+    } finally {
+      undo();
+    }
+    assert.equal(fired, true, 'the boundary changed during the backup window');
+    assert.deepEqual(outcome.changed, [], 'nothing is written through the link');
+    assert.ok(
+      outcome.refused.some((entry) => entry.code === 'AGENT_PATH_CONFLICT' && entry.reason === 'codex-home-is-link'),
+      JSON.stringify(outcome.refused),
+    );
+    assert.equal(readFileSync(fixture.configPath, 'utf8'), original, 'the config is byte-identical');
+  } finally {
+    backup.cleanup();
+    fixture.cleanup();
+  }
+});
+
+test('startup never rewrites an operator wrapper, end to end through the real write path', async () => {
+  const fixture = codexHomeFixture();
+  const backup = backupFixture();
+  const wrapperDir = mkdtempSync(join(tmpdir(), 'dsh-delegate-wrapper-'));
+  try {
+    mkdirSync(join(wrapperDir, 'bin'), { recursive: true });
+    const wrapperScript = join(wrapperDir, 'bin', 'dsh-delegate-mcp.js');
+    writeFileSync(wrapperScript, '// the operator own program\n');
+    const wrapper = [
+      MCP_MARKER,
+      '[mcp_servers.dsh-delegate]',
+      `command = ${JSON.stringify(resolveNodeExecutable())}`,
+      `args = [${JSON.stringify(wrapperScript)}]`,
+      '',
+    ].join('\n');
+    writeFileSync(fixture.configPath, wrapper, 'utf8');
+    const seam = createCodexSeam({ codexHome: fixture.home, env: isolatedEnv(fixture.home), version: DELIVERABLE_VERSION, backupDir: backup.dir });
+    const outcome = await seam.refreshManagedIntegration({ startupTarget: await seam.startupTarget() });
+    assert.deepEqual(outcome.changed, [], 'the wrapper is never rewritten');
+    assert.equal(readFileSync(fixture.configPath, 'utf8'), wrapper, 'the file is byte-identical');
+    assert.equal(outcome.status.mcp.state, 'conflict');
+    assert.deepEqual(readdirSync(backup.dir), []);
+    const install = await seam.run('install');
+    assert.equal(install.changed.includes('mcp'), false);
+    assert.ok(install.refused.some((entry) => entry.target === 'mcp' && entry.code === 'MCP_ENTRY_CONFLICT'));
+    assert.equal(readFileSync(fixture.configPath, 'utf8'), wrapper);
+  } finally {
+    rmSync(wrapperDir, { recursive: true, force: true });
+    fixture.cleanup();
+    backup.cleanup();
+  }
+});
+
+test('startup never rewrites an entry with extra arguments, end to end', async () => {
+  const fixture = codexHomeFixture();
+  const backup = backupFixture();
+  try {
+    const flagged = [
+      MCP_MARKER,
+      '[mcp_servers.dsh-delegate]',
+      `command = ${JSON.stringify(resolveNodeExecutable())}`,
+      `args = [${JSON.stringify(join(ROOT, 'bin', 'dsh-delegate-mcp.js'))}, "--inspect"]`,
+      '',
+    ].join('\n');
+    writeFileSync(fixture.configPath, flagged, 'utf8');
+    const seam = createCodexSeam({ codexHome: fixture.home, env: isolatedEnv(fixture.home), version: DELIVERABLE_VERSION, backupDir: backup.dir });
+    const outcome = await seam.refreshManagedIntegration({ startupTarget: await seam.startupTarget() });
+    assert.deepEqual(outcome.changed, []);
+    assert.equal(readFileSync(fixture.configPath, 'utf8'), flagged);
+    assert.equal(outcome.status.mcp.state, 'conflict');
+    assert.equal(outcome.status.mcp.reason, 'args-shape-not-ours');
+  } finally {
+    fixture.cleanup();
+    backup.cleanup();
+  }
+});
+
+test('an automatic upgrade REFUSES to write without a trusted backup location', async () => {
+  // A backup is a precondition, not a nicety: without a destination the migration must not
+  // rewrite a config it could not preserve.
+  const fixture = codexHomeFixture();
+  try {
+    await runCodexAction('install', { codexHome: fixture.home, env: isolatedEnv(fixture.home), version: DELIVERABLE_VERSION });
+    const prior = priorManagedConfig();
+    writeFileSync(fixture.configPath, prior, 'utf8');
+    const outcome = await refreshKnownAgentTemplate({
+      codexHome: fixture.home,
+      env: isolatedEnv(fixture.home),
+      version: DELIVERABLE_VERSION,
+      refreshMcp: true,
+      // No backupDir at all.
+    });
+    assert.deepEqual(outcome.changed, [], 'nothing is written without a backup target');
+    assert.ok(
+      outcome.refused.some((entry) => entry.code === 'MCP_ENTRY_BACKUP_UNAVAILABLE'),
+      JSON.stringify(outcome.refused),
+    );
+    assert.equal(readFileSync(fixture.configPath, 'utf8'), prior, 'the original document is untouched');
   } finally {
     fixture.cleanup();
   }
 });
+
+test('an automatic upgrade REFUSES when the backup destination is a file or a link', async () => {
+  const cases = ['file', 'link'];
+  for (const kind of cases) {
+    const fixture = codexHomeFixture();
+    const scratch = mkdtempSync(join(tmpdir(), 'dsh-delegate-badbackup-'));
+    try {
+      await runCodexAction('install', { codexHome: fixture.home, env: isolatedEnv(fixture.home), version: DELIVERABLE_VERSION });
+      const prior = priorManagedConfig();
+      writeFileSync(fixture.configPath, prior, 'utf8');
+      const target = join(scratch, 'backup-target');
+      const real = join(scratch, 'real-target');
+      if (kind === 'file') writeFileSync(target, 'not a directory\n');
+      else {
+        // The DESTINATION itself must be the link, not a link inside it.
+        mkdirSync(real, { recursive: true });
+        symlinkSync(real, target, 'junction');
+      }
+      // On Windows a junction is reported by `lstat` as a plain directory, so the suite
+      // states the platform verdict through the documented classifier hook — the same
+      // call a real install makes. This is what proves the backup path rejects a link.
+      const undo = kind === 'link'
+        ? useDirectoryClassifier(nodeClassifier((candidate) => candidate === target))
+        : () => {};
+      try {
+        const outcome = await refreshKnownAgentTemplate({
+          codexHome: fixture.home,
+          env: isolatedEnv(fixture.home),
+          version: DELIVERABLE_VERSION,
+          refreshMcp: true,
+          backupDir: target,
+        });
+        assert.deepEqual(outcome.changed, [], `${kind}: nothing is written`);
+        assert.ok(
+          outcome.refused.some((entry) => entry.code === 'MCP_ENTRY_BACKUP_FAILED'),
+          `${kind}: ${JSON.stringify(outcome.refused)}`,
+        );
+        assert.equal(readFileSync(fixture.configPath, 'utf8'), prior, `${kind}: the original document is untouched`);
+        // No config text was written to the untrusted destination.
+        if (kind === 'file') assert.equal(readFileSync(target, 'utf8'), 'not a directory\n');
+        else assert.deepEqual(readdirSync(real), [], 'no config was written through the link');
+      } finally {
+        undo();
+      }
+    } finally {
+      fixture.cleanup();
+      rmSync(scratch, { recursive: true, force: true });
+    }
+  }
+});
+
+test('an automatic upgrade REFUSES a backup directory behind a linked ancestor, writing nothing through it', async () => {
+  // Checking only the leaf is not enough: the leaf can be a plain directory while one of
+  // its parents is a junction into somebody else's tree, and a write there would put the
+  // complete config outside the plugin's data directory.
+  const fixture = codexHomeFixture();
+  const scratch = mkdtempSync(join(tmpdir(), 'dsh-delegate-ancestor-link-'));
+  const real = join(scratch, 'real-target');
+  const link = join(scratch, 'linked-ancestor');
+  try {
+    await runCodexAction('install', { codexHome: fixture.home, env: isolatedEnv(fixture.home), version: DELIVERABLE_VERSION });
+    const prior = priorManagedConfig();
+    writeFileSync(fixture.configPath, prior, 'utf8');
+    mkdirSync(real, { recursive: true });
+    // A real junction, whose platform verdict is stated through the same documented hook a
+    // real Windows install uses (lstat reports a junction as an ordinary directory).
+    symlinkSync(real, link, 'junction');
+    const target = join(link, 'nested', 'backup');
+    const undo = useDirectoryClassifier(nodeClassifier((candidate) => candidate === link));
+    try {
+      const outcome = await refreshKnownAgentTemplate({
+        codexHome: fixture.home,
+        env: isolatedEnv(fixture.home),
+        version: DELIVERABLE_VERSION,
+        refreshMcp: true,
+        backupDir: target,
+      });
+      assert.deepEqual(outcome.changed, [], 'nothing is written');
+      assert.ok(
+        outcome.refused.some((entry) => entry.code === 'MCP_ENTRY_BACKUP_FAILED' && /ancestor-is-a-link/u.test(entry.message)),
+        JSON.stringify(outcome.refused),
+      );
+      assert.equal(readFileSync(fixture.configPath, 'utf8'), prior, 'the original document is untouched');
+      assert.deepEqual(readdirSync(real), [], 'no backup and no config text reached the link target');
+    } finally {
+      undo();
+    }
+  } finally {
+    fixture.cleanup();
+    rmSync(scratch, { recursive: true, force: true });
+  }
+});
+
+test('an automatic upgrade REFUSES a backup directory below a non-directory ancestor', async () => {
+  const fixture = codexHomeFixture();
+  const scratch = mkdtempSync(join(tmpdir(), 'dsh-delegate-ancestor-file-'));
+  try {
+    await runCodexAction('install', { codexHome: fixture.home, env: isolatedEnv(fixture.home), version: DELIVERABLE_VERSION });
+    const prior = priorManagedConfig();
+    writeFileSync(fixture.configPath, prior, 'utf8');
+    const blocker = join(scratch, 'not-a-directory');
+    writeFileSync(blocker, 'file, not a directory\n');
+    const outcome = await refreshKnownAgentTemplate({
+      codexHome: fixture.home,
+      env: isolatedEnv(fixture.home),
+      version: DELIVERABLE_VERSION,
+      refreshMcp: true,
+      backupDir: join(blocker, 'nested'),
+    });
+    assert.deepEqual(outcome.changed, [], 'nothing is written');
+    assert.ok(
+      outcome.refused.some((entry) => entry.code === 'MCP_ENTRY_BACKUP_FAILED' && /ancestor-not-a-directory/u.test(entry.message)),
+      JSON.stringify(outcome.refused),
+    );
+    assert.equal(readFileSync(fixture.configPath, 'utf8'), prior, 'the original document is untouched');
+    assert.equal(readFileSync(blocker, 'utf8'), 'file, not a directory\n', 'the blocker is untouched');
+  } finally {
+    fixture.cleanup();
+    rmSync(scratch, { recursive: true, force: true });
+  }
+});
+
+test('missing backup subdirectories are created and verified before the upgrade writes', async () => {
+  const fixture = codexHomeFixture();
+  const scratch = mkdtempSync(join(tmpdir(), 'dsh-delegate-missing-backup-'));
+  try {
+    await runCodexAction('install', { codexHome: fixture.home, env: isolatedEnv(fixture.home), version: DELIVERABLE_VERSION });
+    const prior = priorManagedConfig();
+    writeFileSync(fixture.configPath, prior, 'utf8');
+    // Three levels that do not exist yet: the normal first-run shape for a data directory.
+    const backupDir = join(scratch, 'data', 'dsh-delegate', 'codex-config-backup');
+    const outcome = await refreshKnownAgentTemplate({
+      codexHome: fixture.home,
+      env: isolatedEnv(fixture.home),
+      version: DELIVERABLE_VERSION,
+      refreshMcp: true,
+      backupDir,
+    });
+    assert.deepEqual(outcome.changed, ['mcp'], 'the stale owned entry is upgraded');
+    assert.deepEqual(outcome.refused, []);
+    assert.match(readFileSync(fixture.configPath, 'utf8'), /^tool_timeout_sec = 3660$/mu);
+    const copies = readdirSync(backupDir);
+    assert.equal(copies.length, 1, 'exactly one pre-write copy');
+    assert.equal(readFileSync(join(backupDir, copies[0]), 'utf8'), prior, 'the copy is the original document');
+  } finally {
+    fixture.cleanup();
+    rmSync(scratch, { recursive: true, force: true });
+  }
+});
+
+test('a bare startup refresh upgrades a stale managed entry, backing it up in the plugin data directory', async () => {
+  // The review's requirement: `seam.refreshManagedIntegration()` without an explicit
+  // `backupDir` must still perform the safe migration of an already-installed managed
+  // entry — the product derives the backup destination from its OWN data directory
+  // (`DSH_HOME`), not from a caller. The same bare call on a first run writes nothing.
+  const fixture = codexHomeFixture();
+  const env = isolatedEnv(fixture.home);
+  const expectedBackupDir = join(env.DSH_HOME, 'data', 'dsh-delegate', 'codex-config-backup');
+  try {
+    assert.equal(defaultBackupDirectory(env), expectedBackupDir, 'the default lives in the plugin data directory');
+
+    // 1. First enable: an empty Codex home. Nothing is created, and no backup is taken.
+    const first = await createCodexSeam({ codexHome: fixture.home, env, version: DELIVERABLE_VERSION })
+      .refreshManagedIntegration();
+    assert.deepEqual(first.changed, []);
+    assert.deepEqual(first.refused, []);
+    assert.equal(existsSync(fixture.configPath), false, 'a first run creates no Codex config');
+    assert.equal(existsSync(fixture.agentPath), false, 'a first run creates no agent file');
+    assert.equal(existsSync(expectedBackupDir), false, 'nothing was backed up because nothing was written');
+
+    // 2. An entry this plugin wrote BEFORE `tool_timeout_sec` existed, upgraded in place.
+    writeFileSync(fixture.configPath, priorManagedConfig(), 'utf8');
+    const prior = readFileSync(fixture.configPath, 'utf8');
+    const outcome = await createCodexSeam({ codexHome: fixture.home, env, version: DELIVERABLE_VERSION })
+      .refreshManagedIntegration();
+    assert.deepEqual(outcome.changed, ['mcp'], 'the stale managed entry is upgraded without any argument');
+    assert.deepEqual(outcome.refused, []);
+    assert.match(readFileSync(fixture.configPath, 'utf8'), /^tool_timeout_sec = 3660$/mu);
+
+    // 3. The pre-write copy is real, and it is in the scratch data directory.
+    const copies = readdirSync(expectedBackupDir);
+    assert.equal(copies.length, 1, 'exactly one pre-write copy');
+    assert.equal(readFileSync(join(expectedBackupDir, copies[0]), 'utf8'), prior, 'the copy is the original document');
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test('the status document names the drift, so the panel can say what is stale', async () => {
+  const fixture = codexHomeFixture();
+  try {
+    writeFileSync(fixture.configPath, priorManagedConfig(), 'utf8');
+    const status = await runCodexAction('status', { codexHome: fixture.home, env: isolatedEnv(fixture.home), version: DELIVERABLE_VERSION });
+    assert.equal(status.status.mcp.state, 'outdated');
+    assert.ok(Array.isArray(status.status.mcp.drift), 'the drift is a list of owned facts');
+    assert.ok(status.status.mcp.drift.includes('tool_timeout_sec'));
+    assert.equal(status.status.mcp.previous.discoveryFile, null);
+    const note = (status.status.notes ?? []).find((entry) => entry.code === 'MCP_ENTRY_OUTDATED');
+    assert.ok(note !== undefined, 'an outdated entry is explained');
+    assert.match(note.text, /3660/u);
+    // The fingerprint is a planning receipt, not part of the public contract.
+    assert.equal(typeof status.status.mcp.fingerprint, 'string');
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test('a first run with an EMPTY Codex home creates neither the agent file nor the MCP entry', async () => {
+  const fixture = codexHomeFixture();
+  try {
+    const target = await resolveStartupTarget({ env: isolatedEnv(fixture.home) });
+    assert.equal(target.source, 'explicit', 'an explicit CODEX_HOME is the target');
+    assert.equal(target.home, resolve(fixture.home));
+    const seam = createCodexSeam({ codexHome: fixture.home, env: isolatedEnv(fixture.home), version: DELIVERABLE_VERSION });
+    const outcome = await seam.refreshManagedIntegration({ startupTarget: target });
+    assert.deepEqual(outcome.changed, []);
+    assert.equal(outcome.status.agent.state, 'not-installed');
+    assert.equal(outcome.status.mcp.state, 'not-configured');
+    assert.equal(existsSync(fixture.agentPath), false, 'no agent file is created');
+    assert.equal(existsSync(join(fixture.home, 'agents')), false, 'no agents directory is created');
+    assert.equal(existsSync(fixture.configPath), false, 'no config.toml is created');
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test('a home that does not exist at all is not a startup target, and refresh never falls back', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'dsh-delegate-nohome-'));
+  try {
+    const env = { CODEX_HOME: '', DSH_HOME: join(root, 'dsh'), DSH_DELEGATE_DISCOVERY_FILE: '', DSH_DELEGATE_BASE_URL: '' };
+    // Redirect the default away from the real user home for this call.
+    const target = await resolveStartupTarget({ env, homeDirectory: root });
+    assert.equal(target.home, null);
+    assert.equal(target.reason, 'no-codex-home');
+    assert.equal(existsSync(join(root, '.codex')), false, 'nothing was created while deciding');
+
+    // THE NO-FALLBACK guarantee: a refresh told that the target has no home must REFUSE,
+    // not quietly write into whatever `base()` would have resolved.
+    const seam = createCodexSeam({ env, version: DELIVERABLE_VERSION });
+    const outcome = await seam.refreshManagedIntegration({ startupTarget: target });
+    assert.deepEqual(outcome.changed, [], 'no write happened');
+    assert.ok(outcome.refused.some((entry) => entry.code === 'CODEX_HOME_INVALID'), JSON.stringify(outcome.refused));
+    assert.equal(existsSync(join(root, 'dsh')), false, 'nothing was written into the data directory either');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('startup prefers an explicit CODEX_HOME over everything else, and refuses a linked default', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'dsh-delegate-targets-'));
+  const explicit = join(root, 'explicit-home');
+  const linkedDefault = join(root, 'linked-default');
+  const outside = join(root, 'outside');
+  try {
+    mkdirSync(explicit, { recursive: true });
+    mkdirSync(outside, { recursive: true });
+
+    // 1. An explicit CODEX_HOME wins even when a default exists.
+    const explicitTarget = await resolveStartupTarget({
+      env: { CODEX_HOME: explicit, DSH_HOME: join(root, 'dsh') },
+      homeDirectory: root,
+    });
+    assert.equal(explicitTarget.home, resolve(explicit));
+    assert.equal(explicitTarget.source, 'explicit');
+
+    // 2. A real default is used when nothing is explicit.
+    mkdirSync(join(root, '.codex'), { recursive: true });
+    const defaultTarget = await resolveStartupTarget({
+      env: { CODEX_HOME: '', DSH_HOME: join(root, 'dsh') },
+      homeDirectory: root,
+    });
+    assert.equal(defaultTarget.source, 'default');
+    assert.equal(defaultTarget.home, resolve(join(root, '.codex')));
+
+    // 3. A default that is a LINK is refused with a reason, never walked.
+    rmSync(join(root, '.codex'), { recursive: true, force: true });
+    symlinkSync(outside, join(root, '.codex'), 'junction');
+    const undo = useDirectoryClassifier(nodeClassifier((candidate) => candidate === resolve(join(root, '.codex'))));
+    try {
+      const linkedTarget = await resolveStartupTarget({
+        env: { CODEX_HOME: '', DSH_HOME: join(root, 'dsh') },
+        homeDirectory: root,
+      });
+      // The path is reported (so an operator can see WHICH directory) but flagged as not
+      // a usable target, and the installer refuses to write through it.
+      assert.equal(linkedTarget.reason, 'default-is-link', 'a linked default is diagnosed, never walked');
+      // The seam resolves the default home through `os.homedir()`, and it has no
+      // `homeDirectory` option of its own. Point the process's home at the scratch root
+      // for this one call, so the assertion really exercises the seam's OWN precedence
+      // against the linked default we just built — and never inspects the operator's real
+      // `~/.codex` (a test must not read or write the real user settings).
+      const previousProfile = process.env.USERPROFILE;
+      process.env.USERPROFILE = root;
+      let seamTarget;
+      try {
+        seamTarget = await createCodexSeam({ env: { CODEX_HOME: '', DSH_HOME: join(root, 'dsh') }, version: DELIVERABLE_VERSION }).startupTarget();
+      } finally {
+        if (previousProfile === undefined) delete process.env.USERPROFILE;
+        else process.env.USERPROFILE = previousProfile;
+      }
+      assert.equal(seamTarget.reason, 'default-is-link', 'the seam never treats a linked default as a plain target');
+      assert.equal(seamTarget.home, resolve(join(root, '.codex')), 'and reports WHICH linked directory it refused');
+    } finally {
+      undo();
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('a successful explicit install is remembered — including a zero-change idempotent one', async () => {
+  // The review's regression: an installation that is ALREADY exactly right installs with
+  // `changed: []`. That is a success, and it must still record the directory, otherwise
+  // removing CODEX_HOME makes the page and the buttons point somewhere else.
+  const root = mkdtempSync(join(tmpdir(), 'dsh-delegate-remember-'));
+  const codexHome = join(root, 'codex-home');
+  const dshHome = join(root, 'dsh');
+  try {
+    mkdirSync(codexHome, { recursive: true });
+    const env = { CODEX_HOME: codexHome, DSH_HOME: dshHome, DSH_DELEGATE_DISCOVERY_FILE: '', DSH_DELEGATE_BASE_URL: '' };
+    const first = await createCodexSeam({ env, version: DELIVERABLE_VERSION }).run('install');
+    assert.ok(first.changed.length > 0, 'the first install really wrote both targets');
+    const recordPath = installationRecordPath(env);
+    assert.equal(existsSync(recordPath), true, 'the install location is recorded');
+
+    // 1. A SECOND install writes nothing (idempotent) but is still a success...
+    const second = await createCodexSeam({ env, version: DELIVERABLE_VERSION }).run('install');
+    assert.deepEqual(second.changed, [], 'the second install is a no-op');
+    assert.deepEqual(second.refused, []);
+    // ...and after dropping CODEX_HOME altogether the recorded home is still the target.
+    const bareEnv = { CODEX_HOME: '', DSH_HOME: dshHome, DSH_DELEGATE_DISCOVERY_FILE: '', DSH_DELEGATE_BASE_URL: '' };
+    const target = await resolveStartupTarget({ env: bareEnv });
+    assert.equal(target.source, 'recorded');
+    assert.equal(resolve(target.home), resolve(codexHome));
+
+    // 2. status, repair and install all report/act on that SAME directory.
+    const seam = createCodexSeam({ env: bareEnv, version: DELIVERABLE_VERSION });
+    const status = await seam.status();
+    assert.equal(resolve(status.status.codexHome), resolve(codexHome), 'status points at the recorded home');
+    assert.equal(status.status.agent.state, 'installed');
+    assert.equal(status.status.mcp.state, 'configured');
+    for (const action of ['repair', 'install']) {
+      const outcome = await seam.run(action);
+      assert.equal(resolve(outcome.status.codexHome), resolve(codexHome), `${action} acts on the same home`);
+      assert.deepEqual(outcome.changed, [], `${action} has nothing to change there`);
+    }
+
+    // 3. ...and a stale entry in that same home is really upgraded by startup.
+    writeFileSync(join(codexHome, 'config.toml'), priorManagedConfig(), 'utf8');
+    const backup = backupFixture();
+    try {
+      const migrated = await createCodexSeam({ env: bareEnv, version: DELIVERABLE_VERSION, backupDir: backup.dir })
+        .refreshManagedIntegration({ startupTarget: target });
+      assert.deepEqual(migrated.changed, ['mcp']);
+      assert.match(readFileSync(join(codexHome, 'config.toml'), 'utf8'), /^tool_timeout_sec = 3660$/mu);
+    } finally {
+      backup.cleanup();
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('a failed install is never remembered as the target', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'dsh-delegate-remember-fail-'));
+  const dshHome = join(root, 'dsh');
+  try {
+    const codexHome = join(root, 'codex-home');
+    mkdirSync(codexHome, { recursive: true });
+    writeFileSync(join(codexHome, 'config.toml'), '[mcp_servers.dsh-delegate]\ncommand = "/usr/bin/node"\nargs = ["/x.js"]\n');
+    const env = { CODEX_HOME: codexHome, DSH_HOME: dshHome, DSH_DELEGATE_DISCOVERY_FILE: '', DSH_DELEGATE_BASE_URL: '' };
+    const outcome = await createCodexSeam({ env, version: DELIVERABLE_VERSION }).run('install');
+    assert.ok(outcome.refused.length > 0, 'the install really was refused at least in part');
+    assert.equal(existsSync(installationRecordPath(env)), false, 'a refused install records nothing');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('startup refuses to upgrade through a symbolic link at the Codex home or agents directory', async () => {
+  const fixture = codexHomeFixture();
+  const outside = mkdtempSync(join(tmpdir(), 'dsh-delegate-outside-'));
+  const backup = backupFixture();
+  const prior = priorManagedConfig();
+  try {
+    writeFileSync(join(outside, 'config.toml'), prior, 'utf8');
+    mkdirSync(join(outside, 'agents'), { recursive: true });
+    const linkHome = join(fixture.home, 'linked-home');
+    symlinkSync(outside, linkHome, 'junction');
+    const undo = useDirectoryClassifier(nodeClassifier((path) => path === linkHome));
+    try {
+      const outcome = await createCodexSeam({ codexHome: linkHome, env: isolatedEnv(linkHome), version: DELIVERABLE_VERSION, backupDir: backup.dir })
+        .refreshManagedIntegration();
+      assert.deepEqual(outcome.changed, [], 'a linked home is never written through');
+      assert.ok(outcome.refused.some((entry) => entry.code === 'AGENT_PATH_CONFLICT'), JSON.stringify(outcome.refused));
+      assert.equal(readFileSync(join(outside, 'config.toml'), 'utf8'), prior, 'the linked config is untouched');
+    } finally {
+      undo();
+    }
+  } finally {
+    fixture.cleanup();
+    backup.cleanup();
+    rmSync(outside, { recursive: true, force: true });
+  }
+});
+
+
+// ---------------------------------------------------------------------------
+// Restored regression tests (recovered verbatim from the release baseline)
+// ---------------------------------------------------------------------------
 
 test('the 0.1.6 Desktop GUI command is migrated only when the current package entry is intact', async () => {
   const fixture = codexHomeFixture();
@@ -2006,7 +3127,7 @@ test('a conflicting dsh-delegate MCP entry is refused and explained, never repla
     // all remain conflicts.
     [`${MCP_MARKER}\n[mcp_servers.dsh-delegate]\ncommand = "DeepSeek Harness.exe"\nargs = [${JSON.stringify(join(ROOT, 'bin', 'dsh-delegate-mcp.js'))}]\n`, 'command-not-ours'],
     [`${MCP_MARKER}\n[mcp_servers.dsh-delegate]\ncommand = "C:\\\\DeepSeek Harness Helper.exe"\nargs = [${JSON.stringify(join(ROOT, 'bin', 'dsh-delegate-mcp.js'))}]\n`, 'command-not-ours'],
-    [`${MCP_MARKER}\n[mcp_servers.dsh-delegate]\ncommand = ${JSON.stringify(DESKTOP_EXE)}\nargs = ["E:/old/profile/bin/dsh-delegate-mcp.js"]\n`, 'legacy-command-shape'],
+    [`${MCP_MARKER}\n[mcp_servers.dsh-delegate]\ncommand = ${JSON.stringify(DESKTOP_EXE)}\nargs = ["E:/old/profile/bin/dsh-delegate-mcp.js"]\n`, 'args-shape-not-ours'],
     // An `env` block the operator added to *our* entry is their data, so an entry
     // that also carries one is a conflict rather than something to prune.
     [[MCP_MARKER, ...OURS_WITH_EXTRA_ENV().split('\n')].join('\n'), 'extra-env'],
@@ -2068,6 +3189,8 @@ test('an unmarked same-name entry is never adopted, updated or removed', async (
 
 test('a marked entry is updated in place and removable, and the marker survives', async () => {
   const fixture = codexHomeFixture();
+  // A real moved installation: the only differing path an explicit action may adopt.
+  const oldInstall = otherInstallationFixture();
   try {
     await runCodexAction('install', { codexHome: fixture.home, env: isolatedEnv(fixture.home) });
     const installed = readFileSync(fixture.configPath, 'utf8');
@@ -2075,17 +3198,21 @@ test('a marked entry is updated in place and removable, and the marker survives'
     const status = await runCodexAction('status', { codexHome: fixture.home, env: isolatedEnv(fixture.home) });
     assert.equal(status.status.mcp.marked, true);
 
-    // Simulate a moved installation: the values go stale, the marker stays.
+    // Simulate a moved installation: the path goes stale, the marker stays.
     writeFileSync(fixture.configPath, installed.replace(
       /^args = \[.*\]$/mu,
-      `args = [${JSON.stringify('E:/old/profile/bin/dsh-delegate-mcp.js')}]`,
+      `args = [${JSON.stringify(oldInstall.script)}]`,
     ));
     const repaired = await runCodexAction('repair', { codexHome: fixture.home, env: isolatedEnv(fixture.home) });
-    assert.ok(repaired.changed.includes('mcp'));
+    assert.ok(repaired.changed.includes('mcp'), 'the explicit repair adopted the proved moved install');
     const text = readFileSync(fixture.configPath, 'utf8');
     assert.equal(text.match(new RegExp(`^${MCP_MARKER.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&')}$`, 'gmu'))?.length, 1, 'exactly one marker');
-    assert.doesNotMatch(text, /E:\/old\/profile/u);
+    assert.equal(text.includes(oldInstall.root), false);
+    // And remove still proves ownership before deleting.
+    const removed = await runCodexAction('remove', { codexHome: fixture.home, env: isolatedEnv(fixture.home) });
+    assert.ok(removed.changed.includes('mcp'));
   } finally {
+    oldInstall.cleanup();
     fixture.cleanup();
   }
 });
@@ -2206,16 +3333,18 @@ test('removing a marked entry keeps the operator comments around it', () => {
 // 4. `repair` is MCP-only: it never creates, refreshes or deletes the agent file
 // ---------------------------------------------------------------------------
 
-/** Pin a byte-exact "known prior build" digest for the duration of `body`. */
+/**
+ * Provide a REAL published prior build for the duration of `body`.
+ *
+ * The 0.1.13 fixture is a release whose bytes this build still enumerates, so an agent
+ * file holding it is `outdated` — exactly the state `repair` must leave alone and
+ * `install` must refresh. Using the fixture (rather than relabelling today's template)
+ * keeps the input a file a release really shipped, and mutating the shared product list
+ * would leak into later tests.
+ * @param {(prior: string) => Promise<void>} body - receives the published bytes.
+ */
 async function withKnownPriorBuild(body) {
-  const prior = readFileSync(join(ROOT, 'codex', AGENT_FILENAME), 'utf8')
-    .replace(/^version = ".*"$/mu, 'version = "0.1.5"');
-  KNOWN_AGENT_TEMPLATES.push({ version: '0.1.5', sha256: digest(prior) });
-  try {
-    await body(prior);
-  } finally {
-    KNOWN_AGENT_TEMPLATES.length = 0;
-  }
+  await body(readFileSync(AGENT_0_1_13_FIXTURE, 'utf8'));
 }
 
 test('repair registers the MCP entry but never creates a missing agent or agents directory', async () => {
@@ -2274,6 +3403,8 @@ test('repair leaves an outdated agent byte-identical while it updates the MCP en
 
 test('repair updates a stale MCP entry without touching an installed agent', async () => {
   const fixture = codexHomeFixture();
+  // A REAL second installation: the only differing script path an explicit action adopts.
+  const oldInstall = otherInstallationFixture();
   try {
     await runCodexAction('install', { codexHome: fixture.home, env: isolatedEnv(fixture.home), version: DELIVERABLE_VERSION });
     const agentBefore = readFileSync(fixture.agentPath, 'utf8');
@@ -2281,12 +3412,12 @@ test('repair updates a stale MCP entry without touching an installed agent', asy
     // The installation moved: only the MCP entry is stale now.
     writeFileSync(fixture.configPath, readFileSync(fixture.configPath, 'utf8').replace(
       /^args = \[.*\]$/mu,
-      `args = [${JSON.stringify('E:/old/profile/bin/dsh-delegate-mcp.js')}]`,
+      `args = [${JSON.stringify(oldInstall.script)}]`,
     ));
 
     const repaired = await runCodexAction('repair', { codexHome: fixture.home, env: isolatedEnv(fixture.home), version: DELIVERABLE_VERSION });
-    assert.deepEqual(repaired.changed, ['mcp']);
-    assert.doesNotMatch(readFileSync(fixture.configPath, 'utf8'), /E:\/old\/profile/u);
+    assert.deepEqual(repaired.changed, ['mcp'], 'repair adopted the proved moved installation');
+    assert.equal(readFileSync(fixture.configPath, 'utf8').includes(oldInstall.root), false);
     assert.equal(readFileSync(fixture.agentPath, 'utf8'), agentBefore, 'an installed agent is not rewritten by repair');
     assert.equal(lstatSync(fixture.agentPath).mtimeMs, agentStat.mtimeMs, 'and is not even reopened for writing');
     assert.equal(repaired.status.agent.state, 'installed');
@@ -2296,10 +3427,10 @@ test('repair updates a stale MCP entry without touching an installed agent', asy
     assert.deepEqual(again.changed, []);
     assert.deepEqual(again.refused, []);
   } finally {
+    oldInstall.cleanup();
     fixture.cleanup();
   }
 });
-
 test('repair never deletes or replaces an agent it would not own', async () => {
   const fixture = codexHomeFixture();
   try {
@@ -2672,3 +3803,30 @@ test('a changed or non-integer tool_timeout_sec is never silently adopted', () =
   assert.equal(classifyMcpEntry(unmarked, desired).state, 'conflict');
   assert.equal(classifyMcpEntry(unmarked, desired).reason, 'unmanaged-entry');
 });
+
+test('the LEGACY 1.0.0 identities are retained and labelled, never claimed as git bytes', () => {
+  // The review's requirement: an older enumerated identity must not be dropped just
+  // because a corrected, git-verified one was added. Dropping it would flip an
+  // installation created by that build to "somebody else's file", which is not refreshable
+  // and not removable.
+  const legacy = KNOWN_AGENT_TEMPLATES.filter((entry) => entry.legacy === true);
+  assert.deepEqual(legacy.map((entry) => entry.sha256).sort(), [
+    AGENT_1_0_0_LEGACY_DIGEST,
+    AGENT_1_0_0_LEGACY_DIGEST_ALT,
+  ].sort(), 'both legacy 1.0.0 identities are still enumerated');
+  for (const entry of legacy) {
+    assert.equal(entry.version, '1.0.0');
+    assert.match(entry.sha256, /^[0-9a-f]{64}$/u);
+  }
+  // The git-verified fixture bytes are a DIFFERENT identity, enumerated separately: the
+  // legacy labels must never be used to describe the fixture.
+  const fixtureDigest = digest(readFileSync(join(ROOT, 'tests', 'fixtures', 'codex-agent-1.0.0.toml'), 'utf8'));
+  assert.equal(fixtureDigest, 'b1fd531598087564b26df14d3261515e961012f3fd010ea493f222da7bbaf415');
+  assert.equal(legacy.some((entry) => entry.sha256 === fixtureDigest), false,
+    'the legacy labels are not the git bytes');
+  assert.ok(
+    KNOWN_AGENT_TEMPLATES.some((entry) => entry.sha256 === fixtureDigest && entry.legacy !== true),
+    'the git-verified identity is enumerated as a normal entry',
+  );
+});
+

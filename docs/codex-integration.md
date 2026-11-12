@@ -1,6 +1,6 @@
 # Codex integration contract
 
-Status: implemented in 1.1.0. Scope: Codex only. Claude Code and other hosts are
+Status: implemented in 1.2.0 (1.1.0 shipped the wait rules; 1.2.0 adds the installed-integration upgrade). Scope: Codex only. Claude Code and other hosts are
 out of scope and no surface for them is provided.
 
 This document is the contract between the plugin's settings page (browser half),
@@ -15,7 +15,7 @@ README.
 | Path | Owner | The plugin may | The plugin may never |
 | --- | --- | --- | --- |
 | `$CODEX_HOME/agents/dsh-delegate.toml` | managed copy of `codex/dsh-delegate.toml` | create it **exclusively** on explicit install when absent; refresh a byte-exact known build during plugin startup or explicit install; delete it on `remove` only after re-reading it and finding the same bytes it classified | overwrite or delete a file that is not that exact build — including a file with an old version line whose body was edited, and including a file that changed in the window between the status read and the write/removal |
-| `$CODEX_HOME/config.toml`, table `mcp_servers.dsh-delegate` | operator, with one managed entry | add the entry when absent; update `command`/`args`/its own `env.DSH_DELEGATE_DISCOVERY_FILE` when the entry carries **the plugin marker** *and* is the exact shape this plugin writes | touch any other key, table, comment or ordering; adopt, update or delete an unmarked same-name entry, even one whose values coincide |
+| `$CODEX_HOME/config.toml`, table `mcp_servers.dsh-delegate` | operator, with one managed entry | add the entry when absent; update `command`/`args`/its own `env.DSH_DELEGATE_DISCOVERY_FILE` when the entry carries **the plugin marker** *and* is the exact shape this plugin writes; on an explicit `install`/`repair` only, adopt a recorded `args[0]` that is a PROVED real installation of this package (manifest `name` + `bin["dsh-delegate-mcp"]` mapping) | touch any other key, table, comment or ordering; adopt, update or delete an unmarked same-name entry, even one whose values coincide; adopt a differing script path from the automatic startup check |
 | `$CODEX_HOME` and `$CODEX_HOME/agents` | Codex | read them (lstat **and** the Windows file attributes); create `agents` (`0700`) when both are real directories | create them relative to the process working directory; **follow a link at either level** (POSIX symlink, Windows junction/reparse point) for any read-through, write or delete |
 | DSH local-call switch | operator | report it | change it |
 
@@ -89,11 +89,13 @@ tool_timeout_sec = 3660
   the *installed* package — never a repository checkout and never a path captured
   when the tarball was built.
 * `tool_timeout_sec = 3660` (1.1.0) is an **owned scalar on this entry only**. The
-  `delegate_wait` tool defaults to a 3600-second wait and caps it there, so Codex must
-  be allowed to let one call run that long; Codex's default tool timeout would cut a
-  healthy long wait at one minute. 3660 s is the 3600-second wait plus one minute of
-  slack — never a second wait window. It is not a Codex-wide setting and the plugin
-  writes it nowhere else.
+  `delegate_wait` tool defaults to a 3600-second wait and caps it there, so a client that
+  honours this field is allowed to let one call run that long. The plugin cannot prove that
+  every client honours it: a client that applies its own default tool timeout may still end
+  the wait earlier (Codex's historical default is one minute). The managed entry therefore
+  *requests* 3660 s — the 3600-second wait plus one minute of slack, never a second wait
+  window — while a client-side cap that ignores the field remains a client limit the plugin
+  cannot lift. This is not a Codex-wide setting and the plugin writes it nowhere else.
   * A managed entry written by an earlier release has no such field. It is classified
     `outdated` and repaired **in place** (the line is inserted inside our table), so an
     existing installation updates through the settings page instead of being reported as
@@ -158,8 +160,27 @@ the agent file is an independent target and is still installed.
 | --- | --- | --- |
 | `not-configured` | no `mcp_servers.dsh-delegate` at all | writes the block |
 | `configured` | the marker is present **and** the values are exactly the owned shape | no change |
-| `outdated` | marked owned command, but stale `args`/discovery; or the narrowly recognised 0.1.6 Desktop command with the current package `args` and owned env shape | rewrites only those values in place |
-| `conflict` | anything else (`unmanaged-entry`, `command-not-ours`, `legacy-command-shape`, `url`, `unknown-field`, `extra-env`, `args-not-an-array`, `command-not-a-string`, `not-a-table`, `array-table`) | **refuses** with `MCP_ENTRY_CONFLICT` and a note explaining why |
+| `outdated` | marked owned command, but stale `args`/discovery/`tool_timeout_sec`; or the narrowly recognised 0.1.6 Desktop command with the current package `args` and owned env shape | rewrites only those values in place |
+| `conflict` | anything else (`unmanaged-entry`, `command-not-ours`, `legacy-command-shape`, `url`, `unknown-field`, `extra-env`, `args-not-an-array`, `command-not-a-string`, `not-a-table`, `array-table`, and the boundary reasons below) | **refuses** with `MCP_ENTRY_CONFLICT` and a note explaining why |
+
+Every classification also reports **`drift`**: the list of owned facts that are stale
+(`tool_timeout_sec`, `args`, `command`, `env`), or `null` when nothing is. The status
+document publishes it as `mcp.drift`, and the note for an `outdated` entry names each
+one, so neither the page nor a log line has to infer what a repair would change.
+
+An `args[0]` that names `dsh-delegate-mcp.js` somewhere ELSE is a `conflict`
+(`args-shape-not-ours`) in a bare status read: the synchronous classifier cannot prove that
+a different path is this package, so it never labels one `outdated`. Only an explicit
+`install`/`repair` may adopt it, after the asynchronous proof below — and only with the
+config digest, the `$CODEX_HOME`/`agents` boundary and the current entry re-checked
+immediately before the write. A different script name, a different command or an extra
+argument stays `conflict` everywhere.
+
+When `$CODEX_HOME` or `$CODEX_HOME/agents` is a link (or cannot be verified), the MCP
+target is reported as `conflict` with `reason` `codex-home-is-link`,
+`agents-dir-is-link` or `boundary-unverified` — the same verdict the agent target gets.
+The entry is **not** read through the link, because a link bounds every write this
+module makes, not only the agent file.
 
 Two rules are deliberate:
 
@@ -243,6 +264,152 @@ character is therefore refused, and an unlink the filesystem refuses (`EPERM`,
 `EACCES`, `EBUSY`) is reported as `AGENT_PATH_CONFLICT` (`reason: unlink-refused`)
 rather than thrown at the operator.
 
+### 2.4 The startup upgrade of an installed integration (1.2.0)
+
+`refreshKnownAgentTemplate({ refreshMcp: true })` — reached through the seam as
+`refreshManagedIntegration({ startupTarget, backupDir })` and called once by plugin
+activation — performs two independent upgrades:
+
+| target | condition | write |
+| --- | --- | --- |
+| agent file | `outdated` (byte-exact published build) | replaced with this build's template |
+| MCP entry | `outdated` **and** passing the write gate below | the owned values rewritten in place, in ONE atomic write |
+
+The automatic check only ever accepts THIS installation's exact entry point. The
+moved-install case (a recorded `args[0]` that is a different, provable installation of the
+same package) is described below but is performed only by an explicit `install`/`repair`;
+startup leaves it byte-identical and reports `conflict`.
+
+#### The write gate (`isOwnedStaleEntry`)
+
+"The classifier said `outdated`" is not permission to write. An automatic, unreviewed
+write additionally requires that the entry is provably this plugin's in EVERY owned fact:
+
+| fact | required |
+| --- | --- |
+| marker comment | present (authorship proof) |
+| `command` | exactly this package's Node command (or the narrowed 0.1.6 Desktop command) |
+| `args` length | exactly 1 — no wrapper flags, no extra arguments |
+| `args[0]` | **provably** this package's entry point (see below) |
+| `env` keys | none that this plugin did not write |
+
+**`args[0]` must be PROVED, not pattern-matched** (`isOwnedEntryScript`, asynchronous
+because the proof is a filesystem one). There are exactly two accepted proofs:
+
+1. **This installation's own file** — an absolute path that is the same location as this
+   package's `bin/dsh-delegate-mcp.js`, compared under the PLATFORM's case rules
+   (`samePlatformPath`). Linux compares exactly: two case variants are different programs
+   there. Windows is case-insensitive; macOS is treated the same way because its default
+   volumes are, which is an assumption rather than a promise on a case-sensitive volume. A
+   RELATIVE path is never equivalent: `relative/bin/dsh-delegate-mcp.js` names no location.
+2. **A different, real installation of this package** — an absolute path ending in
+   `<root>/bin/dsh-delegate-mcp.js` with ALL of:
+   * `<root>` and `<root>/bin` are real directories and not links (a junction is caught by
+     the same attribute read the boundary check uses);
+   * `<root>/bin/dsh-delegate-mcp.js` is a regular, non-link file that IS the candidate
+     (compared by `realpath`, so a link cannot smuggle in another program);
+   * `<root>/package.json` is a regular, non-link file that BOTH declares
+     `"name": "dsh-delegate"` AND maps `bin["dsh-delegate-mcp"]` to that very entry. A
+     `./` prefix is allowed; an absolute path, a `..` segment, a trailing slash, a wrong
+     mapping, a missing mapping or no `bin` object is refused.
+
+The `<root>` is derived with the host's `dirname`/`basename` rules (`packageEntryRoot`), so
+a POSIX leading `/` is preserved: splitting on `/` and rejoining would turn
+`/opt/pkg/bin/dsh-delegate-mcp.js` into the relative `opt/pkg/...`, and no real Linux or
+macOS installation could ever be proved.
+
+Everything else — a wrapper that reuses the marker, the command or even the file name; a
+same-layout script whose manifest maps its bin elsewhere; a missing path; a link; a
+directory that declares another package — is **not** claimed. The synchronous classifier is
+even stricter: only proof 1 can make an entry `outdated`, so a differing script is always a
+`conflict` (`args-shape-not-ours`) and a bare status read can never authorize a write. Proof
+2 is attempted **only by an explicit `install`/`repair`**, never by the unattended startup
+check, and it is re-run immediately before the write together with the plan's config digest
+and the boundary re-check; an edit in that window is refused (`config-changed`).
+
+An unprovable path is therefore KEPT and reported, with a note pointing at the explicit
+button: this is the intended outcome, not a gap. The core upgrade — an exact `args` match
+with only `tool_timeout_sec` missing — always succeeds automatically.
+
+#### No concurrent change (`config-changed`)
+
+The plan records a SHA-256 of the WHOLE `config.toml` (`mcp.fingerprint`, stripped from the
+public status by `publicCodexStatus`). Immediately before the write the file is re-read and
+the digest must match. Re-classifying alone is not enough: an operator can change an owned
+value and leave an entry that still looks stale and managed, which is exactly the overwrite
+this refuses. The result is `MCP_ENTRY_CONFLICT` with `reason: config-changed` and the file
+is kept byte-identical. This is covered by a deterministic test that changes the file
+between the plan and the write.
+
+#### The backup is a PRECONDITION (`MCP_ENTRY_BACKUP_UNAVAILABLE` / `_FAILED`)
+
+Before any automatic MCP write the current document is copied to a protected location, and
+that copy is **verified**. It is not best-effort:
+
+* no destination supplied → `MCP_ENTRY_BACKUP_UNAVAILABLE`, nothing written; a RELATIVE
+  destination is refused as well, because it would be resolved against the harness cwd;
+* EVERY ancestor of the destination is proved to be a real directory — a symbolic link, a
+  Windows junction/reparse point, a component the platform cannot verify, or a file in the
+  chain refuses the whole backup, so a complete `config.toml` is never written through a
+  linked parent (a leaf-only check is not enough: `/safe/backup` can be a plain directory
+  below a junction);
+* missing levels are created ONE at a time and each is inspected immediately afterwards; a
+  recursive `mkdir` would follow a link that appeared at any depth in the window;
+* the chain is re-checked immediately before the copy is written, then the copy is written
+  atomically with owner-only permissions and RE-READ; a mismatch or a write failure →
+  `MCP_ENTRY_BACKUP_FAILED`, nothing written;
+* an existing destination that is a link, a non-file, or holds different bytes is refused
+  rather than overwritten.
+
+The seam supplies `<plugin dataDir>/codex-config-backup` by default, so a caller that passes
+no location still gets one; a direct `refreshMcp` call with no trusted location refuses
+instead of writing. The original file is always left exactly as it was on any refusal.
+
+#### The rest of the guarantees
+
+* an absent entry stays absent — the plugin never creates `config.toml` or the table at
+  startup, so an upgrade can never turn a non-installation into an installation, and the
+  same is true of `agents/` and the agent file;
+* an unmarked entry, an operator-edited shape and any `conflict` are refused and left
+  byte-identical (the outcome carries `MCP_ENTRY_CONFLICT` with the reason);
+* a link or unverifiable directory at `$CODEX_HOME` / `agents` is re-inspected immediately
+  before the write and produces ONE `AGENT_PATH_CONFLICT` refusal for the whole check, even
+  when the visible state shows nothing stale: an upgrade that cannot be proved safe must not
+  look successful;
+* the pre-write document is copied to `backupDir` (the plugin data directory) first — never
+  into the package, never into the Codex home, and never returned in a response;
+* nothing else in `config.toml` is touched: comments, ordering, other MCP tables, CRLF
+  line endings and every unrelated setting survive byte for byte.
+
+#### Which home is targeted — ONE precedence for every seam call
+
+`resolveHomePreference` is the single implementation, and `status()`, the explicit actions
+and the automatic check all use it. Before that, the check consulted the recorded directory
+while `status()` and the buttons consulted only `CODEX_HOME`/default, so removing
+`CODEX_HOME` made the page report — and the buttons write — a different tree than the one
+startup had just upgraded. The order is:
+
+| precedence | target |
+| --- | --- |
+| 1 | an explicit `CODEX_HOME` (or the seam's explicit `codexHome`) |
+| 2 | the home a SUCCESSFUL explicit install recorded in `<dataDir>/codex-installation.json` |
+| 3 | the default (`~/.codex`), only when it exists and is a real directory |
+
+A successful `install` records the directory even when it wrote nothing because the
+installation was already exactly right: `changed: []` is a success, not "nothing happened".
+A REFUSED install records nothing, so a refusal cannot become the remembered target.
+
+A default that is a link (or cannot be verified) is reported as `default-is-link` /
+`default-unverified`; a home that does not exist is `no-codex-home`. When no supported
+directory applies, `status()` and the actions REFUSE with `CODEX_HOME_INVALID` instead of
+falling back, and so does `refreshManagedIntegration` when the caller passes a
+`startupTarget` whose `home` is `null` — the plugin never walks a junction and never
+substitutes a tree nobody named.
+
+The explicit 安装 / 更新 Codex 集成 button (action `install`) is unchanged and remains
+the way to *create* the two managed targets. `status` reports the drift (`mcp.drift`)
+and, when an entry is `outdated`, a note naming exactly which owned facts are stale.
+
 ---
 
 ## 3. Actions and their guarantees
@@ -285,13 +452,15 @@ described below.
 The page's `init()` issues a `GET`; the three buttons are the only callers of the
 `POST`.
 
-**The single write at plugin load is the agent refresh.** `apply()` calls the seam's
-`refreshKnownAgent()` once, which refreshes `agents/dsh-delegate.toml` only when its
-complete bytes equal one of the enumerated `KNOWN_AGENT_TEMPLATES` digests (section 5).
-It never creates a missing agent, never creates `agents/`, never edits `config.toml`
-and never touches a `modified`/`conflict` file: everything else stays an explicit
-`install`. A refusal or failure is logged and startup continues, so a Codex problem
-cannot stop the plugin from loading.
+**The single write at plugin load is the integration refresh.** `apply()` calls the
+seam's `refreshManagedIntegration()` once — only when a Codex home directory exists — which
+refreshes `agents/dsh-delegate.toml` when its complete bytes equal one of the enumerated
+`KNOWN_AGENT_TEMPLATES` digests (section 5) **and** upgrades an already installed
+`mcp_servers.dsh-delegate` entry that is provably this plugin's and merely stale
+(section 2.4). It never creates a missing agent, never creates `agents/`, never creates
+the MCP entry, and never touches a `modified`/`conflict` file: everything else stays an
+explicit `install`. A refusal or failure is logged and startup continues, so a Codex
+problem cannot stop the plugin from loading.
 
 ---
 
@@ -319,7 +488,7 @@ successful diagnosis.
 ```jsonc
 {
   "codexHome": "…",
-  "packageVersion": "1.1.0",
+  "packageVersion": "1.2.0",
   "boundary": { "blocked": false, "link": null, "unknown": false, "home": "directory", "agents": "directory" },
   "agent": {
     "path": "…", "state": "installed", "installed": true, "managed": true,
@@ -420,8 +589,9 @@ session's MCP tools, and a second definition would start a second server.
 * `installed` — byte-identical to the file this build would write;
 * `outdated` — byte-identical to one of the enumerated `KNOWN_AGENT_TEMPLATES`
   digests (published builds only: `0.1.6`, both `0.1.7` builds, `0.1.8`, `0.1.9`,
-  `0.1.10` in both its CRLF and LF byte forms, `0.1.11`, `0.1.12`, plus any later build
-  listed when it is packed and verified);
+  `0.1.10` in both its CRLF and LF byte forms, `0.1.11`, `0.1.12`, `0.1.13`, `0.1.14`,
+  `1.0.0` and `1.1.0` in both byte forms, plus any later build listed when it is packed
+  and verified);
 * `modified`/`conflict` — everything else.
 
 Every release from `0.1.10` through `0.1.13` changes only the version line in the
@@ -436,7 +606,27 @@ ownership is proved against, so every release is enumerated on its own:
 | `0.1.10` | `6583f08a3ec4912a875249e6b127357b41cc3f8bf388b8e5cadbbeff469349be` (same template, LF) |
 | `0.1.11` | `b6ca7c3258fc00c1c1682abf099994b9f5abe650acc3ecf9635eec4a35520151` (packed) |
 | `0.1.12` | `ff04a4bf2c09b97747f835770c837637869581bb13bad3b8a870a3e92218514f` (packed) |
-| `0.1.13` | `b3a1d2f0520774c0067ea733f27fd47c67c5f5ac44394d0eec2564c7959700aa` (packed, 9191 bytes, CRLF) |
+| `0.1.13` | `b3a1d2f0520774c0066ea733f27fd47c67c5f5ac44394d0eec2564c7959700aa` (packed, 9191 bytes, CRLF) |
+| `0.1.14` | `11379c0152f3fb2bd4da1170812e51fe68006d98f6378c720cbadcee9ee4750c` (packed) |
+| `1.0.0` | `b1fd531598087564b26df14d3261515e961012f3fd010ea493f222da7bbaf415` (git release bytes, CRLF) |
+| `1.0.0` | `0cce75574107049413f4ddbdf7d8e6cddea92d45a0c4e0fa41b169cb790e5e13` (same template, LF) |
+| `1.0.0` | `a8c888afaa0a1a6a0abfcb56670ffbdb67697f07e54871ece78c8adffb15c149` (**legacy** pinned identity) |
+| `1.0.0` | `f51831e2ff265c9ba63a4760e245787060de7bd91dcc9663a11729fb472e5f62` (**legacy** pinned identity) |
+| `1.1.0` | `7d3ea5c54647a92cebaa0521741eb27f5141f7b2127b47009195fdb976dae4fb` (git release bytes, CRLF) |
+| `1.1.0` | `93d580bd849bb6d2c30c2db6286695ef3e0356896a88e552abae5f03eafc7601` (same template, LF) |
+
+The `1.0.0` and `1.1.0` **git-verified** identities come from the release commits
+themselves — `git show 2750047:codex/dsh-delegate.toml` and
+`git show 2d71708:codex/dsh-delegate.toml` — and are kept as fixtures
+(`tests/fixtures/codex-agent-1.0.0.toml`, `…-1.1.0.toml`) that are never packed.
+
+The two **legacy** `1.0.0` entries are NOT claimed to be the Git bytes: the fixture above
+is what the release commit contains, and these digests do not match it. They are retained
+because a released build enumerated them, so an installation created by that build stays
+structurally refreshable instead of flipping to "somebody else's file". Labelling them
+`legacy` is the point: keeping an old identity is conservative (an unrecognised file is
+never adopted and never removable), while pretending it came from Git would be a false
+claim.
 
 `0.1.10` therefore carries **two** entries, because that release exists in two byte forms
 and either one can be on disk: the CRLF file inside the packed
@@ -477,6 +667,11 @@ At plugin startup, an `outdated` agent is refreshed automatically only when its
 bytes still match a known shipped build. This does not create a missing agent or
 edit `config.toml`. A file with any other content is preserved, even when its
 version line names an older release.
+
+Since 1.2.0 the startup check has a second half: an **already installed** managed
+`mcp_servers.dsh-delegate` entry that is merely `outdated` is upgraded in place (see
+section 2.4). It is still not an install: no entry is created, and no entry the plugin
+cannot prove it wrote is adopted or rewritten.
 
 The version line is *never* the proof. A file that still starts with the managed
 header, still contains the dispatch rules, but has an old or invented version line
@@ -558,10 +753,35 @@ one fails the build:
       Codex. A large diff is inspected file by relevant file, once each, not re-read.
     - `failed` / `cancelled` — read `delegate_result` once for the recorded reason and
       report it; do not resubmit identical work hoping for a different outcome.
-    - `interrupted` (transport hiccup, page or tool restart) and `wait-limit` (the
-      client's own wait budget ran out) — the task is still running: immediately
-      `delegate_wait` the same task. Neither is a failure, a stall, or a reason to
-      submit anything new or to check the implementation locally.
+    - `wait-limit` (the client's own wait budget ran out) — the task is still running:
+      immediately `delegate_wait` the same task. It is not a failure, a stall, or a reason
+      to submit anything new or to check the implementation locally.
+    - `interrupted` — **the wait was cut off; that is not by itself a finished
+      execution.** One call answers it at once (it does not loop), so the answer's own
+      fields decide the response (1.2.0):
+      * `terminal: false` with a live `state` (`running`/`pending`): the task is running.
+        `delegate_wait` the same task; never resubmit, never implement locally, never
+        cancel for this reason.
+      * `terminal: true` and `state: "interrupted"`: the TASK record itself is a restart
+        history and will not resume. Read `delegate_result` once and report; do not keep
+        calling `delegate_wait` on it.
+      * `terminal: false` with no state, an unrecognized state, or a state that
+        contradicts the record (for example `running` with an end time): neither
+        "running" nor "stopped" may be assumed. Keep the task id and check one fact with
+        `delegate_result` before deciding — and do not re-wait indefinitely on a task the
+        host cannot classify.
+      A settled state carried by an `interrupted` observation is reported as that real
+      outcome (`awaiting-host-review` → `ready`), so a completed run always reaches review.
+10b. **When the host blocks the connection, the control channel is separate (1.2.0).**
+    Some hosts forward one tool call at a time, so a long `delegate_wait` blocks
+    `delegate_status`/`delegate_cancel` on that same MCP connection. When — and only
+    when — the operator asks to stop or inspect that task in that situation, the agent
+    may run `dsh-delegate-control status <taskId>` or
+    `dsh-delegate-control cancel <taskId>` from the SAME package directory as the
+    configured MCP script (derived from this plugin's own MCP `args[0]`, never another
+    script), using the same `node` executable. It cannot submit, change a setting or
+    the switch, act on another task, resubmit the work or switch models, and during a
+    normal wait it stays silent instead of polling that binary.
 11. **Evidence, not approval.** Return state, the actual provider/model/effort,
     changed-file summary, verification evidence, limitations, and the preflight
     facts with the isolation reason actually used. Executing is not accepting:

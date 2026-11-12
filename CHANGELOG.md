@@ -1,5 +1,153 @@
 # Changelog
 
+## 1.2.0 — waiting that cannot be mistaken for completion, and an independent control channel
+
+Fixes the three problems the 1.1.0 real acceptance run reported: an `interrupted`
+observation no longer claims the execution stopped, a local control channel serves
+`status`/`cancel` while a host is blocked in a wait, and an already-installed managed Codex
+integration upgrades itself. The operator's formally installed Desktop profile is still on
+`1.1.0`; this change does not install `1.2.0` there. The complete Desktop upgrade/restart
+acceptance and the actual token-saving ratio have not been measured; candidate-channel
+acceptance evidence belongs in the Release notes.
+
+### `interrupted` no longer claims the execution stopped
+
+- The engine reports `interrupted` when an OBSERVER's own request ends — the caller's
+  signal aborted, the connection dropped, the engine released the waiter during teardown.
+  `delegate_wait` treated that as a terminal answer, so a host was told a healthy run had
+  ended.
+- The wait now decides from the TASK RECORD, not from the reason label
+  (`classifyInterruption` / `resolveInterruption` in `src/mcp/wait.js`), and answers
+  ONCE per observation:
+  - `state` `pending`/`running` with no `endedAt` → the observation ended, the task did
+    not. The answer is `reason: "interrupted"`, `terminal: false`, the REAL task state,
+    and an instruction to wait again on the SAME `taskId`. The call does NOT re-issue
+    an observation internally: a disposed observer answers `interrupted` to every
+    request, so looping made one `delegate_wait` an unbounded request storm.
+  - `state: "interrupted"` (a restart history this build never writes for a live run) →
+    terminal, with an instruction to stop blind waiting and read `delegate_result`.
+  - a settled state carried by an `interrupted` observation → the REAL outcome:
+    `awaiting-host-review` is `ready` (so a finished run still reaches review),
+    `failed`/`cancelled` report themselves.
+  - a missing or UNRECOGNIZED state → nothing is asserted (`terminal: false`); an unknown
+    state string is never treated as a restart history, and neither "stopped" nor "still
+    running" is claimed.
+  - `ready` never invents `state: "ready"`: with no task record the state is `null`.
+- The task panel shows a real `interrupted` history as 「已中断（进程重启后不会继续执行）」 —
+  never as "still running".
+
+### An independent local control channel
+
+- The plugin's own stdio MCP transport already serves concurrent requests; a serialising
+  HOST is what blocks a session behind one long `delegate_wait`.
+- New `dsh-delegate-control` binary (`bin/dsh-delegate-control.js`, registered in `bin`):
+  `status <taskId>` (one bounded `observe` with `waitMs: 0`, compact JSON) and
+  `cancel <taskId>` (stops exactly that task). Both use the existing
+  `createExecutionClient` and endpoint discovery against the existing loopback plane.
+- No submit, no settings, no switch, no grant, no batch cancel, no daemon, no new endpoint,
+  permission or configuration surface. Finite request timeout (10 s default, operator may
+  lower it), stable JSON on stdout, diagnostics on stderr, exit code 0/1/2 for
+  answered/refused/usage.
+- A wait listener that goes away releases only that observation: cancellation is always an
+  explicit `cancel`.
+- The Codex companion gains one narrow rule: when the operator asks to stop or inspect the
+  task AND the host is blocking the same MCP connection, it may run this binary from the
+  same package directory as the configured MCP script. It may not call any other script,
+  resubmit, or switch models, and during a normal wait it stays silent.
+- Tool catalog now carries accurate MCP `annotations` (`readOnlyHint`, `destructiveHint`,
+  `idempotentHint`, `openWorldHint`). They help a concurrency-aware client; they are not a
+  fix for a serialising one, and nothing claims they are.
+
+### Installed Codex integrations now upgrade themselves
+
+- Plugin startup used to refresh only the agent file, so an MCP table installed by an
+  earlier release stayed without `tool_timeout_sec = 3660`. A client may still end a wait
+  earlier through its own default tool timeout (Codex's historical default is one minute);
+  the managed entry now requests 3660 s, which a client that honours the field can grant,
+  while a client-side cap that ignores it remains a client limit this plugin cannot lift.
+- The startup check now also upgrades an ALREADY INSTALLED `mcp_servers.dsh-delegate` entry,
+  and writes only what it can PROVE is its own: the marker comment, exactly this package's
+  Node command, exactly ONE argument that is this installation's exact entry point
+  (`isOwnedStaleEntry` / `isOwnedEntryScript`), and no foreign env key. A wrapper that
+  reuses the marker, the command or even the file name is a `conflict` and is never
+  rewritten; a differing arg count is a conflict too.
+- Accepted migrations: an exact `args` match with only `tool_timeout_sec` missing (the core
+  upgrade), and — by an EXPLICIT `install`/`repair` only — a different path that is proved to
+  be a real installation of this package: real root/bin/entry objects, a manifest whose
+  `name` is this package AND whose `bin["dsh-delegate-mcp"]` maps that entry (a `./` prefix
+  is allowed; absolute, out-of-package, wrong or missing mappings are refused). The
+  automatic startup check never adopts a moved path; it reports `conflict` and points at the
+  button. The owned timeout and a proved moved entry script migrate in ONE write.
+- The plan records a SHA-256 of the whole `config.toml` and the write re-reads the file and
+  requires that digest to match — for the automatic migration AND for the explicit
+  moved-install adoption, which re-proves the boundary, the digest and the current entry
+  immediately before writing. A re-classification alone was NOT enough: a concurrent edit to
+  an owned value still looks stale-and-managed, so it is now refused (`config-changed`) and
+  the file is kept. The boundary (`$CODEX_HOME`, `agents/`) is re-inspected immediately
+  before the write as well, and the pre-write document is copied to the plugin data
+  directory (never into the package, never into the Codex home). The backup destination's
+  ENTIRE ancestor chain is proved to be real directories — a link/junction above the backup
+  directory refuses the upgrade, and missing levels are created one at a time and
+  re-inspected.
+- It never creates the entry, never adopts an unmarked or operator-edited entry, never
+  follows a symlink/junction at `$CODEX_HOME` or `agents/` — the MCP half is now not even
+  REPORTED by reading through a link — and never touches another MCP table or setting.
+- The startup target is the SEAM's decision, not a second read of `process.env`: an explicit
+  `CODEX_HOME` first, then the home a successful explicit install recorded in the plugin data
+  directory, then the default only when it is a real directory. A default that is a link is
+  reported (`default-is-link`) instead of walked, and a first run with no Codex home creates
+  nothing.
+- The 1.0.0 and 1.1.0 companions are enumerated by exact SHA-256 in both byte forms (CRLF and
+  LF), taken from their RELEASE commits (`git show 2750047:…`, `git show 2d71708:…`) and kept as
+  test fixtures, so an existing installation upgrades instead of being reported as somebody
+  else's file. The explicit 安装 / 更新 button stays, and the status document now reports
+  `mcp.drift` (which owned facts are stale) and a per-fact note.
+
+### Tests
+
+- `tests/mcp-wait.test.js`: the case that only proved one heartbeat is now a full
+  1,200,000 ms simulation — 48 bounded 25-second observations, 47 heartbeats, ONE return,
+  no heartbeat/diff/execution text in the answer. The interruption cases assert the
+  single-observation contract: ONE observe per live interruption, a non-terminal answer on
+  the same `taskId`, a terminal restart history, a settled record reported as `ready`/
+  `failed`/`cancelled`, an UNKNOWN state asserted neither way, and no invented
+  `state: "ready"`. Plus a listener-cancellation case that proves no task cancel is issued.
+- `tests/control-cli.test.js`: the command contract, its refusals and exit codes, the
+  lower-only request bound, bounded nested output, and — through REAL, asynchronously spawned
+  `node dsh-delegate-control.js` child processes while the parent holds an HTTP plane and a
+  parked MCP wait — that `status` and `cancel` both arrive before the wait ends and cancel
+  exactly the named task. A bad environment, a missing discovery file and a dead endpoint
+  are each bounded JSON refusals with a non-zero exit.
+- `tests/codex-integration.test.js`: the write gate (wrapper refused, extra args refused, the
+  core missing-timeout case accepted), an end-to-end startup run that never rewrites a
+  wrapper, the DETERMINISTIC check-then-write race (the config changes after the plan; the
+  digest comparison refuses and the edit survives), the same race between the explicit
+  moved-install proof and its write, the boundary re-check (including a link appearing after
+  the proof), the backup (including a linked ANCESTOR and a non-directory ancestor, plus
+  missing levels that must be created), the seam-resolved startup target (explicit /
+  recorded / real default / linked default / none), the moved-install proof matrix (real
+  manifest + `bin` mapping accepted; missing, wrong, absolute, out-of-package and trailing-
+  slash mappings refused; POSIX package root preserved), and the real 1.0.0 and 1.1.0
+  fixture upgrades (packed and LF, unchanged and edited).
+  Both guards are mutation-tested: disabling the digest check or the ownership rule makes
+  these tests fail.
+
+### Known limits
+
+- The operator's formally installed Desktop profile is still on `1.1.0`; `1.2.0` was not
+  installed there by this change. The complete Desktop upgrade/restart acceptance and the
+  actual token-saving ratio have not been measured; the candidate MCP/CLI channel is
+  exercised against the currently running plane before release, and that evidence belongs
+  in the Release notes rather than being pre-filled here.
+- The control channel's behaviour against a specifically serialising host was not observed
+  live; the tests use a mock plane and a real stdio fixture.
+- Annotations do not make a serialising client concurrent.
+- `tool_timeout_sec` is a request to the client. A client that ignores it (or applies its
+  own default tool timeout) can still end a wait early; the plugin cannot prove otherwise
+  for every client.
+- The 1.1.0 published agent bytes are enumerated as packed (CRLF) and as LF; any other byte
+  form of that release is not claimed to be refreshable.
+
 ## 1.1.0 — silent waiting and concentrated host review
 
 Candidate feature release. Ships the monitoring foundation, the browser settings and task

@@ -29,10 +29,23 @@
 // Every other byte of `config.toml` is preserved verbatim, including comments,
 // table order and CRLF line endings (see `src/codex/toml.js`). Nothing here writes on
 // package install: install/repair/remove are operator actions reached through the
-// settings page, and `status` only reads. The one write that can happen without a
-// click is {@link refreshKnownAgentTemplate}, which plugin startup calls to migrate a
-// file whose complete bytes still match a published template; it never creates a
-// missing agent and never touches `config.toml`.
+// settings page, and `status` only reads.
+//
+// What CAN write without a click is {@link refreshKnownAgentTemplate}, which plugin
+// startup calls as the installed-integration check. It has two halves and neither is an
+// install:
+//
+//   * the agent file, when its complete bytes still match a published template;
+//   * an ALREADY INSTALLED `mcp_servers.dsh-delegate` entry that this plugin can prove it
+//     wrote (marker + its own Node command + THIS installation's exact entry script) and
+//     that is merely stale — a missing `tool_timeout_sec`. A recorded script path that
+//     names a DIFFERENT location is never upgraded here: only an explicit install/repair
+//     may adopt it, after the filesystem package-identity proof. The write is gated by
+//     {@link isOwnedStaleEntry}, re-proved against the exact config digest the plan was
+//     made from, and preceded by a backup copy whose whole ancestor chain is proved.
+//
+// It never creates a missing agent or a missing MCP entry, and never rewrites anything
+// it cannot prove is its own.
 //
 // The write sets do not overlap by accident: `install` writes both targets, `repair`
 // writes the MCP entry and nothing else (never creating, refreshing or deleting the
@@ -66,7 +79,7 @@ import { link, lstat, mkdir, open, readFile, readlink, realpath, stat, unlink } 
 import { execFile } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
 import { homedir } from 'node:os';
-import { delimiter, dirname, isAbsolute, join, resolve } from 'node:path';
+import { basename, delimiter, dirname, isAbsolute, join, parse, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { writeFileAtomic } from '../config/store.js';
@@ -134,12 +147,13 @@ export const KNOWN_AGENT_TEMPLATES = [
     version: '0.1.9',
     sha256: '3aa3a2e3a621584ebe002d6a7469ce56c85a899f12d63c26d782f02a47d4d4ca',
   },
-  // Rebuilds of the 0.1.10 template at the older version markers. A shipped
-  // template changes bytes whenever its instructions change (the per-task
-  // conversation policy is one such change), so the rebuilds of the current
-  // template are enumerable here as well: without them, a file this plugin
-  // published is reported `modified` — "somebody else's file" — and is never
-  // refreshed.
+  // Rebuilds of the 0.1.10–0.1.13 companion body at the older version markers. That
+  // release line changed its instructions more than once (the per-task conversation
+  // policy, the source-path policy), so a file this plugin published at those markers
+  // hashes to these exact bytes. The CURRENT template is a different body (0.1.14
+  // changed it), so these digests are fixed published identities rather than something
+  // rebuilt from today's file; without them a published installation would be reported
+  // `modified` — "somebody else's file" — and never refreshed.
   {
     version: '0.1.7',
     sha256: 'e3689492ee0f24d2defd2a9254b653e7bc54c258dd38fb0c2fc70ce5b386f2b3',
@@ -152,11 +166,11 @@ export const KNOWN_AGENT_TEMPLATES = [
     version: '0.1.9',
     sha256: 'b5db667d114baf881f59c9367a80137379960b1fccb524c883ab0edcf9f0d516',
   },
-  // The published 0.1.10 template. Its body differs from this build's only in the
-  // version line, but that line is part of the bytes an operator's file is proved
-  // against, so the digest is distinct and has to be enumerated on its own: without
-  // it, a 0.1.10 install is reported `modified` and is never refreshed by startup
-  // migration.
+  // The published 0.1.10 template. That release shipped the older companion body, and
+  // within 0.1.10–0.1.13 the only difference between builds is the version line. That
+  // line is still part of the bytes an operator's file is proved against, so the digest
+  // is distinct and has to be enumerated on its own: without it, a 0.1.10 install is
+  // reported `modified` and is never refreshed by startup migration.
   //
   // Both digests below are enumerated for 0.1.10, because the release exists in two
   // byte forms and either one can be sitting on an operator's disk:
@@ -231,12 +245,13 @@ export const KNOWN_AGENT_TEMPLATES = [
   // ("somebody else's file") and the settings-page update button would refuse to
   // refresh a file this plugin really published.
   //
-  // The digest is the exact 1.0.0 stamped bytes as packed (CRLF, 11519 bytes),
-  // computed by hashing that shipped file rather than by normalizing anything: a
-  // version line is part of the bytes an operator's file is proved against.
+  // The digest is the exact 1.0.0 stamped bytes, taken from the release itself:
+  // `git show 2750047:codex/dsh-delegate.toml` (the 1.0.0 commit) is byte-for-byte the
+  // file that release shipped, it is preserved as `tests/fixtures/codex-agent-1.0.0.toml`,
+  // and the test hashes that fixture rather than anything reconstructed.
   {
     version: '1.0.0',
-    sha256: 'a8c888afaa0a1a6a0abfcb56670ffbdb67697f07e54871ece78c8adffb15c149',
+    sha256: 'b1fd531598087564b26df14d3261515e961012f3fd010ea493f222da7bbaf415',
   },
   // The same 1.0.0 body with LF line endings. It is an exact identity, not a
   // normalized comparison: an operator who installed from an LF checkout holds these
@@ -245,7 +260,50 @@ export const KNOWN_AGENT_TEMPLATES = [
   // prevent.
   {
     version: '1.0.0',
+    sha256: '0cce75574107049413f4ddbdf7d8e6cddea92d45a0c4e0fa41b169cb790e5e13',
+  },
+  // Two LEGACY pinned identities for 1.0.0 that an earlier build of this plugin shipped.
+  //
+  // Their provenance is deliberately NOT claimed to be the Git release bytes: the fixture
+  // above is what `git show 2750047:codex/dsh-delegate.toml` contains, and these two
+  // digests do not match it. They are retained because a released build enumerated them,
+  // so an installation created by that build must stay structurally refreshable instead of
+  // flipping to "somebody else's file" — and they are labelled `legacy` so nothing here
+  // pretends they are a Git-verified archive identity.
+  //
+  // Keeping them is the conservative choice: an unrecognised file is never adopted and
+  // never removable, while a stale file that this plugin once wrote should still be
+  // refreshable by an explicit install. The digests are exact content identities like
+  // every other entry, so an operator edit still fails to match.
+  {
+    version: '1.0.0',
+    sha256: 'a8c888afaa0a1a6a0abfcb56670ffbdb67697f07e54871ece78c8adffb15c149',
+    legacy: true,
+  },
+  {
+    version: '1.0.0',
     sha256: 'f51831e2ff265c9ba63a4760e245787060de7bd91dcc9663a11729fb472e5f62',
+    legacy: true,
+  },
+  // The published 1.1.0 companion — the file an existing 1.1.0 installation holds when
+  // 1.2.0 starts. 1.2.0 changed the instruction body (the `interrupted` distinction and
+  // the independent control channel), so this is a DISTINCT published build that has to
+  // be enumerated: without it every 1.1.0 installation would be reported `modified`
+  // ("somebody else's file") and neither startup migration nor an explicit install
+  // could refresh bytes this plugin really published.
+  //
+  // Both byte forms are enumerated, exactly like 0.1.10 and 1.0.0. The bytes come from
+  // `git show 2d71708:codex/dsh-delegate.toml` (the 1.1.0 commit), preserved as
+  // `tests/fixtures/codex-agent-1.1.0.toml`: CRLF (`7d3ea5c5…`, the form a Windows
+  // install writes) and the same template kept as LF text (`93d580bd…`). Each is an
+  // exact content identity, never a normalized comparison.
+  {
+    version: '1.1.0',
+    sha256: '7d3ea5c54647a92cebaa0521741eb27f5141f7b2127b47009195fdb976dae4fb',
+  },
+  {
+    version: '1.1.0',
+    sha256: '93d580bd849bb6d2c30c2db6286695ef3e0356896a88e552abae5f03eafc7601',
   },
 ];
 
@@ -274,11 +332,35 @@ export const MCP_STATES = Object.freeze({
 export const MCP_ENTRY_RELATIVE = join('bin', 'dsh-delegate-mcp.js');
 
 /**
+ * The `package.json` `bin` key that must map to {@link MCP_ENTRY_RELATIVE}.
+ *
+ * A manifest that merely declares this package's `name` is not enough: the package
+ * could still point its bin entry somewhere else. The moved-install proof therefore
+ * requires the manifest to map THIS key to the very entry file being adopted.
+ */
+const MCP_BIN_NAME = 'dsh-delegate-mcp';
+
+/**
+ * The one environment variable this plugin may write on its own MCP entry.
+ *
+ * It pins the discovery file when DSH runs with a non-default `DSH_HOME`, and it is
+ * owned exactly like `tool_timeout_sec`: a managed entry carrying a different value is
+ * stale, never foreign.
+ */
+export const DISCOVERY_ENV_VAR = 'DSH_DELEGATE_DISCOVERY_FILE';
+
+/**
  * States in which an MCP definition may be written: absent, already ours, or a stale
  * copy of ours. Anything else — including an unmarked same-name entry — is refused.
  */
 const MANAGEABLE_MCP_STATES = new Set([MCP_STATES.missing, MCP_STATES.configured, MCP_STATES.outdated]);
 const PACKAGE_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
+
+/**
+ * This package's own name, the identity an older installation's `package.json` must
+ * declare before its entry point can be adopted by an automatic migration.
+ */
+const PACKAGE_NAME = 'dsh-delegate';
 const TEMPLATE_PATH = join(PACKAGE_ROOT, 'codex', AGENT_FILENAME);
 const PACKAGE_MANIFEST_PATH = join(PACKAGE_ROOT, 'package.json');
 
@@ -1002,19 +1084,20 @@ export async function resolveMcpScript() {
  * @returns {{ path: string, pin: boolean }} discovery location and whether to write it.
  */
 export function discoveryPin(discoveryFile, env = process.env) {
-  const configured = typeof env.DSH_DELEGATE_DISCOVERY_FILE === 'string' ? env.DSH_DELEGATE_DISCOVERY_FILE.trim() : '';
+  const configured = typeof env[DISCOVERY_ENV_VAR] === 'string' ? env[DISCOVERY_ENV_VAR].trim() : '';
   if (configured !== '') return { path: resolve(configured), pin: true };
   return { path: resolve(discoveryFile), pin: false };
 }
 
 /**
- * How long Codex must let ONE `delegate_wait` call run, in seconds.
+ * How long one `delegate_wait` call asks the client to allow, in seconds.
  *
- * The default wait is 3600 s (60 minutes) and the tool caps it there, so a managed
- * entry that left Codex's default tool timeout in place would cut a legitimate wait
- * off at its default (60 s) and make the companion look broken on a healthy long
- * task. 3660 s is that 3600 s plus a minute of slack for one internal observation
- * slice, JSON overhead and clock skew — never a second wait window.
+ * The default wait is 3600 s (60 minutes) and the tool caps it there, so 3660 s is that
+ * 3600 s plus a minute of slack for one internal observation slice, JSON overhead and
+ * clock skew — never a second wait window. A client that honours the field may let the
+ * whole wait run; a client that applies its own default tool timeout (Codex's historical
+ * default is 60 s) can still end it early, and that client-side limit is not something
+ * this entry can lift. The value is a request, not a guarantee about every client.
  *
  * This is written on THIS server's entry only. It is not a Codex-wide setting and it
  * is never written anywhere else in the operator's config.
@@ -1086,17 +1169,17 @@ export function classifyMcpEntry(document, desired) {
   const childAssignments = document.assignmentsUnder(serverPath);
 
   if (inline === undefined && headerIndex === -1 && childAssignments.length === 0) {
-    return { state: MCP_STATES.missing, previous: null, reason: null, ownedValues: {}, marked: false };
+    return { state: MCP_STATES.missing, previous: null, reason: null, ownedValues: {}, marked: false, drift: null };
   }
   if (document.tablesUnder(serverPath).some((entry) => entry.kind === 'array-table')) {
-    return { state: MCP_STATES.conflict, previous: null, reason: 'array-table', ownedValues: {}, marked: marker !== null };
+    return { state: MCP_STATES.conflict, previous: null, reason: 'array-table', ownedValues: {}, marked: marker !== null, drift: null };
   }
 
   /** Gather the definition regardless of the two legal spellings. */
   const values = {};
   if (inline !== undefined) {
     if (tomlValueType(inline.raw) !== 'table') {
-      return { state: MCP_STATES.conflict, previous: null, reason: 'not-a-table', ownedValues: {}, marked: marker !== null };
+      return { state: MCP_STATES.conflict, previous: null, reason: 'not-a-table', ownedValues: {}, marked: marker !== null, drift: null };
     }
     Object.assign(values, parseInlineTable(inline.raw));
   }
@@ -1108,18 +1191,18 @@ export function classifyMcpEntry(document, desired) {
   if (shape !== 'stdio') {
     // A URL entry, a mixed entry or an entry with fields this plugin never writes
     // is somebody else's definition of the same name.
-    return { state: MCP_STATES.conflict, previous: null, reason: shape, ownedValues: {}, marked: marker !== null };
+    return { state: MCP_STATES.conflict, previous: null, reason: shape, ownedValues: {}, marked: marker !== null, drift: null };
   }
   const command = readStringValue(values.command?.text);
   const args = readArrayValue(values.args?.text);
   const envKeys = Object.keys(values).filter((key) => key.startsWith('env.')).map((key) => key.slice(4));
   /** @type {'missing' | 'different' | null} */
   let timeoutMismatch = null;
-  const previous = { command, args, envKeys, toolTimeoutSec: null };
+  const previous = { command, args, envKeys, toolTimeoutSec: null, discoveryFile: null };
   if (marker === null) {
     // Values that happen to match are still not proof the plugin wrote them; the
     // marker is the only authorship proof this format carries.
-    return { state: MCP_STATES.conflict, previous, reason: 'unmanaged-entry', ownedValues: {}, marked: false };
+    return { state: MCP_STATES.conflict, previous, reason: 'unmanaged-entry', ownedValues: {}, marked: false, drift: null };
   }
   // A different *command* is a different program: even if the arguments look like
   // ours, running (or replacing) someone else's wrapper is not this plugin's call.
@@ -1130,7 +1213,7 @@ export function classifyMcpEntry(document, desired) {
   // conflict, so a similarly named user wrapper is never adopted.
   const legacyDesktopCommand = isLegacyDesktopCommand(command);
   if (command !== desired.command && !legacyDesktopCommand) {
-    return { state: MCP_STATES.conflict, previous, reason: 'command-not-ours', ownedValues: {}, marked: true };
+    return { state: MCP_STATES.conflict, previous, reason: 'command-not-ours', ownedValues: {}, marked: true, drift: null };
   }
   const mismatched = !sameStrings(args, desired.args);
   const expectedEnvKeys = Object.keys(desired.env);
@@ -1141,7 +1224,7 @@ export function classifyMcpEntry(document, desired) {
   const extraEnv = envKeys.filter((key) => !expectedEnvKeys.includes(key));
   const missingEnv = expectedEnvKeys.filter((key) => !envKeys.includes(key));
   if (extraEnv.length > 0) {
-    return { state: MCP_STATES.conflict, previous, reason: 'extra-env', ownedValues: { extraEnv }, marked: true };
+    return { state: MCP_STATES.conflict, previous, reason: 'extra-env', ownedValues: { extraEnv }, marked: true, drift: null };
   }
   // The tool timeout is an OWNED fact. A managed entry written by an earlier release
   // has no `tool_timeout_sec` at all, and one an operator (or a future build) changed
@@ -1150,8 +1233,53 @@ export function classifyMcpEntry(document, desired) {
   // non-integer was already refused by `describeEntryShape`.
   const recordedTimeout = readIntegerValue(values.tool_timeout_sec?.text);
   previous.toolTimeoutSec = recordedTimeout;
+  const discoveryEnvKey = DISCOVERY_ENV_VAR;
+  const recordedDiscovery = typeof values[`env.${discoveryEnvKey}`]?.text === 'string'
+    ? readStringValue(values[`env.${discoveryEnvKey}`].text)
+    : null;
+  previous.discoveryFile = recordedDiscovery;
   if (recordedTimeout === null) timeoutMismatch = 'missing';
   else if (recordedTimeout !== desired.toolTimeoutSec) timeoutMismatch = 'different';
+
+  // The owned `args[0]` normally names THIS installation's MCP entry point exactly.
+  // It may legitimately differ in ONE conservative way: the plugin was upgraded into a
+  // new directory, so an older build's absolute path still points at a copy of the SAME
+  // package layout. That must be PROVED, not guessed: a basename match alone would let
+  // `args = ["/mine/dsh-delegate-mcp.js"]` — an operator's own wrapper that happens to
+  // reuse the file name — be silently rewritten by a startup migration.
+  //
+  // `staleScript` is therefore only a drift LABEL. It never authorizes a write by
+  // itself: `isOwnedStaleEntry` (below) decides write eligibility from the complete
+  // recorded shape, and anything it cannot prove stays a `conflict` the caller refuses.
+  const scriptDiffers = !sameStrings(args, desired.args);
+  const extraArgs = scriptDiffers && args.length !== desired.args.length;
+  // The classifier is SYNCHRONOUS and can therefore only accept the one proof that needs
+  // no I/O: `args[0]` is the exact same absolute path as this installation's script.
+  //
+  // A DIFFERENT script is a conflict here — never `outdated` — because the only way it
+  // could be ours (an older installation of this same package) requires reading that
+  // root's `package.json` and resolving the file, and a label computed without that proof
+  // must not authorize a write. `isOwnedStaleEntry` performs the real, asynchronous proof
+  // for the explicit repair path, which is allowed to adopt a verified moved install.
+  const scriptIsThisInstallation = scriptDiffers && isExactInstalledScript(args[0], desired.args[0]);
+  const argsShapeNotOurs = extraArgs || (scriptDiffers && !scriptIsThisInstallation);
+  if (argsShapeNotOurs) {
+    return {
+      state: MCP_STATES.conflict,
+      previous,
+      reason: 'args-shape-not-ours',
+      ownedValues: {},
+      marked: true,
+      drift: null,
+    };
+  }
+  const staleScript = scriptDiffers;
+  const envDrift = new Set();
+  if (timeoutMismatch !== null) envDrift.add('tool_timeout_sec');
+  if (staleScript) envDrift.add('args');
+  if (envMismatch) envDrift.add('env');
+  if (missingEnv.length > 0) envDrift.add('env');
+  const drift = envDrift.size === 0 ? null : [...envDrift];
   if (legacyDesktopCommand && (mismatched || envMismatch || missingEnv.length > 0)) {
     return {
       state: MCP_STATES.conflict,
@@ -1159,10 +1287,11 @@ export function classifyMcpEntry(document, desired) {
       reason: 'legacy-command-shape',
       ownedValues: {},
       marked: true,
+      drift: null,
     };
   }
   if (mismatched || envMismatch || missingEnv.length > 0 || timeoutMismatch !== null) {
-    return { state: MCP_STATES.outdated, previous, reason: null, ownedValues: {}, marked: true };
+    return { state: MCP_STATES.outdated, previous, reason: null, ownedValues: {}, marked: true, drift };
   }
   return {
     state: legacyDesktopCommand ? MCP_STATES.outdated : MCP_STATES.configured,
@@ -1170,8 +1299,279 @@ export function classifyMcpEntry(document, desired) {
     reason: null,
     ownedValues: {},
     marked: true,
+    drift: legacyDesktopCommand ? ['command'] : null,
   };
 }
+
+/**
+ * Can this recorded entry be REWRITTEN by an automatic migration?
+ *
+ * This is the write gate, deliberately narrower than "the classifier said `outdated`".
+ * An automatic, unreviewed write is only acceptable when the entry is provably the
+ * plugin's own in every owned fact:
+ *
+ *   * it is `outdated` (never `conflict`/`missing`/`configured`);
+ *   * the marker proved authorship (the classifier only reports `outdated` for a marked
+ *     entry, and this re-checks it);
+ *   * the command is exactly this plugin's Node command (or the one recognized 0.1.6
+ *     Desktop command, which the classifier already narrowed);
+ *   * `args[0]` is either this installation's exact script — the core missing-timeout
+ *     case — or a path whose FINAL TWO segments are this package's
+ *     `bin/dsh-delegate-mcp.js`, i.e. an older installation of the same layout. A bare
+ *     file-name match anywhere on disk is not enough;
+ *   * there is exactly ONE argument (no wrapper flags), and the env carries no key this
+ *     plugin did not write.
+ *
+ * Everything else is refused by the caller with an explanation: it keeps the file and
+ * tells the operator to use the explicit install/repair button.
+ *
+ * The script proof is a FILESYSTEM proof (`isOwnedEntryScript`), so this gate is async and
+ * is re-run at write time — a label computed from the plan is not enough, because the
+ * script could have been replaced between the check and the write.
+ * @param {object} classification - value from {@link classifyMcpEntry}.
+ * @param {object} desired - value from {@link desiredMcpCommand}.
+ * @param {object} [options] - `allowMovedInstall`: accept a DIFFERENT path that is
+ *   provably another installation of this package. Only the explicit `repair` path sets
+ *   it; the unattended startup migration never does, so it cannot adopt a path it did not
+ *   prove in the plan.
+ * @returns {Promise<{ owned: true } | { owned: false, reason: string }>} gate verdict.
+ */
+export async function isOwnedStaleEntry(classification, desired, options = {}) {
+  if (classification?.marked !== true) return { owned: false, reason: 'unmarked' };
+  const previous = classification.previous ?? null;
+  if (previous === null) return { owned: false, reason: 'no-recorded-shape' };
+  if (previous.command !== desired.command && !isLegacyDesktopCommand(previous.command)) {
+    return { owned: false, reason: 'command-not-ours' };
+  }
+  const args = Array.isArray(previous.args) ? previous.args : [];
+  if (args.length !== 1) return { owned: false, reason: 'args-shape-not-ours' };
+  const recordedEnv = Array.isArray(previous.envKeys) ? previous.envKeys : [];
+  const expectedEnv = Object.keys(desired.env);
+  if (recordedEnv.some((key) => !expectedEnv.includes(key))) return { owned: false, reason: 'extra-env' };
+  // The script proof is a FILESYSTEM proof and runs here, at gate time, so a label
+  // computed earlier cannot stand in for it.
+  if (isExactInstalledScript(args[0], desired.args[0])) {
+    return classification.state === MCP_STATES.outdated
+      ? { owned: true }
+      : { owned: false, reason: `state-${classification.state}` };
+  }
+  if (options.allowMovedInstall !== true) return { owned: false, reason: 'script-not-provably-ours' };
+  if (!(await isOtherInstallationOfThisPackage(args[0], PACKAGE_NAME))) {
+    return { owned: false, reason: 'script-not-provably-ours' };
+  }
+  return classification.state === MCP_STATES.outdated || classification.state === MCP_STATES.conflict
+    ? { owned: true }
+    : { owned: false, reason: `state-${classification.state}` };
+}
+
+/**
+ * The native path rules, as a value, so {@link packageEntryRoot} can also be exercised
+ * with an explicit POSIX/Win32 rule set in tests instead of only on the host platform.
+ */
+const NATIVE_PATH = Object.freeze({ isAbsolute, basename, dirname, parse });
+
+/**
+ * The `<root>` of an absolute `<root>/bin/dsh-delegate-mcp.js` path, or `null`.
+ *
+ * Derived with `dirname`/`basename` rather than by splitting on `/` and rejoining:
+ * splitting drops the leading empty segment of a POSIX path, so `/opt/pkg/bin/x`
+ * silently became the relative `opt/pkg/bin/x` and the real installation could never be
+ * proved on Linux or macOS. The rules are explicit and platform-shaped:
+ *
+ *   * the input must be absolute and name exactly `bin/dsh-delegate-mcp.js`;
+ *   * `<root>` must be a real directory NAME below the filesystem root — `/bin/x` and
+ *     `C:\bin\x` have `<root>` at the root itself and are refused;
+ *   * nothing here touches the filesystem; {@link isOtherInstallationOfThisPackage}
+ *     proves the boundaries of the root it returns.
+ * @param {string} script - candidate entry path.
+ * @param {{ isAbsolute: Function, basename: Function, dirname: Function, parse: Function }} [pathApi]
+ *   path rules; defaults to the host platform's.
+ * @returns {string | null} the package root, or null when the shape is not ours.
+ */
+export function packageEntryRoot(script, pathApi = NATIVE_PATH) {
+  if (typeof script !== 'string') return null;
+  const value = script.trim();
+  if (value === '' || !pathApi.isAbsolute(value)) return null;
+  if (pathApi.basename(value) !== 'dsh-delegate-mcp.js') return null;
+  const binDir = pathApi.dirname(value);
+  if (pathApi.basename(binDir) !== 'bin') return null;
+  const root = pathApi.dirname(binDir);
+  if (root === binDir || root === '' || root === pathApi.parse(root).root) return null;
+  return root;
+}
+
+/**
+ * Is `candidate` provably this package's MCP entry point on THIS machine?
+ *
+ * There are exactly two accepted proofs, and both are asynchronous because both must
+ * INSPECT the filesystem. A suffix comparison is not a proof: `/mine/bin/
+ * dsh-delegate-mcp.js` has the same last two segments as this package's script and is
+ * still somebody else's program, so accepting it would let a startup migration overwrite
+ * an operator's wrapper.
+ *
+ *   1. **Exact equivalence of the absolute path** to this installation's own script, with
+ *      the comparison following the PLATFORM's case rules (`==` on Windows and — by
+ *      assumption, because its default volumes are case-insensitive — macOS; exact bytes
+ *      on Linux). A relative path is never equivalent: it names no location.
+ *   2. **A different, but real, installation of this package**: an absolute path to a
+ *      regular, non-link file, whose directory is `<root>/bin`, where `<root>` is a real
+ *      directory, `<root>/bin` is a real directory, `<root>/bin/dsh-delegate-mcp.js` is a
+ *      regular non-link file that IS the candidate (compared by real path), and
+ *      `<root>/package.json` is a regular non-link file that BOTH declares
+ *      `"name": "dsh-delegate"` and maps `bin["dsh-delegate-mcp"]` to that very entry
+ *      (a `./` prefix is allowed; an absolute, out-of-package, wrong or missing mapping
+ *      is not).
+ *
+ * Anything else — a relative path, a missing file, a link, a directory that is not this
+ * package, a same-layout script whose root's manifest maps its bin elsewhere — is NOT
+ * claimed. The caller keeps the operator's entry and tells them to use the explicit
+ * install/repair button, which is the correct outcome for a path this plugin cannot
+ * account for.
+ * @param {string} candidate - recorded `args[0]`.
+ * @param {string} installed - this installation's script path (absolute).
+ * @param {object} [options] - `rootPackageName` (defaults to `dsh-delegate`) for tests.
+ * @returns {Promise<boolean>} true only when the candidate is provably this package's entry.
+ */
+export async function isOwnedEntryScript(candidate, installed, options = {}) {
+  if (typeof candidate !== 'string' || typeof installed !== 'string') return false;
+  const recorded = candidate.trim();
+  if (recorded === '' || installed.trim() === '') return false;
+  // A relative path names no location at all, so it can never be proven.
+  if (!isAbsolute(recorded)) return false;
+  if (samePlatformPath(recorded, installed, process.platform)) return true;
+  return await isOtherInstallationOfThisPackage(recorded, options.rootPackageName ?? PACKAGE_NAME);
+}
+
+/**
+ * The SYNCHRONOUS proof the classifier may use: the recorded script is this
+ * installation's own file.
+ *
+ * Both paths must be absolute and must be the same location under the platform's case
+ * rules, so a Linux `…/DSH-Delegate-Mcp.js` is not this installation while a Windows
+ * `…\DSH-DELEGATE-MCP.JS` is. A relative path names nothing and is never equal.
+ * @param {string} candidate - recorded `args[0]`.
+ * @param {string} installed - this installation's script.
+ * @returns {boolean} true when the two names are the same absolute location.
+ */
+function isExactInstalledScript(candidate, installed) {
+  if (typeof candidate !== 'string' || typeof installed !== 'string') return false;
+  const recorded = candidate.trim();
+  if (recorded === '' || !isAbsolute(recorded)) return false;
+  return samePlatformPath(recorded, installed, process.platform);
+}
+
+/**
+ * Compare two absolute paths with the PLATFORM's case rules.
+ *
+ * Windows path case is insignificant. Linux is always exact — two case variants are two
+ * different programs there. macOS is treated like Windows because its default volumes
+ * are case-insensitive; that is an ASSUMPTION about the volume, not a promise: a
+ * case-sensitive macOS volume would make two case variants different files. The
+ * adopted-install proof compares `realpath` results (which carry the on-disk spelling),
+ * and the exact-path proof compares two strings derived from the same installation.
+ * @param {string} left - first path.
+ * @param {string} right - second path.
+ * @param {string} [platform] - `process.platform` override for tests.
+ * @returns {boolean} true when the paths name the same location on that platform.
+ */
+export function samePlatformPath(left, right, platform = process.platform) {
+  if (typeof left !== 'string' || typeof right !== 'string') return false;
+  const normalize = (value) => {
+    const slashed = value.trim().replace(/\\/gu, '/').replace(/\/+$/u, '');
+    return platform === 'linux' ? slashed : slashed.toLowerCase();
+  };
+  return normalize(left) === normalize(right);
+}
+
+/**
+ * Does this manifest map its `dsh-delegate-mcp` bin entry to OUR entry file?
+ *
+ * The mapping is the second half of the package identity proof: a `name` alone can be
+ * copied onto a same-layout wrapper, while a manifest that maps the published bin key to
+ * `<root>/bin/dsh-delegate-mcp.js` (with nothing outside the root) is describing the
+ * package this plugin ships. Only a relative in-package path is accepted — `./` is fine,
+ * an absolute path or any `..` segment is not, and neither is a trailing slash.
+ * @param {object} manifest - parsed `package.json`.
+ * @param {string} rootDir - the package root the entry belongs to.
+ * @returns {boolean} true when the mapping names that exact entry.
+ */
+function doesManifestMapEntry(manifest, rootDir) {
+  const bin = manifest.bin;
+  if (bin === null || typeof bin !== 'object' || Array.isArray(bin)) return false;
+  const declared = bin[MCP_BIN_NAME];
+  if (typeof declared !== 'string' || declared.trim() === '') return false;
+  const slashed = declared.trim().replace(/\\/gu, '/');
+  if (slashed.endsWith('/')) return false;
+  // A POSIX root, a Windows drive letter or a UNC path names a location that is not
+  // relative to the package root at all.
+  if (slashed.startsWith('/') || /^[A-Za-z]:/u.test(slashed)) return false;
+  const segments = slashed.split('/');
+  if (segments.some((segment) => segment === '..')) return false;
+  const relative = segments.filter((segment) => segment !== '' && segment !== '.');
+  if (relative.length === 0) return false;
+  const mapped = resolve(rootDir, ...relative);
+  return samePlatformPath(mapped, join(rootDir, MCP_ENTRY_RELATIVE), process.platform);
+}
+
+/**
+ * Is `script` a real entry point of another installation of THIS package?
+ *
+ * The proof is the package's own identity, read from the candidate's root — never a file
+ * name, a suffix or a guess:
+ *
+ *   * the path must be absolute and, after normalisation, name `<root>/bin/dsh-delegate-mcp.js`
+ *     with a package root below the filesystem root ({@link packageEntryRoot});
+ *   * `<root>`, `<root>/bin` and the entry must be real directories/regular files and not
+ *     links ({@link lstat} on each, plus the entry compared to the candidate by `realpath`);
+ *   * `<root>/package.json` must be a regular, non-link file that declares this package's
+ *     name AND maps its `dsh-delegate-mcp` bin key to that entry
+ *     ({@link doesManifestMapEntry}).
+ *
+ * A missing root, a root without that manifest, a manifest for another package or with a
+ * wrong/missing/absolute/out-of-package bin mapping, an unreadable or linked path, or a
+ * `bin/` that is a link is all "not provable" — and the caller refuses. Every filesystem
+ * probe here is bounded and never throws.
+ * @param {string} script - absolute candidate path.
+ * @param {string} packageName - package name the root's manifest must declare.
+ * @returns {Promise<boolean>} true only when the root is provably this package.
+ */
+async function isOtherInstallationOfThisPackage(script, packageName) {
+  if (typeof script !== 'string' || !isAbsolute(script)) return false;
+  // Normalise the spelling once: the proof is about the file the path names, and every
+  // probe below must use the same components (`..`, duplicate separators).
+  const normalized = resolve(script);
+  const rootDir = packageEntryRoot(normalized);
+  if (rootDir === null) return false;
+  const binDir = join(rootDir, 'bin');
+  const entry = join(binDir, 'dsh-delegate-mcp.js');
+  const manifestPath = join(rootDir, 'package.json');
+  try {
+    // `<root>` and `<root>/bin` must be REAL directories: on Windows `lstat` reports a
+    // junction as an ordinary directory, so the same attribute read the Codex boundary
+    // uses is what proves it (an `unknown` answer is "cannot be proved", never "fine").
+    const [rootKind, binKind] = await Promise.all([inspectDirectory(rootDir), inspectDirectory(binDir)]);
+    if (rootKind.kind !== 'directory' || binKind.kind !== 'directory') return false;
+    // The candidate must BE that file: a regular file, not a link, and the same file the
+    // package's own `bin` entry names. `realpath` collapses any alias before comparing.
+    const [candidateInfo, entryInfo, manifestInfo] = await Promise.all([
+      lstat(normalized), lstat(entry), lstat(manifestPath),
+    ]);
+    if (!candidateInfo.isFile() || candidateInfo.isSymbolicLink()) return false;
+    if (!entryInfo.isFile() || entryInfo.isSymbolicLink()) return false;
+    if (!manifestInfo.isFile() || manifestInfo.isSymbolicLink()) return false;
+    if (manifestInfo.size > MAX_CONFIG_BYTES) return false;
+    const [realCandidate, realEntry] = await Promise.all([realpath(normalized), realpath(entry)]);
+    if (!samePlatformPath(realCandidate, realEntry, process.platform)) return false;
+    const manifest = JSON.parse(await readFile(manifestPath, 'utf8'));
+    if (manifest === null || typeof manifest !== 'object' || Array.isArray(manifest)) return false;
+    if (manifest.name !== packageName) return false;
+    return doesManifestMapEntry(manifest, rootDir);
+  } catch {
+    // Anything unreadable, missing or malformed is "cannot be proved", never "assume ours".
+    return false;
+  }
+}
+
 
 /**
  * Recognize only the DSH Desktop executable name used by the 0.1.6 defect.
@@ -1622,26 +2022,58 @@ export async function readCodexStatus({
     ? null
     : desiredMcpCommand({ node, script: script.script, discoveryFile: discovery.path, pinDiscovery: discovery.pin });
 
-  let mcp = { state: MCP_STATES.unreadable, previous: null, reason: null, ownedValues: {}, marked: false };
+  let mcp = { state: MCP_STATES.unreadable, previous: null, reason: null, ownedValues: {}, marked: false, drift: null };
   let configError = null;
   let configPathInfo = { exists: false };
-  try {
-    const loaded = await loadConfig(configPath);
-    configPathInfo = { exists: loaded.exists };
-    if (loaded.unreadable) {
-      configError = { code: 'CODEX_CONFIG_UNREADABLE', message: 'config.toml is not a regular file this plugin may edit' };
-    } else if (desired === null) {
-      // The executable is the subject of this read's refusal, so the entry is not
-      // classified against a command that does not exist.
-      mcp = { state: MCP_STATES.unreadable, previous: null, reason: 'no-executable', ownedValues: {}, marked: false };
-    } else {
-      mcp = classifyMcpEntry(loaded.document, desired);
-    }
-  } catch (error) {
-    configError = {
-      code: typeof error?.code === 'string' ? error.code : 'CODEX_CONFIG_UNREADABLE',
-      message: error?.message ?? 'the Codex config could not be read',
+  /**
+   * SHA-256 of the whole config document this status classified, or null.
+   *
+   * This is the plan's receipt: the automatic upgrade records it and re-checks it before
+   * writing, so a file changed between the check and the write is refused instead of
+   * overwritten. Only the digest is kept — never the text — so no config content,
+   * comment or credential can leave through a status response.
+   */
+  let configFingerprint = null;
+  if (boundary.blocked) {
+    // A link (or an unverifiable directory) at `$CODEX_HOME` or `$CODEX_HOME/agents`
+    // bounds EVERY write this module makes, not only the agent file. The MCP entry is
+    // described by the same verdict instead of by a read-through of the link: reporting
+    // it as `outdated` from inside the linked tree, and then refusing to write, is how a
+    // link would have been followed for a READ. Nothing below the boundary is examined.
+    mcp = {
+      state: MCP_STATES.conflict,
+      previous: null,
+      reason: boundary.unknown === true ? 'boundary-unverified'
+        : (boundary.link === 'codex-home' ? 'codex-home-is-link' : 'agents-dir-is-link'),
+      ownedValues: {},
+      marked: false,
+      drift: null,
     };
+  } else {
+    try {
+      const loaded = await loadConfig(configPath);
+      configPathInfo = { exists: loaded.exists };
+      // The fingerprint of the WHOLE document this plan was derived from. It is what the
+      // write path re-checks before replacing the file: re-classifying the entry is not
+      // enough, because an owned value can change while the entry still looks stale and
+      // managed. Only the digest is kept — never the file text — so no config content or
+      // credential can travel in a status response.
+      configFingerprint = loaded.unreadable === true ? null : digest(loaded.document.text);
+      if (loaded.unreadable) {
+        configError = { code: 'CODEX_CONFIG_UNREADABLE', message: 'config.toml is not a regular file this plugin may edit' };
+      } else if (desired === null) {
+        // The executable is the subject of this read's refusal, so the entry is not
+        // classified against a command that does not exist.
+        mcp = { state: MCP_STATES.unreadable, previous: null, reason: 'no-executable', ownedValues: {}, marked: false, drift: null };
+      } else {
+        mcp = classifyMcpEntry(loaded.document, desired);
+      }
+    } catch (error) {
+      configError = {
+        code: typeof error?.code === 'string' ? error.code : 'CODEX_CONFIG_UNREADABLE',
+        message: error?.message ?? 'the Codex config could not be read',
+      };
+    }
   }
 
   return buildStatus({
@@ -1659,6 +2091,7 @@ export async function readCodexStatus({
     configPathInfo,
     configError,
     boundary,
+    configFingerprint,
   });
 }
 
@@ -1693,6 +2126,7 @@ function buildStatus({
   configPathInfo,
   configError,
   boundary = null,
+  configFingerprint = null,
 }) {
   const agentOk = agent.state === AGENT_STATES.installed;
   const mcpOk = mcp.state === MCP_STATES.configured;
@@ -1731,6 +2165,14 @@ function buildStatus({
       configured: mcpOk,
       previous: mcp.previous,
       reason: mcp.reason,
+      // WHICH owned facts are stale, as a list of stable names (`tool_timeout_sec`,
+      // `args`, `command`, `env`) — or null when nothing is stale. A state name alone
+      // ("outdated") does not tell an operator, or the panel, what would change.
+      drift: mcp.drift ?? null,
+      // The digest of the whole config this classification was derived from. It travels
+      // with the status only so the write path can prove the file has not changed since;
+      // `publicCodexStatus` strips it, and it is a hash, never the text.
+      fingerprint: configFingerprint,
       // True only when the entry carries the plugin marker, i.e. when a later
       // `remove` may delete it. Values alone never establish ownership.
       marked: mcp.marked === true,
@@ -1791,11 +2233,29 @@ function buildNotes({ agent, mcp, script, configError, nodeError = null }) {
       code: 'MCP_ENTRY_CONFLICT',
       text: mcp.reason === 'unmanaged-entry'
         ? `config.toml 中已有同名的 mcp_servers.${MCP_SERVER_NAME} 条目，但没有本插件的托管标记注释，视为你自己写的：本插件不会更新或删除它；请自行删除或改名后再点安装。`
-        : `config.toml 中已有同名的 mcp_servers.${MCP_SERVER_NAME} 条目，但内容不是本插件写入的形态（${mcp.reason ?? 'unknown'}）。本插件不会替换它；请自行删除或改名后再点安装。`,
+        : (mcp.reason === 'args-shape-not-ours'
+          ? `config.toml 中已有的 mcp_servers.${MCP_SERVER_NAME} 条目带托管标记，但入口脚本与当前安装不同。若那是本插件的另一处真实安装，点「安装 / 更新 Codex 集成」或「仅修复 MCP 配置」会在证明后采纳；否则本插件不会替换它。`
+          : `config.toml 中已有同名的 mcp_servers.${MCP_SERVER_NAME} 条目，但内容不是本插件写入的形态（${mcp.reason ?? 'unknown'}）。本插件不会替换它；请自行删除或改名后再点安装。`),
     });
   }
   if (mcp.state === MCP_STATES.outdated) {
-    notes.push({ code: 'MCP_ENTRY_OUTDATED', text: 'MCP 条目指向的可执行文件已变化（例如插件已升级），重新安装可更新。' });
+    // Stated per stale owned fact, because "outdated" alone does not tell an operator
+    // what will change. A missing `tool_timeout_sec` is the core startup migration. (`args`
+    // drift cannot reach this state any more — a differing script is a `conflict` that only
+    // an explicit install/repair may adopt — but the branch is kept truthful for any path
+    // that still reports it.)
+    const drift = Array.isArray(mcp.drift) ? mcp.drift : [];
+    const reasons = [];
+    if (drift.includes('tool_timeout_sec')) {
+      reasons.push(`缺少或不是托管条目应写入的 tool_timeout_sec = ${String(DELEGATE_TOOL_TIMEOUT_SEC)}（客户端可能因此更早结束一次长时间等待；该字段只是请求客户端放宽，客户端自身的超时限制仍然有效）`);
+    }
+    if (drift.includes('args')) reasons.push('入口脚本路径已不是当前安装位置（需用显式安装/修复证明后采纳；启动自检不会改写）');
+    if (drift.includes('command')) reasons.push('command 仍是旧版写下的桌面程序路径');
+    if (drift.includes('env')) reasons.push(`其 env.${DISCOVERY_ENV_VAR} 与当前发现文件不一致`);
+    notes.push({
+      code: 'MCP_ENTRY_OUTDATED',
+      text: `已安装的 mcp_servers.${MCP_SERVER_NAME} 是本插件写入的托管条目，但已经过期：${reasons.length === 0 ? '需要更新' : reasons.join('；')}。插件下次启动时会自动在原地更新它；也可以点「安装 / 更新 Codex 集成」立即更新。`,
+    });
   }
   if (configError !== null) {
     notes.push({ code: configError.code, text: `无法安全读取 config.toml：${configError.message}` });
@@ -1910,27 +2370,48 @@ async function installManaged(before, outcome) {
  *
  * This is called during plugin activation so a plugin upgrade can migrate a
  * previously shipped agent automatically. It never creates a missing file and
- * never touches config.toml; all replacement writes still re-prove the exact
- * bytes immediately before the atomic rename.
- * @param {object} options - same Codex home and version options as the status reader.
+ * never touches config.toml, unless `refreshMcp` is true; all replacement writes
+ * still re-prove the exact bytes immediately before the atomic rename.
+ * @param {object} options - same Codex home and version options as the status reader,
+ *   plus `refreshMcp`: also upgrade an OUTDATED managed MCP entry (see
+ *   {@link refreshManagedIntegration}); `backupDir`: where a pre-write copy is kept;
+ *   `plan`: a status document captured EARLIER, used instead of a fresh read. The plan
+ *   seam exists so the check-then-write window can be tested deterministically: the
+ *   write path must refuse a file that no longer matches the plan's digest.
  * @returns {Promise<{ changed: string[], refused: object[], status: object }>} migration result.
  */
 export async function refreshKnownAgentTemplate(options = {}) {
-  const { codexHome = null, env = process.env, discoveryFile, version = null, hostNode = null } = options;
+  const {
+    codexHome = null, env = process.env, discoveryFile, version = null, hostNode = null, refreshMcp = false,
+    backupDir = null, plan = null,
+  } = options;
   if (codexHome !== null && (typeof codexHome !== 'string' || codexHome.trim() === '' || !isAbsolute(codexHome))) {
     throw new CodexInstallError('CODEX_HOME_INVALID', 'the Codex home must be an absolute path');
   }
   const home = codexHome === null ? resolveCodexHome({ env }) : requireCodexHome(codexHome);
-  const before = await readCodexStatus({ codexHome: home, env, discoveryFile, version, hostNode });
+  const before = plan ?? await readCodexStatus({ codexHome: home, env, discoveryFile, version, hostNode });
   const changed = [];
   const refused = [];
 
-  if (before.agent.state === AGENT_STATES.outdated) {
-    const boundary = await inspectCodexBoundary(home);
-    if (boundary.blocked === true) {
-      refused.push(linkedBoundaryRefusal({ ...before, boundary }));
-    } else {
+  if (before.boundary?.blocked === true) {
+    // A link (or an unverifiable directory) at `$CODEX_HOME` or `$CODEX_HOME/agents`
+    // blocks EVERY write, so the check reports that one refusal and writes nothing. It
+    // is reported even when the visible state shows nothing stale: "the boundary cannot
+    // be proved" is itself the diagnosis the operator needs, and staying silent here is
+    // how a startup migration came to look successful while doing nothing.
+    refused.push(linkedBoundaryRefusal(before));
+  } else {
+    if (before.agent.state === AGENT_STATES.outdated) {
       await installManagedAgent(before, { changed, refused });
+    }
+    if (refreshMcp === true) {
+      // The automatic MCP half: only a provably-owned, merely-stale definition is
+      // rewritten, and only after the boundary and the config digest are re-proved. It
+      // never CREATES the entry: a home without one is left without one, because a
+      // plugin upgrade is not an install.
+      if (before.config?.readable === true && before.mcp.state === MCP_STATES.outdated) {
+        await upgradeOutdatedMcpEntry(before, { changed, refused }, { backupDir });
+      }
     }
   }
 
@@ -2031,15 +2512,25 @@ async function installMcpEntry(before, outcome) {
     return;
   }
   if (mcp.state === MCP_STATES.conflict) {
-    outcome.refused.push({
-      target: 'mcp',
-      code: 'MCP_ENTRY_CONFLICT',
-      message: mcp.reason === 'unmanaged-entry'
-        ? 'a same-name mcp_servers.dsh-delegate entry without the plugin marker already exists and was left untouched'
-        : 'a different mcp_servers.dsh-delegate entry already exists and was left untouched',
-      path: mcp.path,
-      reason: mcp.reason,
-    });
+    // The ONE conflict an explicit `install`/`repair` may resolve: a marked entry whose
+    // script is a DIFFERENT path that is provably another installation of this package
+    // (its root's `package.json` declares our name and its `bin` is that very file). This
+    // is the moved-installation upgrade, and it is proved here, on the spot — the bare
+    // classification never grants it, and the unattended startup path never attempts it.
+    const adopted = await adoptProvedMovedInstall(before);
+    if (adopted === null) {
+      outcome.refused.push({
+        target: 'mcp',
+        code: 'MCP_ENTRY_CONFLICT',
+        message: mcp.reason === 'unmanaged-entry'
+          ? 'a same-name mcp_servers.dsh-delegate entry without the plugin marker already exists and was left untouched'
+          : 'a different mcp_servers.dsh-delegate entry already exists and was left untouched',
+        path: mcp.path,
+        reason: mcp.reason,
+      });
+      return;
+    }
+    await adoptMovedInstall(adopted, outcome, before);
     return;
   }
   if (mcp.state === MCP_STATES.configured) return;
@@ -2064,6 +2555,334 @@ async function installMcpEntry(before, outcome) {
   await mkdir(dirname(mcp.path), { recursive: true, mode: 0o700 });
   await writeFileAtomic(mcp.path, next);
   outcome.changed.push('mcp');
+}
+
+/**
+ * Upgrade ONE managed MCP entry that is already installed and merely stale.
+ *
+ * This is the plugin-upgrade paths' shared implementation: startup's
+ * {@link refreshKnownAgentTemplate} (with `refreshMcp`) and the explicit `repair` both
+ * end up here. It writes NOTHING except a definition this plugin can prove is its own,
+ * and it proves that three times over:
+ *
+ *   1. **Ownership** — {@link isOwnedStaleEntry}: marker authorship, exactly this
+ *      package's Node command, exactly one argument whose script is PROVED (this
+ *      installation's own absolute path, or — for an explicit repair only — a real other
+ *      installation of this package, verified through its `package.json`), and no foreign
+ *      env key. A wrapper that reuses the file name is refused, not rewritten.
+ *   2. **No concurrent change** — the plan records a SHA-256 of the whole `config.toml`
+ *      it was derived from (`fingerprint`), and the write re-reads the file and requires
+ *      that digest to match.
+ *   3. **A protected backup first** — the current document is copied to a private,
+ *      regular, non-link file before ANY write, and that copy is a PRECONDITION. A backup
+ *      that cannot be taken (no destination, a destination that is a file or a link, a
+ *      permission failure) refuses the upgrade and keeps the original file: an
+ *      unattended migration must never rewrite a config it could not preserve.
+ *
+ * The boundary (`$CODEX_HOME`, `agents/`) is re-inspected and the ownership proof is
+ * re-run against the current bytes before the backup is taken, and AGAIN after the backup
+ * succeeds — the backup performs several asynchronous probes (and a Windows attribute
+ * read), so a config edit or a boundary change in that window must not be overwritten.
+ * The replacement is then written atomically, built from the bytes that were just
+ * re-read. An entry that became `configured` or `missing` is left alone: nothing is
+ * created and nothing is rewritten when nothing is stale.
+ * @param {object} before - status read before the change.
+ * @param {{ changed: string[], refused: object[] }} outcome - mutable outcome.
+ * @param {object} [options] - `backupDir` (required, trusted), `allowMovedInstall`.
+ * @returns {Promise<void>} resolves after the target was attempted.
+ */
+async function upgradeOutdatedMcpEntry(before, outcome, options = {}) {
+  const { mcp } = before;
+  if (mcp.state !== MCP_STATES.outdated) return;
+  const refuse = (code, message, extra = {}) => {
+    outcome.refused.push({ target: 'mcp', code, message, path: mcp.path, ...extra });
+  };
+  if (mcp.desired === null || mcp.nodeResolved !== true) {
+    refuse('MCP_EXECUTABLE_UNRESOLVED', mcp.nodeError?.message
+      ?? 'no Node.js executable could be proved for the Codex MCP command, so the stale entry was left untouched',
+    { details: mcp.nodeError?.details ?? {} });
+    return;
+  }
+  if (mcp.scriptExists !== true) {
+    outcome.refused.push({
+      target: 'mcp',
+      code: 'MCP_SCRIPT_MISSING',
+      message: 'the package MCP entry point is missing, so the stale Codex entry was left untouched',
+      path: mcp.script,
+    });
+    return;
+  }
+  // A trusted backup destination is a precondition, checked before anything else can be
+  // decided: no destination means no unattended write.
+  if (typeof options.backupDir !== 'string' || options.backupDir.trim() === '') {
+    refuse('MCP_ENTRY_BACKUP_UNAVAILABLE',
+      'no trusted backup location was supplied, so the stale entry was left untouched');
+    return;
+  }
+  // The write gate: "outdated" is not by itself permission to write, and the script proof
+  // is a filesystem proof re-run HERE (not a label computed earlier).
+  const gate = await isOwnedStaleEntry(
+    { state: mcp.state, marked: mcp.marked, previous: mcp.previous },
+    mcp.desired,
+    { allowMovedInstall: options.allowMovedInstall === true },
+  );
+  if (gate.owned !== true) {
+    refuse('MCP_ENTRY_CONFLICT',
+      'the stale mcp_servers.dsh-delegate entry is not one this plugin can prove is its own, so it was left untouched; use 安装 / 更新 Codex 集成 to replace it explicitly',
+      { reason: gate.reason });
+    return;
+  }
+  // The boundary is re-inspected right before the write: a link can have replaced the
+  // home or `agents/` since the plan was made, and writing through one would put the
+  // file outside the Codex home.
+  const boundary = await inspectCodexBoundary(before.codexHome);
+  if (boundary.blocked === true) {
+    outcome.refused.push(linkedBoundaryRefusal({ ...before, boundary }));
+    return;
+  }
+  let loaded;
+  try {
+    loaded = await loadConfig(mcp.path);
+  } catch (error) {
+    refuse(typeof error?.code === 'string' ? error.code : 'CODEX_CONFIG_UNREADABLE',
+      typeof error?.message === 'string' ? error.message : 'the Codex config could not be read');
+    return;
+  }
+  // Everything below acts on the CURRENT file, and every fact the plan asserted is
+  // re-proved against it: the digest first (the file is byte-identical to the one the
+  // plan was derived from), then ownership and staleness of that same text.
+  const currentContents = loaded.unreadable === true ? null : loaded.document.text;
+  if (currentContents === null || mcp.fingerprint === null || digest(currentContents) !== mcp.fingerprint) {
+    refuse('MCP_ENTRY_CONFLICT', 'config.toml changed after the upgrade was checked, so nothing was written',
+      { reason: 'config-changed' });
+    return;
+  }
+  const classification = classifyMcpEntry(loaded.document, mcp.desired);
+  const reGate = await isOwnedStaleEntry(classification, mcp.desired, {
+    allowMovedInstall: options.allowMovedInstall === true,
+  });
+  if (reGate.owned !== true) {
+    refuse('MCP_ENTRY_CONFLICT',
+      'the mcp_servers.dsh-delegate entry is no longer the stale, provably-owned definition that was checked, so nothing was written',
+      { reason: reGate.reason });
+    return;
+  }
+  const planned = applyMcpEntry(loaded.document, mcp.desired, classification);
+  if (planned === null) return;
+  // THE BACKUP IS A PRECONDITION: it is taken, and verified, before the write. A failure
+  // here refuses the upgrade and leaves the file exactly as it was.
+  const backup = await backupConfigBeforeWrite(mcp.path, currentContents, options.backupDir);
+  if (backup.ok !== true) {
+    refuse('MCP_ENTRY_BACKUP_FAILED',
+      `the config could not be backed up before the upgrade (${backup.reason}), so nothing was written`);
+    return;
+  }
+  // THE BACKUP ITSELF TAKES TIME: several asynchronous probes, and on Windows a
+  // PowerShell child for the attribute read. The operator (or another tool) can change
+  // the config, or replace a boundary with a link, during that window. Everything the
+  // plan asserted is therefore re-proved against the filesystem as it is NOW — after the
+  // backup and immediately before the write — and a change is refused with the user's
+  // edit kept. This is not a claim about every OS-level race; it is the observable
+  // window between the plan and this write.
+  const boundaryAfterBackup = await inspectCodexBoundary(before.codexHome);
+  if (boundaryAfterBackup.blocked === true) {
+    outcome.refused.push(linkedBoundaryRefusal({ ...before, boundary: boundaryAfterBackup }));
+    return;
+  }
+  let afterBackup;
+  try {
+    afterBackup = await loadConfig(mcp.path);
+  } catch (error) {
+    refuse(typeof error?.code === 'string' ? error.code : 'CODEX_CONFIG_UNREADABLE',
+      typeof error?.message === 'string' ? error.message : 'the Codex config could not be read after the backup');
+    return;
+  }
+  const afterBackupContents = afterBackup.unreadable === true ? null : afterBackup.document.text;
+  if (afterBackupContents === null || mcp.fingerprint === null || digest(afterBackupContents) !== mcp.fingerprint) {
+    refuse('MCP_ENTRY_CONFLICT',
+      'config.toml changed while the upgrade was being backed up, so nothing was written',
+      { reason: 'config-changed' });
+    return;
+  }
+  const afterBackupClassification = classifyMcpEntry(afterBackup.document, mcp.desired);
+  const afterBackupGate = await isOwnedStaleEntry(afterBackupClassification, mcp.desired, {
+    allowMovedInstall: options.allowMovedInstall === true,
+  });
+  if (afterBackupGate.owned !== true) {
+    refuse('MCP_ENTRY_CONFLICT',
+      'the mcp_servers.dsh-delegate entry is no longer the stale, provably-owned definition that was checked, so nothing was written after the backup',
+      { reason: afterBackupGate.reason });
+    return;
+  }
+  const next = applyMcpEntry(afterBackup.document, mcp.desired, afterBackupClassification);
+  if (next === null) return;
+  await mkdir(dirname(mcp.path), { recursive: true, mode: 0o700 });
+  await writeFileAtomic(mcp.path, next);
+  outcome.changed.push('mcp');
+}
+
+/**
+ * The absolute directory prefixes of `directory`, root excluded, in order.
+ *
+ * The components come from the host path rules (`parse`/`sep`), so a POSIX leading `/`
+ * and a Windows drive or UNC root are both preserved rather than split away.
+ * @param {string} directory - absolute directory path.
+ * @returns {string[]} each ancestor from the root's child down to `directory` itself.
+ */
+function directoryPrefixes(directory) {
+  const { root } = parse(directory);
+  const prefixes = [];
+  let current = root;
+  for (const part of directory.slice(root.length).split(sep).filter((part) => part !== '')) {
+    current = join(current, part);
+    prefixes.push(current);
+  }
+  return prefixes;
+}
+
+/**
+ * Prove the whole ancestor chain of `directory`, creating missing levels safely.
+ *
+ * Checking only the leaf is not enough: `/safe/backup` can be a real directory while
+ * `/safe` is a junction to somebody else's tree, and writing there would put the complete
+ * `config.toml` outside the plugin's data directory. Every EXISTING component is therefore
+ * inspected — `lstat` catches a POSIX symlink, and the Windows attribute read catches a
+ * junction `lstat` reports as an ordinary directory. A link, a non-directory or an
+ * unverifiable component refuses the whole chain.
+ *
+ * Missing levels are created ONE at a time and inspected immediately afterwards, never
+ * with a recursive `mkdir`: a recursive create would follow a link that appeared in the
+ * window at any depth. This is why the function returns a bounded reason instead of
+ * throwing: the caller must refuse the unattended config write.
+ * @param {string} directory - absolute directory path.
+ * @returns {Promise<{ ok: true } | { ok: false, reason: string }>} verdict.
+ */
+async function ensureTrustedDirectoryChain(directory) {
+  const prefixes = directoryPrefixes(directory);
+  let firstMissing = prefixes.length;
+  for (let index = 0; index < prefixes.length; index += 1) {
+    const prefix = prefixes[index];
+    let info;
+    try {
+      info = await lstat(prefix);
+    } catch (error) {
+      if (error?.code === 'ENOENT') {
+        firstMissing = index;
+        break;
+      }
+      return { ok: false, reason: 'backup-ancestor-unreadable' };
+    }
+    if (info.isSymbolicLink()) return { ok: false, reason: 'backup-ancestor-is-a-link' };
+    if (!info.isDirectory()) return { ok: false, reason: 'backup-ancestor-not-a-directory' };
+  }
+  // Ask the platform about the components that exist, in ONE child process on Windows: a
+  // junction is a plain directory to `lstat`, so the attribute read is the actual proof.
+  const existing = prefixes.slice(0, firstMissing);
+  if (existing.length > 0) {
+    const verdicts = await windowsDirectoryKinds(existing);
+    for (const prefix of existing) {
+      const verdict = verdicts.get(prefix);
+      if (verdict === 'directory') continue;
+      if (verdict === 'unknown') return { ok: false, reason: 'backup-ancestor-unverified' };
+      if (verdict === 'link') return { ok: false, reason: 'backup-ancestor-is-a-link' };
+      if (verdict === 'other') return { ok: false, reason: 'backup-ancestor-not-a-directory' };
+      if (verdict === 'missing') {
+        firstMissing = Math.min(firstMissing, prefixes.indexOf(prefix));
+        break;
+      }
+    }
+  }
+  for (let index = firstMissing; index < prefixes.length; index += 1) {
+    const prefix = prefixes[index];
+    try {
+      await mkdir(prefix, { mode: 0o700 });
+    } catch (error) {
+      if (error?.code !== 'EEXIST') return { ok: false, reason: 'backup-ancestor-unwritable' };
+    }
+    const kind = await inspectDirectory(prefix);
+    if (kind.kind === 'directory') continue;
+    if (kind.kind === 'link') return { ok: false, reason: 'backup-ancestor-is-a-link' };
+    if (kind.kind === 'unknown') return { ok: false, reason: 'backup-ancestor-unverified' };
+    return { ok: false, reason: 'backup-ancestor-not-a-directory' };
+  }
+  return { ok: true };
+}
+
+/**
+ * Keep a protected copy of `config.toml` before an automatic migration rewrites it.
+ *
+ * This is a PRECONDITION, not a best-effort extra: the caller refuses to write when it
+ * fails. The destination is validated before anything is written —
+ *
+ *   * the destination must be an ABSOLUTE path;
+ *   * every ancestor of the destination is proved to be a real directory — a symlink, a
+ *     Windows junction/reparse point, an unverifiable component or a non-directory refuses
+ *     the whole chain ({@link ensureTrustedDirectoryChain}); missing levels are created one
+ *     by one and re-inspected, and the chain is re-checked immediately before the write;
+ *   * the file name is derived from the content digest, so repeated upgrades do not grow
+ *     without bound;
+ *   * an existing destination that is a link or not a regular file is refused, so a
+ *     pre-planted link cannot redirect the config text;
+ *
+ * — and the copy itself is written atomically with owner-only permissions. A failure
+ * returns a bounded REASON (never the config text, never a path a caller could mistake for
+ * a credential) so the refusal can be reported.
+ * @param {string} configPath - the file that is about to change (for the record only).
+ * @param {string} contents - its current bytes.
+ * @param {string} backupDir - trusted destination directory.
+ * @returns {Promise<{ ok: true, path: string } | { ok: false, reason: string }>} outcome.
+ */
+async function backupConfigBeforeWrite(configPath, contents, backupDir) {
+  void configPath;
+  if (typeof backupDir !== 'string' || backupDir.trim() === '') {
+    return { ok: false, reason: 'no-backup-directory' };
+  }
+  // A relative destination would be resolved against the harness cwd, which is not a
+  // location this plugin may pick for itself.
+  if (!isAbsolute(backupDir)) return { ok: false, reason: 'backup-directory-not-absolute' };
+  const targetDir = resolve(backupDir);
+  const chain = await ensureTrustedDirectoryChain(targetDir);
+  if (chain.ok !== true) return { ok: false, reason: chain.reason };
+  const target = join(targetDir, `codex-config-before-${digest(contents).slice(0, 16)}.toml`);
+  let existing;
+  try {
+    existing = await lstat(target);
+  } catch (error) {
+    if (error?.code !== 'ENOENT') return { ok: false, reason: 'backup-target-unreadable' };
+    existing = null;
+  }
+  if (existing !== null) {
+    // Something already sits there. It is acceptable ONLY as the same regular file with
+    // the same bytes (an idempotent re-check); a link, a directory or different bytes is
+    // refused rather than overwritten.
+    if (existing.isSymbolicLink() || !existing.isFile()) return { ok: false, reason: 'backup-target-not-a-regular-file' };
+    try {
+      const previous = await readFile(target, 'utf8');
+      if (previous !== contents) return { ok: false, reason: 'backup-target-differs' };
+      return { ok: true, path: target };
+    } catch {
+      return { ok: false, reason: 'backup-target-unreadable' };
+    }
+  }
+  // Re-prove the chain at the last moment: the pre-write probes above are asynchronous and
+  // a component can be replaced by a link between the first check and the write.
+  const recheck = await ensureTrustedDirectoryChain(targetDir);
+  if (recheck.ok !== true) return { ok: false, reason: recheck.reason };
+  try {
+    // `writeFileAtomic` writes its temp file with mode `0600` and renames it into place,
+    // so the copy is owner-only and never partial.
+    await writeFileAtomic(target, contents);
+  } catch {
+    return { ok: false, reason: 'backup-write-failed' };
+  }
+  // Re-read what was actually written: a backup nobody verified is not a backup.
+  try {
+    const written = await readFile(target, 'utf8');
+    if (written !== contents) return { ok: false, reason: 'backup-verification-failed' };
+  } catch {
+    return { ok: false, reason: 'backup-verification-failed' };
+  }
+  return { ok: true, path: target };
 }
 
 /**
@@ -2223,7 +3042,11 @@ async function removeManaged(before, outcome) {
 export function publicCodexStatus(status) {
   if (status === null || typeof status !== 'object') return status;
   const { expect: _ignored, ...agent } = status.agent ?? {};
-  return { ...status, agent };
+  // `mcp.fingerprint` is the write path's receipt for the exact config bytes it plans to
+  // replace. It is a digest, not content, but it is an internal planning fact like
+  // `agent.expect`, so it does not belong in a response an operator or a page reads.
+  const { fingerprint: _receipt, ...mcp } = status.mcp ?? {};
+  return { ...status, agent, mcp };
 }
 
 /**
@@ -2251,3 +3074,163 @@ export function digest(text) {
 
 /** Re-exported for callers that need to render a path list consistently. */
 export { delimiter };
+
+
+/**
+ * Detect the ONE conflict an explicit action may resolve: a proved moved installation.
+ *
+ * This is deliberately NOT part of `classifyMcpEntry`, which is synchronous and must never
+ * label a differing script `outdated` without a proof. The proof is the async filesystem
+ * one in {@link isOwnedEntryScript} — a real package root, a `package.json` naming this
+ * package AND mapping its `bin["dsh-delegate-mcp"]` to the entry, and a
+ * `bin/dsh-delegate-mcp.js` that IS the recorded file — so a wrapper that merely reuses
+ * the file name stays refused.
+ *
+ * The proof is made against the config document this action read, and the plan's digest is
+ * required to match it: a document that changed since the plan is not the one the operator
+ * acted on, so no proof from a different state can authorize the write.
+ *
+ * Exported for the deterministic race regression (the async window between this proof and
+ * {@link adoptMovedInstall}); `installMcpEntry` is its only production caller.
+ * @internal
+ * @param {object} before - status read.
+ * @returns {Promise<{ document: object, classification: object, desired: object } | null>}
+ *   the current document and its re-classification when the moved install is proved.
+ */
+export async function adoptProvedMovedInstall(before) {
+  const { mcp } = before;
+  if (mcp.state !== MCP_STATES.conflict || mcp.reason !== 'args-shape-not-ours') return null;
+  if (mcp.marked !== true || mcp.previous === null || mcp.desired === null) return null;
+  const args = Array.isArray(mcp.previous.args) ? mcp.previous.args : [];
+  if (args.length !== 1) return null;
+  if (mcp.previous.command !== mcp.desired.command && !isLegacyDesktopCommand(mcp.previous.command)) return null;
+  if ((await isOwnedEntryScript(args[0], mcp.desired.args[0])) !== true) return null;
+  let loaded;
+  try {
+    loaded = await loadConfig(mcp.path);
+  } catch {
+    return null;
+  }
+  if (loaded.unreadable === true) return null;
+  // The CURRENT bytes must still be the plan's bytes: a config edited after the plan can
+  // describe a different entry, and a proof made from it would authorize a write the
+  // operator never saw.
+  if (typeof mcp.fingerprint !== 'string' || digest(loaded.document.text) !== mcp.fingerprint) return null;
+  const classification = classifyMcpEntry(loaded.document, mcp.desired);
+  // The proof must still hold for the CURRENT text: same conflict, same recorded script.
+  if (classification.marked !== true || classification.reason !== 'args-shape-not-ours') return null;
+  const currentArgs = Array.isArray(classification.previous?.args) ? classification.previous.args : [];
+  if (currentArgs.length !== 1) return null;
+  if ((await isOwnedEntryScript(currentArgs[0], mcp.desired.args[0])) !== true) return null;
+  return { document: loaded.document, classification, desired: mcp.desired };
+}
+
+/**
+ * Write a proved moved installation into the owned entry, in one atomic write.
+ *
+ * The edit is the same minimal in-place rewrite `applyMcpEntry` performs; the only
+ * difference is that the classification was established by the async proof above rather
+ * than by the synchronous classifier, so it is re-stated as `outdated` for the apply step
+ * (which refuses a `conflict` by design).
+ *
+ * Everything the proof relied on is re-proved here, immediately before the write, because
+ * proving the old path involves several filesystem probes and the operator (or another
+ * tool) can change the config in that window:
+ *
+ *   1. the `$CODEX_HOME`/`agents` boundary is inspected again;
+ *   2. `config.toml` is read again and its digest must equal the plan's fingerprint;
+ *   3. the entry is re-classified and its recorded script re-proved as a real installation
+ *      of this package; anything else is refused, with the file kept.
+ *
+ * Exported for the deterministic race regression; `installMcpEntry` is its only
+ * production caller.
+ * @internal
+ * @param {object} adopted - value from {@link adoptProvedMovedInstall}.
+ * @param {{ changed: string[], refused: object[] }} outcome - mutable outcome.
+ * @param {object} before - the status read the plan and proof came from.
+ * @returns {Promise<void>} resolves after the attempt.
+ */
+export async function adoptMovedInstall(adopted, outcome, before) {
+  const { mcp } = before;
+  const refuse = (code, message, reason) => {
+    outcome.refused.push({ target: 'mcp', code, message, path: mcp.path, ...(reason === undefined ? {} : { reason }) });
+  };
+  // The proof and this write must still describe the same plan. A mismatched pair would
+  // mean the caller re-entered the path with a proof made for another read.
+  if (typeof adopted?.document?.text !== 'string'
+    || typeof mcp.fingerprint !== 'string'
+    || digest(adopted.document.text) !== mcp.fingerprint) {
+    refuse('MCP_ENTRY_CONFLICT',
+      'the moved-install proof does not match the plan it is being written for, so nothing was written',
+      'proof-plan-mismatch');
+    return;
+  }
+  // 1. The boundary can have become a link since the plan; writing through one would put
+  // the entry outside the Codex home.
+  const boundary = await inspectCodexBoundary(before.codexHome);
+  if (boundary.blocked === true) {
+    outcome.refused.push(linkedBoundaryRefusal({ ...before, boundary }));
+    return;
+  }
+  // 2. The plan's digest is the race guard: the proof described those exact bytes.
+  let loaded;
+  try {
+    loaded = await loadConfig(mcp.path);
+  } catch (error) {
+    refuse(
+      typeof error?.code === 'string' ? error.code : 'CODEX_CONFIG_UNREADABLE',
+      typeof error?.message === 'string' ? error.message : 'the Codex config could not be read',
+    );
+    return;
+  }
+  if (loaded.unreadable === true) {
+    refuse('CODEX_CONFIG_UNSUPPORTED', 'the Codex config is not readable as TOML and was left untouched');
+    return;
+  }
+  if (typeof mcp.fingerprint !== 'string' || digest(loaded.document.text) !== mcp.fingerprint) {
+    refuse('MCP_ENTRY_CONFLICT',
+      'config.toml changed after the moved installation was proved, so nothing was written',
+      'config-changed');
+    return;
+  }
+  // 3. Re-prove the CURRENT entry: same conflict, same owned facts, same real package.
+  if (mcp.desired === null || mcp.desired === undefined) {
+    refuse('MCP_ENTRY_CONFLICT', 'no owned entry shape is available for the moved installation');
+    return;
+  }
+  const classification = classifyMcpEntry(loaded.document, mcp.desired);
+  if (classification.marked !== true || classification.state !== MCP_STATES.conflict
+    || classification.reason !== 'args-shape-not-ours') {
+    refuse('MCP_ENTRY_CONFLICT',
+      'the mcp_servers.dsh-delegate entry is no longer the moved installation that was proved, so nothing was written',
+      classification.reason ?? classification.state);
+    return;
+  }
+  if (classification.previous?.command !== mcp.desired.command
+    && !isLegacyDesktopCommand(classification.previous?.command)) {
+    refuse('MCP_ENTRY_CONFLICT', 'the recorded command is not one this plugin wrote, so nothing was written', 'command-not-ours');
+    return;
+  }
+  const currentArgs = Array.isArray(classification.previous?.args) ? classification.previous.args : [];
+  if (currentArgs.length !== 1 || (await isOwnedEntryScript(currentArgs[0], mcp.desired.args[0])) !== true) {
+    refuse('MCP_ENTRY_CONFLICT',
+      'the recorded entry script is no longer provably an installation of this package, so nothing was written',
+      'script-not-provably-ours');
+    return;
+  }
+  const asStale = { ...classification, state: MCP_STATES.outdated, reason: null };
+  let next;
+  try {
+    next = applyMcpEntry(loaded.document, mcp.desired, asStale);
+  } catch (error) {
+    refuse(
+      typeof error?.code === 'string' ? error.code : 'MCP_ENTRY_CONFLICT',
+      typeof error?.message === 'string' ? error.message : 'the moved installation could not be adopted',
+    );
+    return;
+  }
+  if (next === null) return;
+  await writeFileAtomic(mcp.path, next);
+  outcome.changed.push('mcp');
+}
+

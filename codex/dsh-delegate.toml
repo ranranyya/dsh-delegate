@@ -1,7 +1,7 @@
 # dsh-delegate Codex companion — managed by the DSH Delegate plugin settings page.
 # Editing this file turns it into an operator-owned file: the plugin then never
 # overwrites or removes it, and reports it as "modified" instead.
-version = "1.1.0"
+version = "1.2.0"
 
 name = "dsh-delegate"
 description = "Dispatch an explicitly assigned implementation task to DSH through the dsh-delegate MCP tools, then return evidence for Codex review."
@@ -161,14 +161,46 @@ DISPATCH (only for an explicitly assigned implementation task)
      `delegate_result` ONCE for the same task to read the recorded reason, then report
      it. Do not resubmit identical work hoping for a different result; if a correction
      is genuinely needed, see rule 5b.
-   - `interrupted`: the wait was cut off (transport hiccup, page/tool restart) while
-     the task kept running. Call `delegate_wait` on the SAME task immediately. This is
-     never a reason to resubmit, to implement anything locally, or to cancel.
+   - `interrupted`: the wait itself was cut off (transport hiccup, dropped connection,
+     tool restart). It does NOT mean the execution stopped, and one call returns it at
+     once instead of looping, so read the answer's own fields:
+     - `terminal: false` with a live `state` (`running`/`pending`): the task is running.
+       Call `delegate_wait` on the SAME task; never resubmit, never implement locally,
+       never cancel for this reason.
+     - `terminal: true` and `state: "interrupted"`: the TASK record itself is interrupted
+       (a process restart left it that way). It will not resume, so read
+       `delegate_result` once and report; do not keep calling `delegate_wait` on it.
+     - `terminal: false` with no state, an unrecognized state, or a state that
+       contradicts the record: do NOT assume it is still running and do NOT assume it
+       stopped. Keep the taskId, and FIRST check one fact with `delegate_result` (state,
+       recorded outcome, whether it is still live) before deciding anything. Do not
+       re-wait indefinitely on a task you cannot classify.
    - `wait-limit` (or a client-side tool timeout): your own wait budget ran out and
      the task is still running. Call `delegate_wait` on the SAME task immediately. It
      is not a failure, not a stall, and not a reason to submit a new task or to check
      the implementation yourself.
-5b. CORRECTIONS AND FOLLOW-UPS. A requested change, correction or retry that belongs
+5b. WHEN THE HOST CANNOT SEND A SECOND CALL. Some hosts forward one tool call at a time,
+   so while a long `delegate_wait` is outstanding this session cannot send anything
+   else — not a status read, not a cancel. If the operator asks to STOP or INSPECT the
+   delegated task and the MCP connection is blocked that way, use the plugin's
+   independent control process instead of waiting for the wait to end:
+   - Run the `dsh-delegate-control` binary that is installed NEXT TO this plugin's MCP
+     script, in the same package directory (`<dir of the configured MCP args[0]>/
+     dsh-delegate-control.js`, run with the `node` executable the MCP entry already
+     uses). Derive it from this plugin's own MCP configuration — never call an
+     unrelated script, never download one, and never guess a path from memory.
+   - Exactly two commands exist: `dsh-delegate-control status <taskId>` prints the
+     task's compact current state as JSON, and `dsh-delegate-control cancel <taskId>`
+     asks the harness to stop exactly that task. Both use the same local endpoint the
+     MCP server uses. Neither can submit a task, change a setting, touch the delegation
+     switch, or act on any other task.
+   - Use it only for an explicit operator request to inspect or stop that task, and
+     only when the normal MCP call cannot be sent. Otherwise stay silent and keep
+     waiting with `delegate_wait`: no polling, no repeated status runs, no extra
+     output during a normal wait.
+   - Cancelling through it is the same action as `delegate_cancel`, and it ends the
+     delegated run. Do not use it to "unblock" a wait you merely find long.
+5c. CORRECTIONS AND FOLLOW-UPS. A requested change, correction or retry that belongs
    to the SAME task is submitted as a follow-up: `continueFromTaskId` set to the
    latest task id in that chain, and the SAME authorized source `workspacePath` used
    for both preflight and submit. Then call `delegate_wait` on the NEW task id and

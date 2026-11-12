@@ -1,4 +1,4 @@
-# Worker session permissions (1.0.0)
+# Worker session permissions (1.0.0; unchanged in 1.1.0 and 1.2.0)
 
 This document states what a delegated **worker** run is allowed to do on the machine
 it runs on, how that is established, which connection may continue an existing
@@ -284,6 +284,29 @@ from this document, which claims only the contract.
   behaviour there has not been performed.
 
 These points are open work, not released features.
+
+### What 1.2.0 changes here: nothing, and that is the point
+
+The 1.2.0 release fixes waiting semantics, adds an independent local control channel and
+upgrades installed Codex integrations. None of those widens a permission:
+
+- the control CLI (`bin/dsh-delegate-control.js`) has exactly two verbs, `status <taskId>`
+  and `cancel <taskId>`, uses the SAME loopback execution plane as the MCP server, and
+  adds no token, grant, switch, settings or configuration surface. It cannot submit a
+  task, approve anything, or act on a task other than the one named; the per-call
+  permission decision is still made only by `delegate_permission_decide`;
+- the startup upgrade of an installed Codex MCP entry writes only values this plugin can
+  prove it wrote before (marker + its own Node command + its own `dsh-delegate-mcp.js`
+  file name) and only when they are stale. It cannot create the entry, adopt a same-name
+  entry, follow a link at `$CODEX_HOME`/`agents`, or edit any other Codex setting;
+- the `interrupted` fix is a reporting correction: an interrupted OBSERVATION is no longer
+  reported as an ended execution. It changes what a host is told, not what a worker may
+  do — the standing sandbox mode stays `workspace-write` and the approval stance is
+  unchanged.
+
+The two limitations above that matter for this release are unchanged and restated: the
+switch and the per-call bridge are **not** per-process authentication against arbitrary
+same-user code, and Desktop production-profile acceptance has still not been performed.
 
 ## What *was* verified
 

@@ -542,6 +542,12 @@ export const TASK_STATE_LABELS = Object.freeze({
   'awaiting-host-review': '等待宿主审查',
   failed: '执行失败',
   cancelled: '已取消',
+  // A task persisted by a restart is stored with this state. It is NOT "still
+  // running": the execution does not resume, so the panel says exactly that. The
+  // engine never sets it for a live run — the same word is also the reason an
+  // OBSERVATION was interrupted, and that is a different thing (see
+  // `WAIT_REASON_LABELS.interrupted`).
+  interrupted: '已中断（进程重启后不会继续执行）',
 });
 
 /** Chinese labels for task review states. */
@@ -616,7 +622,11 @@ export const WAIT_REASON_LABELS = Object.freeze({
   ready: '执行已结束，等待宿主审查（不等于已接受）',
   failed: '执行失败',
   cancelled: '已取消',
-  interrupted: '这次等待被中断，任务仍在运行',
+  // The reason describes the WAIT, and only a TERMINAL answer means the task record is
+  // itself interrupted. Both readings are named, because a serialised host reads this
+  // through `delegate_wait`'s answer: a live task stays live (`wait-limit`, below), a
+  // restart history does not resume.
+  interrupted: '这次等待被中断；任务是否仍在运行要看答案里的 terminal/state（任务记录本身中断才是重启历史，不会继续执行）',
   'wait-limit': '本轮等待时间用完，任务仍在运行',
 });
 
@@ -1224,6 +1234,11 @@ export function taskProgress(task) {
   }
   if (settled) {
     detailParts.push('任务已结束，这些时间不再变化。');
+  } else if (task?.state === 'interrupted') {
+    // A restart history: the record has no `finalizedAt` (it was written by a process
+    // that then restarted), but the run will NOT resume. This branch exists because the
+    // generic wording would otherwise promise progress that can never happen.
+    detailParts.push('这条记录来自一次进程重启：任务已经中断，不会继续执行，也不会再有新的进展。');
   } else if (activity.attentionSeconds !== null) {
     detailParts.push(`超过 ${formatDuration(activity.attentionSeconds * 1000)} 没有新进展时会提醒你；提醒只是提示，不会自动判失败。`);
   }
@@ -1236,6 +1251,28 @@ export function taskProgress(task) {
     detail: detailParts.join(' '),
     tone: activity.currentTool !== null ? 'on' : (settled ? 'off' : 'on'),
   };
+}
+
+/**
+ * Chinese labels for the managed MCP entry's stale owned facts (`mcp.drift`).
+ *
+ * A state name ("outdated") does not tell an operator what would change, so the panel
+ * names each fact. An unknown one falls back to its own name rather than being hidden.
+ */
+export const CODEX_MCP_DRIFT_LABELS = Object.freeze({
+  tool_timeout_sec: '缺少工具超时（部分客户端可能因此提前中断长时间等待）',
+  args: '入口脚本路径已变化（插件已升级或移动）',
+  command: 'command 仍是旧版写下的路径',
+  env: '发现文件的环境变量与当前不一致',
+});
+
+/**
+ * Describe an `outdated` MCP entry in the panel's terms.
+ */
+export function codexMcpDriftText(mcp) {
+  const drift = Array.isArray(mcp?.drift) ? mcp.drift : [];
+  if (drift.length === 0) return '托管 MCP 条目需要更新';
+  return drift.map((key) => CODEX_MCP_DRIFT_LABELS[key] ?? key).join('；');
 }
 
 /**

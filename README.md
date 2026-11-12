@@ -6,10 +6,11 @@ DeepSeek Harness（DSH）的委托插件：让 MCP 宿主在你开启本机总�
 新安装时本机调用总开关默认关闭。开关状态会保存在插件设置中，重启后恢复保存值；
 关闭时拒绝新的委派任务，并请求停止正在运行的任务。
 
-> **发布状态：`1.1.0` 候选版本（静默等待与集中审查）。** 源码仓库和可下载的 Release
+> **发布状态：`1.2.0`（静默等待与独立控制通道的修订版本）。** 源码仓库和可下载的 Release
 > 位于 [GitHub](https://github.com/ranranyya/dsh-delegate)。npm 尚未作为安装渠道发布；
 > GitHub Release 附带的 `.tgz` 是推荐的安装包。`1.1.0` 的静默等待说明见
-> [`docs/silent-wait.md`](./docs/silent-wait.md)。
+> [`docs/silent-wait.md`](./docs/silent-wait.md)；`1.2.0` 修正了其中三处真实问题（等待中断的
+> 语义、串行宿主下的控制能力、已安装 Codex 集成升级遗漏），见第 7.4 节。
 
 ---
 
@@ -40,7 +41,7 @@ Desktop 侧的包操作只能交给应用完成——不要在 Desktop 的正式
 
    ```bash
    npm pack
-   #    → dsh-delegate-1.1.0.tgz
+   #    → dsh-delegate-1.2.0.tgz
    ```
 
 2. 打开 Desktop 的 **Plugins manager**，用它的 add-plugin（添加插件）入口选择上一步生成的
@@ -55,7 +56,7 @@ Desktop 侧的包操作只能交给应用完成——不要在 Desktop 的正式
 
 ```bash
 # 装进一个 profile（例：web）
-dsh plugin --profile web add ./dsh-delegate-1.1.0.tgz && dsh plugin --profile web why dsh-delegate
+dsh plugin --profile web add ./dsh-delegate-1.2.0.tgz && dsh plugin --profile web why dsh-delegate
 
 # 启动（首次启动会自动把插件 bundle 追加到 dsh.profile.bundles）
 dsh --profile web
@@ -68,7 +69,7 @@ dsh --profile web
 ### 说明与注意
 
 - **不要装进你正在用的正式 profile 做试验。** 建议先用一次性 profile：
-  `dsh plugin --profile dsh-delegate-try add ./dsh-delegate-1.1.0.tgz`，再把
+  `dsh plugin --profile dsh-delegate-try add ./dsh-delegate-1.2.0.tgz`，再把
   `DSH_HOME` 指向临时目录做隔离验证。该命令同样只用于 CLI profile。
 - 该包声明了 `@deepseek-ai/dsh-*` 的 peer，若你的包管理器默认自动安装 peer，
   安装过程会尝试解析这些版本。可显式关闭：`npm_config_auto_install_peers=false`
@@ -301,6 +302,11 @@ node bin/dsh-delegate-codex-agent.js remove    # 只删除插件托管项
 
 退出码：`0` 完成，`2` 因冲突/拒绝而未改动，`1` 失败。
 
+已安装的托管 MCP 条目会在插件启动时**自动**原地补齐缺失的 `tool_timeout_sec`（入口脚本正好是
+本安装时）。入口路径已经指向旧安装的条目不会被启动自检改写：请用「安装 / 更新 Codex 集成」或
+「仅修复 MCP 配置」显式采纳，只有在证明旧路径是同一包的真实安装后才会改写。显式按钮仍然是
+未安装时唯一会创建条目的动作。
+
 ## 7. 凭据隔离
 
 - provider、地址和密钥由 DSH 自己管理；插件通过 DSH 原生 provider 调用现有配置。
@@ -398,7 +404,9 @@ worker 请求把**某一次调用**的沙箱权限提升时，那次调用会暂
 Codex 子智能体现在按「提交 → `delegate_wait` 同一任务」运作：`heartbeat` 是内部心跳，
 不会送到模型；`attention` 是提问、默认继续等；`permission` 审查这一次调用后决定再继续等；
 `ready`/`failed`/`cancelled` 只读**一次**完整证据；`interrupted`/`wait-limit` 立刻重新等待
-同一任务。托管 MCP 条目会写入 `tool_timeout_sec = 3660`，让默认 60 分钟的一次等待跑完。
+同一任务。托管 MCP 条目会写入 `tool_timeout_sec = 3660`，让认这个字段的客户端允许一次默认
+60 分钟的等待跑完；客户端如果应用自己的默认工具超时（Codex 的历史默认是一分钟），仍可能提前
+结束等待，这是插件不能解除的客户端限制。
 
 升级后的操作：设置页 → Codex 集成 → **安装 / 更新 Codex 集成**，然后让 Codex 重新载入
 （新开会话或重启）。
@@ -408,6 +416,79 @@ Codex 子智能体现在按「提交 → `delegate_wait` 同一任务」运作�
 **这不是省 token 的承诺**：插件只改变"什么时候把什么告诉派工方"，不控制 Codex 自己的上下文
 与思考开销，也不做节省量的估算。
 
+## 7.4 1.2.0：等待中断、独立控制通道与已安装集成升级
+
+`1.1.0` 的真实验收报告指出了三个问题，本版本逐一修正。这里如实写明**改了什么、没改什么**。
+
+### 等待中断 ≠ 执行中断
+
+`delegate_wait` 的 `interrupted` 原来被当成终态返回，而插件发出的 `interrupted` 多数时候
+只是**观察者自己的这次请求结束**（调用方取消、连接断开、引擎在重建时释放了等待者）。任务
+仍在运行，宿主却以为执行结束了。
+
+- 现在由**任务记录**决定：`state` 是 `pending`/`running` 且 `endedAt` 为 `null` 时，这次
+  中断只算“本次观察结束”，答案带着真实状态与 `terminal: false` 返回，指令要求**继续等同一
+  `taskId`**。一次调用不再在内部重发观察——真实被释放的观察者会让每次观察都立刻返回
+  `interrupted`，旧写法会把一次 `delegate_wait` 变成无界的请求风暴。
+- 真正来自重启历史的 `state: interrupted` 才是不可恢复的终态：`terminal: true`，并明确告诉
+  宿主**不要**继续盲等同一任务。
+- 中断同时带着真实结局时按结局返回：`awaiting-host-review` 是 `ready`（所以审查不会被挡住），
+  `failed`/`cancelled` 各按自己返回。
+- 状态缺失、或本构建不认识的状态一律**不做断言**：`terminal: false`，指令要求先核对；既不宣称
+  “已停止”，也不宣称“仍在运行”，更不把未知状态当成重启历史。
+- `ready`/`failed`/`cancelled` 自己的行为不变；`ready` 不会凭原因编造 `state: "ready"`，缺失
+  任务状态时 `state` 为 `null`。
+- 任务记录页把真实的 `interrupted` 历史显示为「已中断（进程重启后不会继续执行）」，不会
+  再显示成“仍在运行”。
+
+### 串行宿主下的独立控制通道
+
+插件自己的 stdio MCP 服务器**本来就支持并发**（一个长 `delegate_wait` 在飞时，status、cancel
+照样能被回答）。瓶颈在外层宿主：一次只转发一个工具调用的客户端，会让整条 MCP 连接被等待占住。
+
+- 不承诺改变 Codex 的调度器，也不把长等待退化成轮询。新增独立本地控制程序
+  `dsh-delegate-control`（`bin/dsh-delegate-control.js`，已注册到 `package.json` 的 `bin`），
+  用**同一个** `createExecutionClient` 和端点发现调用现有 loopback 执行面：
+  - `status <taskId>`：用 `observe` + `waitMs: 0` 取一次紧凑状态（无 diff、无对话、无密钥）；
+  - `cancel <taskId>`：只停止指定的那个任务。
+  - 没有提交、设置、总开关、批量取消或默认放行；不新增权限、开关、配置接口或常驻后台进程。
+  - 有限请求超时：默认 **10 秒**，`DSH_DELEGATE_CONTROL_TIMEOUT_MS` 只能把它**调小**，填更大的值会被夹回 10 秒；
+    stdout 只有一个稳定的 JSON 文档，诊断走 stderr；`0` = 有答案，`1` = 被拒绝，`2` = 用法错误。
+- 等待监听断开只会释放观察，**取消必须是显式 `cancel`**。
+- 子智能体规则同步：只有用户明确要求停止/查看任务、而宿主把同一条 MCP 连接阻塞住时，才用
+  与已配置 MCP 脚本同目录的这个控制程序；普通等待期间保持静默。
+- 工具目录补上了准确的 MCP `annotations`（`readOnlyHint` 等），帮助支持并发的客户端识别长等待
+  是只读调用。注解**不是**修复：串行客户端照样忽略它，这正是上面独立通道存在的原因。
+
+### 已安装 Codex 集成的升级
+
+`1.1.0` 的启动自检只刷新 agent 文件。因此从 `1.0.0` 升上来的已安装 MCP 表仍然只有
+`command`/`args`、缺 `tool_timeout_sec = 3660`；客户端可能因此更早结束一次 60 分钟的等待
+（Codex 的历史默认是一分钟）。这个字段只能**请求**客户端放宽时长，不能解除客户端自身的限制。
+
+- 启动自检现在也检查已安装的托管 MCP 条目：只有能证明是本插件写入的（带托管标记注释、
+  command 是本包的 Node 命令、`args[0]` 正好是本安装的 `dsh-delegate-mcp.js`）**且**缺
+  `tool_timeout_sec` 的条目，才会在原地补齐。入口路径已经指向旧安装的条目只会被报告为
+  `conflict`，启动不会替操作者改路径。
+- 「安装 / 更新 Codex 集成」或「仅修复 MCP 配置」是唯一会采纳旧路径的入口：它要求旧路径是
+  真实安装（真实的 root/bin/入口文件，`package.json` 的 `name` 是本包且
+  `bin["dsh-delegate-mcp"]` 映射到该入口），并在写入前重查当前 config 指纹、边界和条目所有权；
+  期间有任何改动就拒绝。
+- **绝不会**在未安装时创建配置、不会采纳同名非托管条目或用户改写过形态的条目、不穿过
+  `$CODEX_HOME` 或 `agents/` 上的符号链接/junction（现在连 MCP 条目的**报告**都不再穿链接）、
+  不触碰其他 MCP 与设置；写入仍是原子 + 备份形态，并在写前重新读取并重新判定，发生漂移就拒绝。
+  备份目录的**整条祖先链**都会被检查：备份目录之上任何一级是符号链接/junction、不可验证或
+  不是目录都拒绝升级，缺失层级逐级创建并复核，绝不沿链接把完整 config 写出去。
+- 已发布的 `1.1.0` 子智能体文件（CRLF 与 LF 两种字节形态）已加入精确识别列表，所以旧
+  agent 能安全升级；`1.1.0` 之前、正文已变的历史版本按各自已发布的精确摘要识别。
+- 设置页保留显式「安装 / 更新 Codex 集成」按钮，并显示 `outdated` 的**具体漂移项**与说明。
+
+### 本版本没有做什么
+
+- 没有再次执行 DSH Desktop 正式 profile 上的端到端真实模型运行，也没有实测宿主串行时控制通道的
+  现场行为（自动测试用的是本机 mock 执行面与真实 stdio 夹具，不依赖真实模型）。
+- 不提交、不推送、不发布；npm 仍未作为安装渠道。
+
 ## 8. 升级 / 导出 / 卸载 / 回滚
 
 ```bash
@@ -416,7 +497,7 @@ Codex 子智能体现在按「提交 → `delegate_wait` 同一任务」运作�
 # 不要在 Desktop 的正式 profile 下执行下面的 CLI 命令。
 
 # CLI web profile 的升级：换成本地新包或（将来）新版本
-dsh plugin --profile web add ./dsh-delegate-1.1.0.tgz
+dsh plugin --profile web add ./dsh-delegate-1.2.0.tgz
 
 # 导出：界面里"导出非敏感配置"按钮，或用只读 API
 #   GET /api/dsh-delegate/settings
@@ -460,9 +541,15 @@ dsh plugin --profile web remove dsh-delegate
 - **静默监控不是进度模型**：插件不计算完成百分比，不预测剩余时间，也不读取代码内容来判断
   “是否在推进”。它只看执行器是否真的产生了事件。一次 `attention` 是提示，不是结论；
   一个非常安静但确实在工作的长步骤，也可能到达提醒阈值。
-- **不承诺省多少 token**：`1.1.0` 改变的是"什么时候把什么告诉派工方"。Codex 自己的上下文、
+- **不承诺省多少 token**：`1.1.0` 起改变的是"什么时候把什么告诉派工方"。Codex 自己的上下文、
   思考与工具往返开销不由本插件控制，本插件也不做节省量的估算或承诺。
 - **只在有人观察时运行**：没有派工方在等待时，监控不启动定时器、不消耗资源，也不会提醒。
+- **等待中断不等于执行中断**：`delegate_wait` 返回的 `interrupted` 只描述这次等待；任务仍在
+  `pending`/`running` 时它是非终态，答案里带着真实任务状态。只有任务记录本身是 `interrupted`
+  （重启历史）才是终态。不要把这两个概念混为一谈，也不要把非终态答案当作执行结束。
+- **串行宿主下没有通用的“并发”承诺**：插件自己的 MCP 传输支持并发，但客户端一次只转发一个调用时，
+  同一条连接仍会被长等待占住。可用的是独立控制程序（`dsh-delegate-control status|cancel <taskId>`），
+  它只有这两个动作，也不能改变宿主的调度方式。
 - **逐次授权桥只决定一次调用**：`allow-once` 只对那一次原生工具调用有效，会话的常规沙箱模式
   仍是 `workspace-write`；它不能创建或扩大任何账号/工作区/会话授权，不能改设置/凭据/开关/
   提供方/模型/隔离，也不能预先批准后续调用。它是本机指挥官的决定，不是自动放行规则、不是
@@ -484,6 +571,11 @@ dsh plugin --profile web remove dsh-delegate
     遇到无法定位的 TOML 语法时整体拒绝写入，而不是猜测。
   - 首次安装 agent 文件使用排他创建：若文件在状态读取与写入之间被别的进程创建，
     会报告冲突而不会覆盖。
+  - 启动自检只补齐**已安装、入口正好是本安装**且能证明属于本插件的托管 MCP 条目缺失的
+    `tool_timeout_sec`，不会在未安装时创建条目，也不会采纳同名非托管条目或用户改写过的条目；
+    入口路径指向旧安装时只会报告冲突，需用显式按钮在证明该路径是同一包的真实安装后才会被采纳。
+    链接（含 Windows junction）边界一律拒绝，连 MCP 条目的报告也不再穿过链接；备份目录的整条
+    祖先链同样会被证明，绝不沿链接把完整 config 写出去。
   - 安装/修复不会打开本机调用开关；开关仍由操作者在第 4 节的位置单独控制。
 
 ## 10. 开发
@@ -506,7 +598,7 @@ Codex 集成相关的自动化测试（全部在临时 `CODEX_HOME` 中运行，
 | 文件 | 覆盖 |
 | --- | --- |
 | `tests/codex-toml.test.js` | TOML 定位/最小行区间编辑：注释、多行数组、内联表、Windows 路径、拒绝畸形文档 |
-| `tests/codex-integration.test.js` | 路径与可执行文件推导（普通 Node / Electron / 随包 Node / 环境变量 / 失败即拒绝）、幂等安装、用户文件保留、MCP 冲突拒绝、写入保真、路由契约、只读 status、已发布模板迁移（上一版与更早版本、同一版本的 LF 与 CRLF 两种字节，逐字节比对且不归一化行尾） |
+| `tests/codex-integration.test.js` | 路径与可执行文件推导（普通 Node / Electron / 随包 Node / 环境变量 / 失败即拒绝）、幂等安装、用户文件保留、MCP 冲突拒绝、写入保真、路由契约、只读 status、入口真实性（真实安装的 manifest `name` + `bin` 映射、POSIX 根、同布局 wrapper 拒绝）、备份祖先链（链接/junction/非目录拒绝、缺失层级创建）、已发布模板迁移（上一版与更早版本、同一版本的 LF 与 CRLF 两种字节，逐字节比对且不归一化行尾） |
 | `tests/codex-agent.test.js` | 本版本之前的 `manageCodexAgent` 兼容入口 |
 | `tests/codex-ui.test.js` | 设置页流程：`init` 只读、每个动作恰好一次 POST、三种状态分离、构建产物含面板与限制说明 |
 

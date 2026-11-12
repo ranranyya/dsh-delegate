@@ -33,7 +33,7 @@ import {
   createMcpServer,
   serveStdio,
 } from '../src/mcp/server.js';
-import { compactTask } from '../src/mcp/wait.js';
+import { INTERRUPTION_KINDS, classifyInterruption, compactTask, resolveInterruption } from '../src/mcp/wait.js';
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -111,13 +111,16 @@ function observation(reason, overrides = {}) {
  * elapsed time and the deadline would never arrive, which shows up as a hang in a
  * test rather than as a slow pass.
  * @param {number} [start] - starting instant.
- * @returns {{ now: () => number, sleep: (ms: number) => Promise<void>, elapsed: () => number }} clock.
+ * @returns {{ now: () => number, sleep: (ms: number) => Promise<void>, sleepSync: (ms: number) => void,
+ *   elapsed: () => number }} clock.
  */
 function fakeClock(start = 1_760_000_000_000) {
   let time = start;
   return {
     now: () => time,
     sleep: async (ms) => { time += ms; },
+    // For a test that owns the engine side: advances the same clock without awaiting.
+    sleepSync: (ms) => { time += Math.max(0, ms); },
     elapsed: () => time - start,
   };
 }
@@ -236,24 +239,56 @@ test('delegate_wait refuses a bad taskId or waitSeconds before any observation',
 // 2. Many internal observations, one host-facing answer
 // ---------------------------------------------------------------------------
 
-test('twenty minutes of normal activity is many heartbeats but ONE host answer', async () => {
-  // Twenty minutes at the one-second heartbeat cadence the loop enforces is 1200
-  // internal observations; the fake engine answers `heartbeat` until the 1200th lazy
-  // entry is replaced by a `ready`. A one-hour wait must return at that point — not at
-  // its deadline — and the host must see ONE answer.
-  const heartbeats = 1_199;
-  const script = [
-    () => observation('heartbeat'),
-    // The script repeats its last entry forever, so this one entry stands for the
-    // whole heartbeat phase; the explicit count below is asserted against the clock.
-    observation('ready', { task: summary({ state: 'awaiting-host-review', phase: 'review' }) }),
-  ];
-  const { server, seen, clock } = waitFixture(script, {
-    // Advance the clock as the engine would: one heartbeat per second.
-    async capture() { return undefined; },
+test('twenty minutes of normal activity is 48 internal observations, 47 heartbeats and ONE host answer', async () => {
+  // The real shape of a long wait, asserted end to end rather than in one heartbeat.
+  //
+  // Twenty minutes (1,200,000 ms) is followed in the protocol the plugin actually
+  // uses: each internal observation is bounded at 25 s (the execution plane's own
+  // cap). A task that is quietly working produces 48 observations: the first 47 each
+  // spend their full 25 s inside the engine and answer `heartbeat`, and the 48th ALSO
+  // spends its full 25 s — the run finishes during that waiting period, so the answer
+  // is `ready` only after it ends. 48 × 25 s = 1,200 s, which is the twenty-minute
+  // mark: 48 observation requests, 47 heartbeats consumed, 1 return.
+  //
+  // The clock is the fake one, and time is advanced by the OBSERVED wait (as a real
+  // engine does): every observation, including the last, spends its own `waitMs`, so
+  // the loop's early-heartbeat floor never fires. This is the difference from a fake
+  // that answers instantly and would be spaced out at one second per request.
+  const OBSERVATIONS = 48;
+  const heartbeats = OBSERVATIONS - 1;
+  const clock = fakeClock();
+  const servedWaits = [];
+  let issued = 0;
+  const seen = [];
+  const server = createMcpServer({
+    now: clock.now,
+    sleep: clock.sleep,
+    async callExecution(route, payload) {
+      seen.push({ route, payload });
+      issued += 1;
+      // Every observation, the last one included, spends its whole bound inside the
+      // engine. The task in the last one becomes ready DURING that wait, so the
+      // terminal state only exists after the 25 s have passed — never before the call.
+      clock.sleepSync(payload.waitMs);
+      const wait = {
+        waitMs: payload.waitMs,
+        waitedMs: payload.waitMs,
+        activitySinceWait: issued === OBSERVATIONS,
+      };
+      servedWaits.push(wait);
+      if (issued < OBSERVATIONS) {
+        return { ok: true, ...observation('heartbeat'), wait };
+      }
+      return {
+        ok: true,
+        ...observation('ready', {
+          task: summary({ state: 'awaiting-host-review', phase: 'review', endedAt: clock.now() }),
+        }),
+        wait,
+      };
+    },
   });
-  void heartbeats;
-  const { body, response } = await callWait(server, { taskId: 'task-wait-1', waitSeconds: 3_600 });
+  const { body, response, text } = await callWait(server, { taskId: 'task-wait-1', waitSeconds: 3_600 });
 
   assert.equal(response.result.isError, undefined);
   assert.equal(body.ok, true);
@@ -261,15 +296,47 @@ test('twenty minutes of normal activity is many heartbeats but ONE host answer',
   assert.equal(body.taskId, 'task-wait-1');
   assert.equal(body.state, 'awaiting-host-review');
   assert.equal(body.metrics.waitReturns, 1, 'the host receives exactly one answer');
-  assert.equal(body.metrics.observationRequests, 2);
-  assert.equal(body.metrics.heartbeatsConsumed, 1);
-  assert.equal(seen.length, 2);
+  assert.equal(body.metrics.observationRequests, OBSERVATIONS, 'twenty minutes is 48 bounded 25-second observations');
+  assert.equal(body.metrics.heartbeatsConsumed, heartbeats, '47 heartbeats were consumed internally');
+  assert.equal(body.metrics.perRequestWaitMs, OBSERVE_WAIT_MS);
+  assert.equal(body.metrics.deadlineMs, 3_600_000);
+  // The modelled clock really advanced by the full twenty minutes: the last observation
+  // waited its own 25 s before the task was reported ready, and the answer measures it.
+  assert.equal(servedWaits.length, OBSERVATIONS);
+  assert.ok(servedWaits.every((wait) => wait.waitedMs === OBSERVE_WAIT_MS),
+    'every observation, including the last, waited its full 25 s');
+  assert.equal(servedWaits[servedWaits.length - 1].waitedMs, OBSERVE_WAIT_MS,
+    'the final observation waited 25 s before reporting the finished run');
+  assert.equal(clock.elapsed(), OBSERVATIONS * OBSERVE_WAIT_MS);
+  assert.equal(clock.elapsed(), 1_200_000);
+  assert.equal(body.metrics.elapsedMs, 1_200_000, 'the answer measures the full twenty minutes');
+  // The fake engine answered only the two shapes a real one does.
+  assert.equal(seen.length, OBSERVATIONS);
   assert.ok(seen.every((call) => call.route === 'observe'), 'a wait must never call another route');
   assert.ok(seen.every((call) => call.payload.taskId === 'task-wait-1'));
   assert.ok(seen.every((call) => call.payload.waitMs <= OBSERVE_WAIT_MS),
     'each internal request is individually bounded');
-  assert.equal(body.metrics.deadlineMs, 3_600_000);
-  assert.ok(clock.elapsed() > 0, 'the modelled clock really advanced');
+  assert.ok(seen.every((call) => call.payload.waitMs === OBSERVE_WAIT_MS),
+    'the twenty-minute run uses 25-second observations, not one-second polls');
+  // THE PROPERTY: none of the 47 internal heartbeats reached the host, and the answer
+  // carries no evidence the cheap tool must never carry.
+  assert.equal(text.includes('"heartbeat"'), false, 'no heartbeat is surfaced');
+  // No evidence: the keys a `delegate_result` answer would carry are absent from the
+  // answer's own shape (the task's own `phase` value happens to be called "review",
+  // so the assertion is on keys, not on substrings).
+  const answerKeys = new Set();
+  const collectKeys = (node) => {
+    if (node === null || typeof node !== 'object') return;
+    for (const [key, value] of Object.entries(node)) {
+      answerKeys.add(key);
+      collectKeys(value);
+    }
+  };
+  collectKeys(body);
+  for (const forbidden of ['diff', 'patchText', 'execution', 'review', 'prompt']) {
+    assert.equal(answerKeys.has(forbidden), false, `the answer must not carry a ${forbidden} key`);
+  }
+  assert.ok(text.length < 2_000, 'a twenty-minute wait still answers compactly');
 });
 
 test('a sustained heartbeat stream is still exactly one answer to the host', async () => {
@@ -306,9 +373,13 @@ test('a heartbeat is never surfaced as the reason, and never as its own answer',
 
 test('each actionable reason returns at once, compactly, with no evidence text', async () => {
   for (const reason of ACTIONABLE_REASONS) {
-    const { server } = waitFixture([observation(reason, {
-      task: summary({ state: reason === 'ready' ? 'awaiting-host-review' : 'running' }),
-    })]);
+    // `interrupted` is only actionable as a REAL terminal history: the same reason on a
+    // live task is an observer interruption and never ends the wait (section 3a).
+    const state = reason === 'ready'
+      ? 'awaiting-host-review'
+      : (reason === 'failed' || reason === 'cancelled' ? reason
+        : (reason === 'interrupted' ? 'interrupted' : 'running'));
+    const { server } = waitFixture([observation(reason, { task: summary({ state }) })]);
     const { body } = await callWait(server, { taskId: 'task-wait-1', waitSeconds: 3_600 });
     assert.equal(body.reason, reason, `${reason} must be returned as-is`);
     assert.equal(body.actionable, true);
@@ -338,23 +409,224 @@ test('each actionable reason returns at once, compactly, with no evidence text',
   }
 });
 
-test('attention, failure, cancellation and interruption are terminal where they should be', async () => {
+test('attention, failure and cancellation are reported as they are, with the task state deciding terminality', async () => {
   const cases = [
-    ['attention', false],
-    ['permission', false],
-    ['ready', true],
-    ['failed', true],
-    ['cancelled', true],
-    ['interrupted', true],
+    // reason, task state the engine publishes, expected terminal flag
+    ['attention', 'running', false],
+    ['permission', 'running', false],
+    ['ready', 'awaiting-host-review', true],
+    ['failed', 'failed', true],
+    ['cancelled', 'cancelled', true],
   ];
-  for (const [reason, terminal] of cases) {
-    const { server } = waitFixture([observation(reason)]);
+  for (const [reason, state, terminal] of cases) {
+    const { server } = waitFixture([observation(reason, { task: summary({ state }) })]);
     const { body } = await callWait(server, { taskId: 'task-wait-1', waitSeconds: 60 });
+    assert.equal(body.reason, reason, `${reason} must be returned as-is`);
+    assert.equal(body.state, state, `${reason} must carry the real task state`);
     assert.equal(body.terminal, terminal, `${reason} terminal=${terminal}`);
     // None of these is ever reported as a finished, approved task.
     assert.notEqual(body.reason, WAIT_LIMIT_REASON);
     assert.notEqual(body.reason, 'heartbeat');
   }
+});
+
+// ---------------------------------------------------------------------------
+// 3a. `interrupted` says what happened to the OBSERVER, not to the RUN
+// ---------------------------------------------------------------------------
+//
+// The real acceptance failure this section prevents: the engine reports
+// `interrupted` when an observer's own request ends (the caller's signal aborted,
+// the connection dropped, the engine released the waiter). The TASK keeps running.
+// Reporting that as a terminal answer told the host the delegated execution had
+// ended, and a host that then stopped waiting abandoned a healthy worker.
+
+test('ONE interrupted observation on a LIVE task returns immediately, non-terminal, on the same taskId', async () => {
+  // THE regression the review demanded: a real disposed observer (or a broken wait seam)
+  // makes every observation answer `interrupted` at once. Re-issuing inside one call
+  // turned one `delegate_wait` into an unbounded burst of HTTP requests. The contract is
+  // now ONE observation, ONE answer.
+  let issued = 0;
+  const clock = fakeClock();
+  const call = async () => {
+    issued += 1;
+    if (issued > 1) throw new Error('an interrupted observation must not be re-issued in the same call');
+    return { ok: true, ...observation('interrupted', { task: summary({ state: 'running', endedAt: null }) }) };
+  };
+  const server = createMcpServer({ now: clock.now, sleep: clock.sleep, callExecution: call });
+  const { body, response } = await callWait(server, { taskId: 'task-wait-1', waitSeconds: 600 });
+
+  assert.equal(response.result.isError, undefined, 'an observer interruption is not an error of the call');
+  assert.equal(issued, 1, 'exactly ONE observation was issued');
+  assert.equal(body.metrics.observationRequests, 1);
+  assert.equal(body.metrics.waitReturns, 1);
+  assert.equal(body.metrics.interruptedObservations, 1);
+  assert.equal(body.metrics.heartbeatsConsumed, 0, 'an observer interruption is not a heartbeat');
+  // The task is LIVE: the answer says so, and does not pretend the run ended.
+  assert.equal(body.reason, 'interrupted', 'the wait reports the interruption itself');
+  assert.equal(body.terminal, false, 'a live task is not terminal');
+  assert.equal(body.state, 'running', 'the real task state is reported, never invented');
+  assert.equal(body.taskId, 'task-wait-1', 'the same task identity for the next wait');
+  assert.match(body.instruction, /was interrupted while the task was still running/u);
+  assert.match(body.instruction, /NOT stopped/u, 'the instruction must state that execution did not end');
+  assert.match(body.instruction, /same taskId/iu);
+  assert.doesNotMatch(body.instruction, /will not resume/u);
+  assert.equal(clock.elapsed(), 0, 'an interrupted answer must not busy-spin the clock');
+});
+
+test('a disposed observer cannot turn one call into a request storm', async () => {
+  // The same property at engine-dispose scale: the fake engine answers `interrupted`
+  // instantly and forever. With the fix the call returns after ONE request; the old
+  // code issued as many as the deadline allowed in a tight loop (the clock never moved,
+  // because an interrupted observation consumes no time).
+  let issued = 0;
+  const clock = fakeClock();
+  const call = async () => {
+    issued += 1;
+    if (issued > 50) throw new Error('the wait busy-looped on interrupted observations');
+    return { ok: true, ...observation('interrupted', { task: summary({ state: 'running', endedAt: null }) }) };
+  };
+  const server = createMcpServer({ now: clock.now, sleep: clock.sleep, callExecution: call });
+  const { body } = await callWait(server, { taskId: 'task-wait-1', waitSeconds: 3_600 });
+  assert.equal(issued, 1, `a one-hour wait must issue ONE observation, saw ${issued}`);
+  assert.equal(body.reason, 'interrupted');
+  assert.equal(body.terminal, false);
+});
+
+test('a real restart history (state interrupted) IS terminal and stops the wait', async () => {
+  // This is the record a restart leaves behind: the task is stored as `interrupted`.
+  // No observer can ever wake it, so re-waiting would spin forever. One observation,
+  // one terminal answer.
+  const { server, seen } = waitFixture([
+    observation('interrupted', {
+      task: summary({ state: 'interrupted', phase: 'execute', endedAt: 1_760_000_050_000, idleForMs: 0 }),
+    }),
+  ]);
+  const { body, response } = await callWait(server, { taskId: 'task-wait-1', waitSeconds: 3_600 });
+
+  assert.equal(response.result.isError, undefined);
+  assert.equal(body.reason, 'interrupted', 'the real history is reported as itself');
+  assert.equal(body.terminal, true, 'a restart history is terminal');
+  assert.equal(body.state, 'interrupted', 'the real recorded state is carried, never "running"');
+  assert.match(body.instruction, /will not resume/u, 'the wording says the RUN will not resume');
+  assert.match(body.instruction, /do not keep calling delegate_wait/u);
+  assert.equal(seen.length, 1, 'a terminal history must not be re-observed');
+  assert.equal(body.metrics.waitReturns, 1);
+});
+
+test('an interrupted observation carrying a COMPLETED task is reported as ready so review is never blocked', async () => {
+  // The review's case: a run that finished while its observer was cut off. Reporting it
+  // as an unrecoverable interruption would stop the host from ever reading the result.
+  const state = 'awaiting-host-review';
+  const { server } = waitFixture([
+    observation('interrupted', { task: summary({ state, phase: 'review', endedAt: 1_760_000_060_000 }) }),
+  ]);
+  const { body } = await callWait(server, { taskId: 'task-wait-1', waitSeconds: 600 });
+  assert.equal(body.reason, 'ready', `${state} is a completion, so the reason is ready`);
+  assert.equal(body.terminal, true);
+  assert.equal(body.state, state, 'the real state is carried');
+  assert.match(body.instruction, /awaiting host review/u);
+  assert.doesNotMatch(body.instruction, /will not resume/u, 'a completion is never described as unrecoverable');
+});
+
+test('an interrupted observation carrying a failed or cancelled task is reported at its real outcome', async () => {
+  for (const state of ['failed', 'cancelled']) {
+    const { server } = waitFixture([
+      observation('interrupted', { task: summary({ state, endedAt: 1_760_000_070_000 }) }),
+    ]);
+    const { body } = await callWait(server, { taskId: 'task-wait-1', waitSeconds: 600 });
+    assert.equal(body.reason, state, `${state} must be reported as ${state}`);
+    assert.equal(body.terminal, true);
+    assert.equal(body.state, state);
+  }
+});
+
+test('an UNKNOWN state is never assumed to be a restart history', async () => {
+  // A newer harness may report a state this build does not know. Guessing "finished"
+  // would abandon a running task; guessing "running" would invent a fact. The answer
+  // asserts neither, and it is not terminal.
+  const { server } = waitFixture([
+    observation('interrupted', { task: summary({ state: 'some-future-state', endedAt: null }) }),
+  ]);
+  const { body } = await callWait(server, { taskId: 'task-wait-1', waitSeconds: 600 });
+  assert.equal(body.reason, 'interrupted');
+  assert.equal(body.terminal, false, 'an unrecognized state is not a finish');
+  assert.equal(body.state, 'some-future-state', 'the reported state is carried verbatim');
+  assert.match(body.instruction, /could not be confirmed as settled/u);
+  assert.doesNotMatch(body.instruction, /will not resume/u);
+  assert.doesNotMatch(body.instruction, /was interrupted while the task was still running/u, 'no live-run claim either');
+  assert.equal(body.metrics.observationRequests, 1);
+});
+
+test('an interrupted observation with NO task record asserts neither an end nor a live run', async () => {
+  const { server, seen } = waitFixture([observation('interrupted', { task: null })]);
+  const { body } = await callWait(server, { taskId: 'task-wait-1', waitSeconds: 600 });
+  assert.equal(body.taskId, 'task-wait-1', 'the requested identity is kept even without a record');
+  assert.equal(body.state, null, 'no state is invented');
+  assert.equal(body.reason, 'interrupted');
+  assert.equal(body.terminal, false, 'an unreadable record is not a finished task');
+  assert.match(body.instruction, /could not be confirmed as settled/u);
+  assert.equal(seen.length, 1, 'one observation, one answer');
+  assert.equal(body.metrics.waitReturns, 1);
+});
+
+test('the interruption decision is pinned at the unit level', () => {
+  // The single function every path above goes through.
+  const resolve = (task) => resolveInterruption({ task });
+
+  // Live: interrupted, non-terminal, real state.
+  assert.deepEqual(resolve({ state: 'running', endedAt: null }), { reason: 'interrupted', terminal: false, state: 'running', kind: 'observation' });
+  assert.deepEqual(resolve({ state: 'pending' }), { reason: 'interrupted', terminal: false, state: 'pending', kind: 'observation' });
+  assert.equal(classifyInterruption({ state: 'running', endedAt: null }), INTERRUPTION_KINDS.observation);
+  assert.equal(classifyInterruption({ state: 'pending', endedAt: null }), INTERRUPTION_KINDS.observation);
+
+  // The only unrecoverable interruption.
+  assert.equal(classifyInterruption({ state: 'interrupted' }), INTERRUPTION_KINDS.history);
+  assert.deepEqual(resolve({ state: 'interrupted' }), { reason: 'interrupted', terminal: true, state: 'interrupted', kind: 'history' });
+
+  // Settled outcomes are reported as themselves, never as an interruption.
+  assert.deepEqual(resolve({ state: 'awaiting-host-review' }), { reason: 'ready', terminal: true, state: 'awaiting-host-review', kind: 'history' });
+  assert.deepEqual(resolve({ state: 'failed' }), { reason: 'failed', terminal: true, state: 'failed', kind: 'history' });
+  assert.deepEqual(resolve({ state: 'cancelled' }), { reason: 'cancelled', terminal: true, state: 'cancelled', kind: 'history' });
+
+  // Unknown is unknown: neither terminal, nor a live claim.
+  assert.equal(classifyInterruption({ state: 'future' }), INTERRUPTION_KINDS.unknown);
+  assert.equal(classifyInterruption({}), INTERRUPTION_KINDS.unknown);
+  assert.equal(classifyInterruption(undefined), INTERRUPTION_KINDS.unknown);
+  assert.equal(classifyInterruption(null), INTERRUPTION_KINDS.unknown);
+  assert.deepEqual(resolve(null), { reason: 'interrupted', terminal: false, state: null, kind: 'unknown' });
+  assert.deepEqual(resolve({ state: null }), { reason: 'interrupted', terminal: false, state: null, kind: 'unknown' });
+  assert.equal(classifyInterruption({ state: 'future', endedAt: 5 }), INTERRUPTION_KINDS.unknown,
+    'an unknown state with an end time is still unknown');
+
+  // A live state that ALSO carries an end time contradicts itself: neither "running"
+  // nor a known finish. Reporting it as terminal would claim an outcome the record does
+  // not state, and reporting it as running would ignore the end time, so it is unknown
+  // and the host is told to check — never to stop, never to keep waiting blindly.
+  assert.equal(classifyInterruption({ state: 'running', endedAt: 5 }), INTERRUPTION_KINDS.unknown);
+  assert.deepEqual(resolve({ state: 'running', endedAt: 5 }), {
+    reason: 'interrupted', terminal: false, state: 'running', kind: 'unknown',
+  });
+  assert.equal(classifyInterruption({ state: 'pending', endedAt: 5 }), INTERRUPTION_KINDS.unknown);
+});
+
+test('a settled reason never invents a state the engine cannot have', async () => {
+  // `ready` is a REVIEW outcome; the task state is `awaiting-host-review`. Publishing
+  // `state: "ready"` would be a state the engine never writes.
+  const { server } = waitFixture([observation('ready', { task: summary({ state: 'awaiting-host-review' }) })]);
+  const { body } = await callWait(server, { taskId: 'task-wait-1', waitSeconds: 60 });
+  assert.equal(body.reason, 'ready');
+  assert.equal(body.state, 'awaiting-host-review');
+  assert.notEqual(body.state, 'ready');
+
+  // With no task record at all, the state is null rather than the reason's name.
+  const bare = waitFixture([observation('ready', { task: null })]);
+  const bareBody = (await callWait(bare.server, { taskId: 'task-wait-1', waitSeconds: 60 })).body;
+  assert.equal(bareBody.reason, 'ready');
+  assert.equal(bareBody.state, null, 'no state is invented from the reason');
+  // ...while failed/cancelled ARE task states and may supply their own name.
+  const failedBare = waitFixture([observation('failed', { task: null })]);
+  const failedBody = (await callWait(failedBare.server, { taskId: 'task-wait-1', waitSeconds: 60 })).body;
+  assert.equal(failedBody.state, 'failed');
 });
 
 // ---------------------------------------------------------------------------
@@ -518,6 +790,57 @@ test('a wait that could not reach the harness reports its own code and no task s
 // ---------------------------------------------------------------------------
 // 7. Cancellation: one wait, not every wait
 // ---------------------------------------------------------------------------
+
+test('cancelling the wait releases only this listener, never the task', async () => {
+  // The distinction the acceptance run needed: a host that gives up waiting (a
+  // `notifications/cancelled`, a page reload, a dropped MCP connection) ends its own
+  // observation and NOTHING else. The wait answers with a cancellation refusal; the
+  // task keeps running, no `delegate_cancel` is issued, and a later wait on the same
+  // taskId still observes it normally.
+  const observations = [];
+  const cancels = [];
+  // Stands in for the observing engine's own `observe()` promise. It settles when the
+  // engine's waiter is ABORTED — which is what a dropped HTTP request does server-side
+  // (the route aborts the engine's signal and answers nothing) — never because the
+  // host's MCP request was abandoned. A fake that cannot be aborted is what made an
+  // earlier version of this test wait forever.
+  const engineWaiters = new Set();
+  const clock = stillClock();
+  const server = createMcpServer({
+    now: clock.now,
+    sleep: clock.sleep,
+    async callExecution(route, payload, context) {
+      observations.push({ route, taskId: payload.taskId });
+      if (route === 'cancel') {
+        cancels.push(payload.taskId);
+        return { ok: true, task: { taskId: payload.taskId, state: 'cancelled' } };
+      }
+      await new Promise((resolvePromise) => {
+        engineWaiters.add(resolvePromise);
+        context.signal.addEventListener('abort', () => resolvePromise(), { once: true });
+        if (context.signal.aborted) resolvePromise();
+      });
+      return { ok: true, ...observation('heartbeat') };
+    },
+  });
+  await server.handle({ jsonrpc: '2.0', id: 1, method: 'initialize', params: {} });
+  const controller = new AbortController();
+  const pendingWait = server.handle(
+    { jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'delegate_wait', arguments: { taskId: 'task-live', waitSeconds: 3_600 } } },
+    { signal: controller.signal },
+  );
+  // Let the observation register, then drop the listener the way a host does.
+  await new Promise((resolvePromise) => { setTimeout(resolvePromise, 20); });
+  controller.abort();
+  for (const release of engineWaiters) release();
+  const response = await pendingWait;
+  assert.equal(response.result.isError, true, 'the released wait is a refusal, not a verdict about the task');
+  const body = JSON.parse(response.result.content[0].text);
+  assert.equal(body.error.code, 'MCP_REQUEST_CANCELLED');
+  assert.equal(body.reason, undefined, 'a released wait never reports a task reason');
+  assert.deepEqual(cancels, [], 'releasing a listener must never cancel the task');
+  assert.deepEqual(observations.map((entry) => entry.route), ['observe'], 'nothing but the observation was issued');
+});
 
 test('cancelling one wait aborts only that observation, and another wait keeps running', async () => {
   // Two waits on two tasks are in flight at once, as they are in a real host. The
@@ -885,3 +1208,34 @@ test('compactTask keeps identity and activity and drops evidence', () => {
     assert.equal(forbidden in compact, false, `a wait summary must not carry ${forbidden}`);
   }
 });
+test('a contradictory live-with-endedAt record is reported as unknown, never as a finish', async () => {
+  // The review's cross-check: `classifyInterruption` must not call this a history (which
+  // would be `terminal: true`) while the agent rule only stops on `state: "interrupted"`.
+  // It is an unknown record, so the answer is non-terminal and the instruction tells the
+  // host to verify instead of assuming either outcome.
+  const { server, seen } = waitFixture([
+    observation('interrupted', { task: summary({ state: 'running', endedAt: 1_760_000_080_000 }) }),
+  ]);
+  const { body } = await callWait(server, { taskId: 'task-wait-1', waitSeconds: 600 });
+  assert.equal(body.reason, 'interrupted');
+  assert.equal(body.terminal, false, 'a contradictory record must not claim an end');
+  assert.equal(body.state, 'running', 'the reported state is carried as published');
+  assert.match(body.instruction, /could not be confirmed as settled/u);
+  assert.doesNotMatch(body.instruction, /will not resume/u, 'not a known restart history');
+  assert.doesNotMatch(body.instruction, /was interrupted while the task was still running/u,
+    'and not asserted to be running either');
+  assert.equal(seen.length, 1, 'one observation, one answer');
+});
+
+test('a settled state reached while the observer was interrupted still reaches review', async () => {
+  // The other half of the cross-check: a KNOWN settled state maps to its real outcome, so
+  // a completed run is never hidden behind an interruption.
+  const { server } = waitFixture([
+    observation('interrupted', { task: summary({ state: 'awaiting-host-review', endedAt: 1_760_000_090_000 }) }),
+  ]);
+  const { body } = await callWait(server, { taskId: 'task-wait-1', waitSeconds: 600 });
+  assert.equal(body.reason, 'ready');
+  assert.equal(body.terminal, true);
+  assert.equal(body.state, 'awaiting-host-review');
+});
+

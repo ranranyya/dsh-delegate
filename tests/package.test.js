@@ -53,15 +53,14 @@ const SUPPORTED_DSH_RANGE = SUPPORTED_DSH_VERSIONS.join(' || ');
  * The package version this build must declare everywhere a human writes it.
  *
  * Pinned rather than derived: `MANIFEST.version` is one of the places checked below,
- * so asserting itself would pass for any value. `1.1.0` is the silent-waiting release:
- * it adds the global `monitoring` thresholds (self-check and attention intervals),
- * bounded activity metadata on every task view, the authenticated monitoring settings
- * route and its Chinese controls, the task panel's bounded auto-refresh, the Codex
- * companion's submit → `delegate_wait` rules with an explicit no-local-implementation
- * boundary, and the managed MCP entry's owned `tool_timeout_sec` so one default
- * 60-minute wait can complete. It follows the `1.0.0` per-call permission release.
+ * so asserting itself would pass for any value. `1.2.0` is the correction release on
+ * top of the `1.1.0` silent-waiting feature release: an interrupted OBSERVATION is no
+ * longer reported as an ended execution, an independent local control binary
+ * (`dsh-delegate-control`) talks to the same loopback plane, and plugin startup now
+ * upgrades an already installed managed Codex MCP entry that is merely stale. It
+ * follows the `1.1.0` release.
  */
-const DELIVERABLE_VERSION = '1.1.0';
+const DELIVERABLE_VERSION = '1.2.0';
 
 /**
  * The published build this release upgrades *from*.
@@ -70,7 +69,7 @@ const DELIVERABLE_VERSION = '1.1.0';
  * current version must be exactly one MINOR above this baseline (a feature release),
  * and the two are different versions by construction.
  */
-const PREVIOUS_VERSION = '1.0.0';
+const PREVIOUS_VERSION = '1.1.0';
 
 // Published prior builds are retained only where the migration/ownership contract
 // names them. Other operator-facing and shipped code must not carry stale versions.
@@ -86,8 +85,7 @@ const HISTORICAL_VERSION_PATHS = new Set([
  * A published build may only be named next to a historical-contract document when its
  * bytes are still recognized by the migrator; otherwise the mention is a stale label.
  */
-const MIGRATABLE_AGENT_VERSIONS = ['0.1.6', '0.1.7', '0.1.8', '0.1.9', '0.1.10', '0.1.11', '0.1.12', '0.1.13', '0.1.14'];
-
+const MIGRATABLE_AGENT_VERSIONS = ['0.1.6', '0.1.7', '0.1.8', '0.1.9', '0.1.10', '0.1.11', '0.1.12', '0.1.13', '0.1.14', '1.0.0', '1.1.0'];
 /** A semver value: `MAJOR.MINOR.PATCH` with an optional prerelease suffix. */
 const SEMVER = /^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)(?:-[0-9A-Za-z.-]+)?$/u;
 
@@ -351,6 +349,7 @@ test('the stdio MCP executable is declared as a bin and points at a real script'
   assert.deepEqual(MANIFEST.bin, {
     'dsh-delegate-mcp': 'bin/dsh-delegate-mcp.js',
     'dsh-delegate-codex-agent': 'bin/dsh-delegate-codex-agent.js',
+    'dsh-delegate-control': 'bin/dsh-delegate-control.js',
   });
   const binPath = MANIFEST.bin['dsh-delegate-mcp'];
   assert.ok(existsSync(join(ROOT, binPath)), 'the bin target must exist');
@@ -360,6 +359,17 @@ test('the stdio MCP executable is declared as a bin and points at a real script'
   const codexBinPath = MANIFEST.bin['dsh-delegate-codex-agent'];
   assert.ok(existsSync(join(ROOT, codexBinPath)), 'the Codex companion bin target must exist');
   assert.ok(PACKED.includes(codexBinPath), 'the Codex companion bin target must be published');
+
+  // The independent control channel (1.2.0). It exists so an operator can query and
+  // stop ONE task while a host blocks the MCP connection on a long wait; it is
+  // published as its own bin, next to the MCP script it talks to the same plane as.
+  const controlBinPath = MANIFEST.bin['dsh-delegate-control'];
+  assert.ok(existsSync(join(ROOT, controlBinPath)), 'the control bin target must exist');
+  assert.ok(PACKED.includes(controlBinPath), 'the control bin target must be published');
+  const controlSource = readFileSync(join(ROOT, controlBinPath), 'utf8');
+  assert.match(controlSource, /^#!\/usr\/bin\/env node/u, 'a bin needs a shebang');
+  assert.match(controlSource, /CONTROL_ACTIONS = Object\.freeze\(\['status', 'cancel'\]\)/u,
+    'the control channel has exactly two verbs');
   assert.ok(PACKED.includes('codex/dsh-delegate.toml'), 'the custom-agent template must be published');
   const codexAgent = readFileSync(join(ROOT, 'codex/dsh-delegate.toml'), 'utf8');
   assert.match(codexAgent, /^name = "dsh-delegate"$/mu);
@@ -582,7 +592,7 @@ test('the release metadata is one version everywhere it is written by hand', () 
   }
 });
 
-test(`the release is ${DELIVERABLE_VERSION}, the first formal major release after ${PREVIOUS_VERSION}`, () => {
+test(`the release is ${DELIVERABLE_VERSION}, the correction release after ${PREVIOUS_VERSION}`, () => {
   // Pinned, not derived: the worker permission build is a new release, and a
   // manifest that still advertised the previous version would label that build as
   // current. `package.json`, the lockfile (both fields), the agent template and the
@@ -800,11 +810,15 @@ test('the packed size stays bounded and contains no single-file outlier', () => 
   let total = 0;
   for (const path of PACKED) total += statSync(join(ROOT, path)).size;
   // The archive is source plus one built bundle; a sudden multi-megabyte entry
-  // means a bundle, a lockfile or a fixture slipped in.
-  assert.ok(total < 2_000_000, `unpacked size grew unexpectedly: ${total} bytes`);
+  // means a bundle, a lockfile or a fixture slipped in. The bound tracks the real
+  // contents (the generated `lib/client.js` dominates it) rather than a round number,
+  // so a NEW multi-hundred-kilobyte file still fails loudly.
+  assert.ok(total < 2_500_000, `unpacked size grew unexpectedly: ${total} bytes`);
   const largest = PACKED.map((path) => ({ path, size: statSync(join(ROOT, path)).size }))
     .sort((left, right) => right.size - left.size)[0];
   assert.ok(largest.size < 500_000, `unexpectedly large packed file: ${largest.path}`);
+  assert.ok(['lib/client.js', 'src/jobs/engine.js'].includes(largest.path),
+    `the largest file must be one of the two known big sources, saw ${largest.path}`);
 });
 
 // ---------------------------------------------------------------------------

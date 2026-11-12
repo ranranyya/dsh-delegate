@@ -69,6 +69,7 @@ import {
   boundedText,
   changedFiles,
   clone,
+  codexMcpDriftText,
   codexTargetView,
   createApi,
   createStore,
@@ -2133,8 +2134,10 @@ function CodexPanel({ store, snapshot }) {
         <span className="dshdg-mono">agents/dsh-delegate.toml</span>
         {' 装进 Codex 目录，并在 Codex 的 '}
         <span className="dshdg-mono">config.toml</span>
-        {' 里登记本插件的 stdio MCP 服务（delegate_status / delegate_submit / delegate_result / delegate_cancel）。'
-          + '只有你点击才会写文件：打开本页或安装插件都不会改动 Codex。'}
+        {' 里登记本插件的 stdio MCP 服务（delegate_status / delegate_submit / delegate_result / delegate_wait / delegate_cancel）。'
+          + '首次安装只会由你点击触发：打开本页、安装或升级本插件都不会自动创建子智能体文件或 MCP 条目。'
+          + '已经安装过的情况下，插件下次启动会把本插件自己写入的过期托管条目就地更新（例如补上 tool_timeout_sec）；'
+          + '它不会改写非托管、被你改过的条目，也不会触碰 Codex 的其他设置。下面会显示当前条目缺了什么。'}
       </p>
       {error === null ? null : <p className="dshdg-fail">{error}</p>}
       {codex === null ? (
@@ -2151,6 +2154,13 @@ function CodexPanel({ store, snapshot }) {
             <CodexTargetRow view={mcpView} />
             <CodexTargetRow view={switchView} />
           </div>
+          {codex.mcp?.state === 'outdated' ? (
+            <p className="dshdg-hint" data-dshdg-codex-drift="">
+              {'这个托管 MCP 条目已经过期：'}
+              {codexMcpDriftText(codex.mcp)}
+              {'。插件下次启动会自动在原地更新；也可以点上面的「安装 / 更新 Codex 集成」。'}
+            </p>
+          ) : null}
           {notes.length === 0 ? null : (
             <ul className="dshdg-hint">
               {notes.map((note) => <li key={note.code}>{note.text}</li>)}

@@ -113,11 +113,13 @@ export const ENDPOINT_RETRY_BUDGET_MS = 30_000;
  * are retried, and only for the observation route: an ordinary tool call keeps its
  * single attempt, because repeating a submission is not a safe thing to do.
  * @param {object} config - value from {@link readConfig}.
- * @param {object} [options] - `sleep` (injectable for tests), `now`.
+ * @param {object} [options] - `sleep` (injectable for tests), `now`, `fetch` (injectable
+ *   transport, for tests and for a caller that owns its own HTTP stack).
  * @returns {(route: string, payload: object, context?: { signal?: AbortSignal }) => Promise<object>} call function.
  */
 export function createExecutionClient(config, options = {}) {
   const sleep = options.sleep ?? ((ms) => new Promise((resolvePromise) => { setTimeout(resolvePromise, ms); }));
+  const fetchImpl = typeof options.fetch === 'function' ? options.fetch : null;
 
   /**
    * Perform one request, with the retry policy of its route.
@@ -178,7 +180,8 @@ export function createExecutionClient(config, options = {}) {
       : timeout;
     let response;
     try {
-      response = await fetch(`${baseUrl}${path}`, {
+      const doFetch = fetchImpl ?? fetch;
+      response = await doFetch(`${baseUrl}${path}`, {
         method,
         headers: {
           accept: 'application/json',

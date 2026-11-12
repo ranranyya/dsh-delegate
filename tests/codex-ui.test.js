@@ -227,7 +227,16 @@ test('the page states the reload requirement, the limits, and that it never enab
   assert.match(PAGE_SOURCE, /取决于 Codex 版本自身是否提供提及选择/u);
   assert.doesNotMatch(PAGE_SOURCE, /支持在输入框直接输入 @dsh-delegate/u, 'the old claim must be gone');
   assert.match(PAGE_SOURCE, /不会替你打开该开关/u);
-  assert.match(PAGE_SOURCE, /只有你点击才会写文件/u);
+  // The page states the truth about writes: the FIRST installation is only ever a click,
+  // and an already-installed managed entry is upgraded in place at the next startup. The
+  // old sentence ("only a click writes / installing the plugin never changes Codex")
+  // contradicted the startup upgrade and must be gone.
+  assert.match(PAGE_SOURCE, /首次安装只会由你点击触发/u);
+  assert.match(PAGE_SOURCE, /不会自动创建子智能体文件或 MCP 条目/u);
+  assert.match(PAGE_SOURCE, /插件下次启动会把本插件自己写入的过期托管条目就地更新/u);
+  assert.match(PAGE_SOURCE, /不会改写非托管、被你改过的条目/u);
+  assert.doesNotMatch(PAGE_SOURCE, /只有你点击才会写文件/u, 'the unconditional claim must be gone');
+  assert.doesNotMatch(PAGE_SOURCE, /打开本页或安装插件都不会改动 Codex/u, 'the contradicting claim must be gone');
   assert.match(PAGE_SOURCE, /没有本插件托管标记注释的同名 MCP 条目也视为你自己写的/u);
   // No button may flip the delegation switch from this panel.
   const panel = PAGE_SOURCE.slice(PAGE_SOURCE.indexOf('function CodexPanel'), PAGE_SOURCE.indexOf('// Root page'));

@@ -194,6 +194,35 @@ test('the shipped companion drives delegate_wait and never polls delegate_result
   assert.match(template, /`delegate_result` ONCE/u);
 });
 
+test('the shipped companion distinguishes an interrupted WAIT from an interrupted RUN, and names the control channel', () => {
+  // 1.2.0: the real acceptance defect was a host told that a healthy run had ended,
+  // and an operator who could not stop a task while the host blocked the connection.
+  const template = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'codex', 'dsh-delegate.toml'), 'utf8');
+  // The live case keeps waiting on the SAME task and forbids the other three reactions.
+  assert.match(template, /`interrupted`: the wait itself was cut off/u);
+  assert.match(template, /It does NOT mean the execution stopped/u);
+  assert.match(template, /never resubmit, never implement locally,\s+never cancel for\s+this reason/iu);
+  // ...and an UNKNOWN record is not a blanket "keep waiting": check one fact first.
+  assert.match(template, /do NOT assume it is still running and do NOT assume it\s+stopped/u);
+  assert.match(template, /FIRST check one fact with `delegate_result`/u);
+  assert.match(template, /Do not\s+re-wait indefinitely on a task you cannot classify/u);
+  // The terminal case is identified by the plugin's own fields, not by the word.
+  assert.match(template, /`terminal: true`/u);
+  assert.match(template, /`state: "interrupted"`/u);
+  assert.match(template, /do not\s+keep calling `delegate_wait` on it/u);
+  // The control channel: derived from this plugin's own MCP configuration, two verbs only.
+  assert.match(template, /WHEN THE HOST CANNOT SEND A SECOND CALL/u);
+  assert.match(template, /`dsh-delegate-control`/u);
+  assert.match(template, /status <taskId>/u);
+  assert.match(template, /cancel <taskId>/u);
+  assert.match(template, /NEXT TO this plugin's MCP\s+script/u);
+  assert.match(template, /never call an\s+unrelated script/u);
+  assert.match(template, /Neither can submit a task, change a setting/u);
+  // ...and only for an explicit operator request, with silence otherwise.
+  assert.match(template, /explicit operator request to inspect or stop that task/u);
+  assert.match(template, /Otherwise stay silent and keep\s+waiting/u);
+});
+
 test('the shipped companion forbids local implementation while a worker runs', () => {
   const template = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'codex', 'dsh-delegate.toml'), 'utf8');
   assert.match(template, /DO NOT IMPLEMENT LOCALLY WHILE A DELEGATED WORKER RUNS/u);

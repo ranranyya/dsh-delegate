@@ -1,24 +1,35 @@
 # Runtime compatibility
 
-This document states which DSH runtimes this plugin build (`1.1.0`, package
-`dsh-delegate-1.1.0.tgz`) may be loaded into, what changed in the newest one, and what
+This document states which DSH runtimes this plugin build (`1.2.0`, package
+`dsh-delegate-1.2.0.tgz`) may be loaded into, what changed in the newest one, and what
 has and has not been verified on it. It is a compatibility note, not an acceptance
 report; the package is distributed through the GitHub Release.
 
-`1.1.0` adds silent waiting: the global `monitoring` thresholds (self-check and attention
+`1.1.0` added silent waiting: the global `monitoring` thresholds (self-check and attention
 intervals), bounded activity metadata on every task view, the authenticated monitoring
 settings route and its Chinese controls, the task panel's bounded auto-refresh, the Codex
 companion's submit → `delegate_wait` rules, and the managed MCP entry's owned
-`tool_timeout_sec`. The supported runtime range below and the execution implementation are
-carried over unchanged from `1.0.0`; the DSH `0.2.2` compatibility described here was
-introduced by `0.1.12` and is historical fact for this build.
+`tool_timeout_sec`.
 
-**Not verified:** this build has not been installed on the production Desktop profile.
-The production Desktop profile must be upgraded to this build, and the Codex companion
-must be refreshed from the settings page and Codex reloaded before the new wait rules and
-the managed `tool_timeout_sec` take effect. The transport that returns `delegate_wait`
-results ships in the same release; until it is present the legacy `delegate_result` path
-still works. No unit-test count and no mock constitutes an acceptance run.
+`1.2.0` is a correction release on top of that behaviour, with no runtime-API change: an
+interrupted OBSERVATION is no longer reported as an ended execution, a new independent
+local control binary (`dsh-delegate-control status|cancel <taskId>`) talks to the same
+loopback plane, and plugin startup now upgrades an ALREADY INSTALLED managed
+`mcp_servers.dsh-delegate` entry that is merely stale. The supported runtime range below
+and the execution implementation are carried over unchanged from `1.0.0`; the DSH `0.2.2`
+compatibility described here was introduced by `0.1.12` and is historical fact for this
+build.
+
+**Not verified in a full Desktop upgrade:** the operator's formally installed Desktop
+profile is still on `1.1.0`, and `1.2.0` has not been installed into it. The complete
+Desktop upgrade/restart acceptance and the actual token-saving ratio have not been
+measured. The candidate MCP/CLI channel is exercised against the currently running plane
+before release; that acceptance evidence belongs in the Release notes and is not
+pre-filled here. The production profile must still be upgraded to this build, and the
+Codex companion refreshed from the settings page (or by the startup check, which now also
+upgrades the installed MCP entry) and Codex reloaded before the new wait rules and the
+managed `tool_timeout_sec` take effect. No unit-test count and no mock constitutes an
+acceptance run.
 
 ## 1. Supported versions
 
@@ -141,7 +152,7 @@ Rules that hold in **both** paths:
 
 **Verified natively (host-run fixtures, not the production Desktop profile).** The full
 `0.2.2-rc.1` base + web + delegate profile loads with no skipped bundles; a real stdio MCP
-`initialize` returns `1.0.0` with six tools and discovers the endpoint; `delegate_status`
+`initialize` returns that build's version with six tools and discovers the endpoint; `delegate_status`
 works and an `OFF` submit is refused with `DELEGATION_DISABLED`; the real native
 Workspace/Session controllers, Agent and AgentModel were used; the runner selected and
 read back its route and effort before prompt delivery, a follow-up reused the native
@@ -163,9 +174,11 @@ What remains genuinely unverified:
   services, but no worker command was run under it — the temp-directory and
   piped-stdio caveats below are properties of the native layer, not behaviours this task
   exercised end to end.
-- **No production DSH Desktop installation.** Installing this build into the operator's
-  real Desktop profile and running a real delegated turn there has **not** been done.
-  Nothing in this repository establishes that, and no end-to-end acceptance is claimed.
+- **No production DSH Desktop installation of this build.** The operator's formally
+  installed Desktop profile is still on `1.1.0`; installing `1.2.0` there and running a
+  real delegated turn on that upgraded profile has **not** been done. Nothing in this
+  repository establishes it, and no end-to-end acceptance of the upgraded Desktop profile
+  is claimed.
 - **`0.2.1-rc.3` was not re-validated here.** It stays declared as supported, but this
   task contains no independent native full-profile boot on that version.
 - **Windows temporary-directory caveat.** DSH's own Windows sandbox layer admits the
@@ -181,10 +194,10 @@ What remains genuinely unverified:
 
 ## 5. Upgrading from an older plugin build
 
-1. Download `dsh-delegate-1.0.0.tgz` from the GitHub Release, or build the package locally (`npm pack`).
+1. Download `dsh-delegate-1.2.0.tgz` from the GitHub Release, or build the package locally (`npm pack`).
 2. Install it the way your surface requires: the Desktop **Plugins manager** for a
    Desktop profile (npm/CLI operations on that profile are refused), or
-   `dsh plugin --profile <name> add ./dsh-delegate-1.0.0.tgz` for a CLI profile you
+   `dsh plugin --profile <name> add ./dsh-delegate-1.2.0.tgz` for a CLI profile you
    start yourself.
 3. The settings, the switch value and the task history are preserved
    (`$DSH_HOME/data/dsh-delegate`); nothing is migrated destructively.
@@ -203,3 +216,5 @@ What remains genuinely unverified:
 | Both lockfiles' root metadata match `package.json` | `tests/package.test.js` ("the lockfile pins the same dependency set…") |
 | This table matches the manifest, in both directions | `tests/package.test.js` ("the supported-version table is the one the manifest admits") |
 | A published `0.1.11` or `0.1.10` agent is refreshed, an edited one is not | `tests/codex-integration.test.js` |
+
+

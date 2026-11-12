@@ -84,13 +84,16 @@ export declare const ENDPOINT_RETRY_DELAYS_MS: readonly number[];
 export declare const ENDPOINT_RETRY_BUDGET_MS: number;
 
 /**
- * Injectable seams for tests. Production passes neither.
+ * Injectable seams for tests. Production passes none of them.
  *
  * `sleep` is used between endpoint retries; a test replaces it so a transient
- * disconnect can be exercised without actually waiting seconds.
+ * disconnect can be exercised without actually waiting seconds. `fetch` replaces the
+ * global transport for a caller that owns its own HTTP stack (and for a test that must
+ * not open a socket); the retry policy, timeout and refusal mapping are unchanged.
  */
 export interface ExecutionClientOptions {
   sleep?: (ms: number) => Promise<void>;
+  fetch?: (url: string, init: object) => Promise<{ ok: boolean, status: number, json: () => Promise<unknown> }>;
 }
 
 /**

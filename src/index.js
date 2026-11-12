@@ -230,7 +230,14 @@ export async function apply(ctx, config = {}) {
     authorizationMode: 'switch',
     // Startup only refreshes an agent file whose bytes match a shipped template.
     // Agent creation and MCP registration remain explicit settings-page actions.
-    codex: resolveCodexActionSeam({ version: PLUGIN_VERSION }),
+    codex: resolveCodexActionSeam({
+      version: PLUGIN_VERSION,
+      // The automatic upgrade's protected backup location, inside this activation's own
+      // data directory: never the package, never the Codex home, never a user home. The
+      // seam supplies it to a caller that does not pass one, so the unattended MCP write
+      // always has a place to keep the original bytes.
+      backupDir: join(dataDir, 'codex-config-backup'),
+    }),
     // The runner calls this only for worker jobs. Reviews intentionally use their
     // own read-only tool policy and are not put into a delegated worker sandbox.
     configureDelegatedSession,
@@ -252,15 +259,41 @@ export async function apply(ctx, config = {}) {
   };
 
   try {
-    const migration = await deps.codex?.refreshKnownAgent();
+    // Both halves of the installed-integration check: a byte-exact shipped agent is
+    // refreshed, and an ALREADY INSTALLED managed `mcp_servers.dsh-delegate` entry that
+    // is merely stale (for example one written before `tool_timeout_sec` existed) is
+    // upgraded in place. Nothing is created here — a home without an entry stays
+    // without one — and an entry this plugin cannot prove it wrote is refused and left
+    // byte-identical.
+    //
+    // The TARGET is the seam's own decision (`startupTarget`), not a second read of
+    // `process.env`: an explicit `CODEX_HOME`, else the home this plugin recorded from a
+    // successful install, else the default only when it is a real directory. A default
+    // that is a link is reported instead of walked, so the automatic upgrade never
+    // writes into a tree nobody named.
+    const target = await deps.codex?.startupTarget?.();
+    let migration = null;
+    if (target?.home) {
+      migration = await deps.codex?.refreshManagedIntegration({
+        startupTarget: target,
+        // The pre-write copy lives in the plugin's own data directory: supportable, not
+        // packaged, and never inside the Codex home.
+        backupDir: join(dataDir, 'codex-config-backup'),
+      });
+    } else if (target !== undefined && target !== null) {
+      logger?.info?.(`dsh-delegate: Codex integration check skipped (${target.reason})`);
+    }
     if (migration?.changed.includes('agent')) {
       logger?.info?.(`dsh-delegate: refreshed a managed Codex agent template to ${PLUGIN_VERSION}`);
     }
+    if (migration?.changed.includes('mcp')) {
+      logger?.info?.('dsh-delegate: upgraded a stale managed Codex MCP entry in place');
+    }
     for (const refusal of migration?.refused ?? []) {
-      logger?.warn?.(`dsh-delegate: Codex agent refresh was refused (${refusal.code})`);
+      logger?.warn?.(`dsh-delegate: Codex integration refresh was refused (${refusal.code})`);
     }
   } catch (error) {
-    logger?.warn?.(`dsh-delegate: Codex agent refresh check failed (${diagnostic(error?.message ?? error, 200)})`);
+    logger?.warn?.(`dsh-delegate: Codex integration refresh check failed (${diagnostic(error?.message ?? error, 200)})`);
   }
 
   /**
@@ -478,7 +511,7 @@ export async function apply(ctx, config = {}) {
 }
 
 /** Version reported by the runtime facts block. Mirrors `package.json`. */
-const PLUGIN_VERSION = '1.1.0';
+const PLUGIN_VERSION = '1.2.0';
 
 /**
  * Read the native approval service without turning absence into a throw.

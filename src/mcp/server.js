@@ -76,7 +76,7 @@ export const SUPPORTED_PROTOCOL_VERSIONS = Object.freeze([
 export const LATEST_PROTOCOL_VERSION = SUPPORTED_PROTOCOL_VERSIONS[0];
 
 /** Identifies this server in the handshake. */
-export const SERVER_INFO = Object.freeze({ name: 'dsh-delegate', version: '1.1.0' });
+export const SERVER_INFO = Object.freeze({ name: 'dsh-delegate', version: '1.2.0' });
 
 /** Bound on a tool result's text. A task view can be large; a model's context cannot. */
 export const MAX_TOOL_TEXT_CHARS = 20_000;
@@ -161,12 +161,30 @@ export class McpError extends Error {
  * `inputSchema` is deliberately closed (`additionalProperties: false`): a model
  * that invents a field gets a clear protocol error instead of a silently ignored
  * argument, and no tool can grow an undeclared parameter by accident.
+ *
+ * Every tool also carries MCP `annotations` (`readOnlyHint` / `destructiveHint` /
+ * `idempotentHint` / `openWorldHint`). They are an accurate DESCRIPTION of what each
+ * tool does — a read is marked read-only, cancelling is marked destructive and not
+ * idempotent — and they let a concurrency-aware client know that a long wait is a
+ * read and must not be treated as a mutating call that blocks the session. They are
+ * not the fix for a serialising host: a client that forwards one call at a time
+ * ignores every annotation, which is exactly why the independent
+ * `bin/dsh-delegate-control.js` channel exists. Nothing here claims that annotations
+ * make a serial client concurrent.
  */
 export const TOOLS = Object.freeze([
   Object.freeze({
     name: 'delegate_status',
     title: 'Delegation status',
     description: 'Report whether delegation is enabled in DSH for this local MCP connection.',
+    // A pure read of the plane's own posture: no task, no grant, no write.
+    annotations: Object.freeze({
+      title: 'Delegation status',
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    }),
     inputSchema: Object.freeze({
       type: 'object',
       properties: {},
@@ -189,6 +207,15 @@ export const TOOLS = Object.freeze([
       + 'location from '
       + 'the caller. An unknown, unfinished, removed or differently-sourced parent is refused rather than '
       + 'started as a new conversation.',
+    // It creates work, so it is not a read; it is not destructive of anything the
+    // operator already has, and repeating it creates ANOTHER task (never idempotent).
+    annotations: Object.freeze({
+      title: 'Submit delegated task',
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
+      openWorldHint: false,
+    }),
     inputSchema: Object.freeze({
       type: 'object',
       properties: {
@@ -232,6 +259,14 @@ export const TOOLS = Object.freeze([
     description: 'Read one task this connection submitted: state, effective provider/model/effort, '
       + 'changed-file summary, bounded diff, validation evidence and review outcome. '
       + 'A finished execution is not host acceptance.',
+    // A read of a stored task: no work is created, changed or cancelled.
+    annotations: Object.freeze({
+      title: 'Read task result',
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    }),
     inputSchema: Object.freeze({
       type: 'object',
       properties: {
@@ -256,7 +291,25 @@ export const TOOLS = Object.freeze([
       + 'diff or full result (use delegate_result for that, after an actionable reason). '
       + 'On `permission`, the returned `permission` block carries the pending request with its requestId, '
       + 'its exact fingerprint and the full existing redacted operation, so delegate_permission_decide can '
-      + 'be sent without another read.',
+      + 'be sent without another read. '
+      + '`interrupted` does NOT mean the execution stopped. This call answers it immediately, once: '
+      + 'when the task is still pending or running the answer is `reason: "interrupted"` with '
+      + '`terminal: false` and the real task state, and YOU wait again on the same taskId. '
+      + '`terminal: true` with `state: "interrupted"` means the task record itself is a restart history '
+      + 'and will not resume. If the reason carried a settled state it is reported as that outcome '
+      + '(`ready`/`failed`/`cancelled`). A missing or unrecognized state is reported as '
+      + '`terminal: false` with nothing asserted: check before deciding.',
+    // A LONG read, and that is the point: `readOnlyHint` is what tells a
+    // concurrency-aware client this call may be held for an hour without being a
+    // mutating operation. A serialising host still ignores it; the independent
+    // `dsh-delegate-control` channel is the answer there.
+    annotations: Object.freeze({
+      title: 'Wait for a task to need you',
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    }),
     inputSchema: Object.freeze({
       type: 'object',
       properties: {
@@ -277,6 +330,15 @@ export const TOOLS = Object.freeze([
     name: 'delegate_cancel',
     title: 'Cancel task',
     description: 'Ask the harness to stop one task this connection submitted, and return its state afterwards.',
+    // It stops running work: destructive of the run (never of the workspace), and a
+    // second call on an already-cancelled task changes nothing.
+    annotations: Object.freeze({
+      title: 'Cancel task',
+      readOnlyHint: false,
+      destructiveHint: true,
+      idempotentHint: true,
+      openWorldHint: false,
+    }),
     inputSchema: Object.freeze({
       type: 'object',
       properties: {
@@ -301,6 +363,16 @@ export const TOOLS = Object.freeze([
       + '`allow-once` REQUIRES the pending request\u2019s `fingerprint` and is refused when `permission.pending.'
       + 'completeness` is not `complete` (the operation was shortened by a bound, so an allow cannot be granted '
       + 'on it). `reject` needs neither and is therefore always available.',
+    // It does not read and it does not write a configuration: it settles ONE paused
+    // call. A repeated decision for the same request is refused, so it is not
+    // idempotent — the second call is a different outcome by design.
+    annotations: Object.freeze({
+      title: 'Decide a paused permission request',
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
+      openWorldHint: false,
+    }),
     inputSchema: Object.freeze({
       type: 'object',
       properties: {
@@ -334,6 +406,14 @@ export const TOOLS = Object.freeze([
       + '(worktree / shared / block) with a stable reason code. '
       + 'It creates no commit, stash, worktree or task and changes no setting; '
       + 'passing allowShared acknowledges a dirty workspace but does not dispatch anything.',
+    // A read-only measurement of a directory: nothing is created or changed.
+    annotations: Object.freeze({
+      title: 'Inspect workspace before dispatch',
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    }),
     inputSchema: Object.freeze({
       type: 'object',
       properties: {
@@ -1475,7 +1555,14 @@ export function createMcpServer(options) {
               + 'never a standing grant, and cannot approve anything else. To follow a task without polling, use '
               + 'delegate_wait: one call blocks until the task needs you (permission, ready, failed, cancelled, '
               + 'interrupted) or until its deadline, in which case it answers reason "wait-limit" and you call '
-              + 'it again with the same taskId instead of reviewing or resubmitting anything.',
+              + 'it again with the same taskId instead of reviewing or resubmitting anything. '
+              + '`interrupted` never means the execution stopped by itself: this call returns it at once '
+              + 'with `terminal: false` while the task is still pending or running (wait again on the same '
+              + 'taskId); only a task record that is itself interrupted (a restart history) is `terminal: true`. '
+              + 'If a host serialises tool calls so that this '
+              + 'connection is blocked by a long wait, the independently installed `dsh-delegate-control` '
+              + 'binary can report or cancel one task from a separate process; it cannot submit, configure or '
+              + 'change the switch.',
           });
         }
         case 'notifications/initialized':
