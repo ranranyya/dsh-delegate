@@ -793,6 +793,65 @@ test('repeating an observe is the only route that retries, and a transient failu
   }
 });
 
+test('a caller may opt its own observe call out of the retry, and the default is unchanged', async () => {
+  // The control CLI is one short command: it cannot spend the 1 s/2 s/5 s backoff, and it
+  // must not leave a request running after it answered. `{ retry: false }` is that opt-out.
+  // It is per CALL, so the MCP wait's own retry policy — the thing that lets a wait follow
+  // a DSH restart — stays exactly as it was.
+  const original = globalThis.fetch;
+  const attempts = [];
+  globalThis.fetch = async () => {
+    attempts.push('call');
+    throw Object.assign(new TypeError('fetch failed'), { name: 'TypeError' });
+  };
+  const sleeps = [];
+  try {
+    const client = createExecutionClient(
+      { baseUrl: 'http://127.0.0.1:3210', discoveryFile: 'unused', timeoutMs: 5_000 },
+      { sleep: async (ms) => { sleeps.push(ms); } },
+    );
+    // 1. Opted out: exactly ONE attempt, no backoff, and the same compact refusal.
+    await assert.rejects(
+      () => client('observe', { taskId: 't1', waitMs: 1 }, { retry: false }),
+      (error) => {
+        assert.equal(error.code, 'MCP_HARNESS_UNREACHABLE');
+        return true;
+      },
+    );
+    assert.equal(attempts.length, 1, 'an opted-out call must make exactly one attempt');
+    assert.deepEqual(sleeps, [], 'an opted-out call must not sleep out a backoff');
+  } finally {
+    globalThis.fetch = original;
+  }
+
+  // 2. Any other context value, including no retry field at all, keeps the documented
+  //    schedule: the MCP server never opts out, so this is the policy it still gets.
+  const defaultOriginal = globalThis.fetch;
+  const defaultAttempts = [];
+  globalThis.fetch = async () => {
+    defaultAttempts.push('call');
+    throw Object.assign(new TypeError('fetch failed'), { name: 'TypeError' });
+  };
+  const defaultSleeps = [];
+  try {
+    const client = createExecutionClient(
+      { baseUrl: 'http://127.0.0.1:3210', discoveryFile: 'unused', timeoutMs: 5_000 },
+      { sleep: async (ms) => { defaultSleeps.push(ms); } },
+    );
+    for (const context of [undefined, {}, { retry: true }]) {
+      defaultAttempts.length = 0;
+      defaultSleeps.length = 0;
+      await assert.rejects(() => client('observe', { taskId: 't1', waitMs: 25_000 }, context),
+        (error) => error.code === 'MCP_HARNESS_UNREACHABLE');
+      assert.equal(defaultAttempts.length, 4,
+        `context ${JSON.stringify(context)} must keep one attempt plus one per delay`);
+      assert.deepEqual(defaultSleeps, [1_000, 2_000, 5_000], 'the documented backoff schedule stays');
+    }
+  } finally {
+    globalThis.fetch = defaultOriginal;
+  }
+});
+
 test('the client forwards the caller signal, and a cancelled request refuses locally', async () => {
   const controller = new AbortController();
   let sawSignal = null;

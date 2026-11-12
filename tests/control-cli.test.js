@@ -13,7 +13,10 @@
 //   * a REAL stdio MCP server with a long wait outstanding, while the control
 //     command queries and cancels the same task through a real HTTP plane. That is
 //     the property a serialising host cannot provide and this channel exists for.
-//     No model is involved: the execution is a scripted fake behind the plane.
+//     Serving that task is a real `JobEngine` over a real temporary workspace with its
+//     own real `TaskMonitor`, behind the real `createExecutionHandler`; only the native
+//     services every engine test fakes are faked here, and no model is contacted. The
+//     task stays `running` because its prompt never finishes, not because a flag says so.
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -21,6 +24,7 @@ import { createServer } from 'node:http';
 import { Readable, Writable } from 'node:stream';
 import { spawn, spawnSync } from 'node:child_process';
 import { closeSync, existsSync, mkdtempSync, openSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdir, realpath } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -29,6 +33,7 @@ import {
   CONTROL_ACTIONS,
   CONTROL_TIMEOUT_MS,
   EXIT,
+  STATUS_WAIT_MS,
   compactControlTask,
   main,
   parseControlArgs,
@@ -36,9 +41,24 @@ import {
   runControl,
 } from '../bin/dsh-delegate-control.js';
 import { createExecutionClient } from '../bin/dsh-delegate-mcp.js';
-import { createExecutionHandler, EXECUTION_PREFIX, MAX_OBSERVE_WAIT_MS } from '../src/http/execution-plane.js';
+import { createExecutionHandler, EXECUTION_PREFIX } from '../src/http/execution-plane.js';
 import { readRuntimeEndpoint, publishRuntimeEndpoint } from '../src/runtime/endpoint-discovery.js';
 import { createMcpServer, serveStdio } from '../src/mcp/server.js';
+import { AuthorizationRegistry } from '../src/auth/grants.js';
+import { JobEngine } from '../src/jobs/engine.js';
+import { SettingsService } from '../src/config/settings.js';
+import { WorkspaceLocks } from '../src/workspace/locks.js';
+import {
+  cleanup,
+  fakeAgents,
+  fakeLlm,
+  fakeSessionController,
+  fakeWorkspaceController,
+  llmTable,
+  makeTempDir,
+  nativePolicyServices,
+  validSettings,
+} from './helpers/fakes.js';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const CONTROL_BIN = join(ROOT, 'bin', 'dsh-delegate-control.js');
@@ -65,8 +85,8 @@ function captureIo() {
  */
 function mockClient(answers, options = {}) {
   const seen = options.seen ?? [];
-  const call = async (route, payload) => {
-    seen.push({ route, payload });
+  const call = async (route, payload, context) => {
+    seen.push({ route, payload, context });
     if (options.fail !== undefined) throw options.fail;
     const answer = answers[route];
     if (answer === undefined) throw Object.assign(new Error(`no answer for ${route}`), { code: 'UNEXPECTED_ROUTE' });
@@ -122,7 +142,7 @@ test('a refused command line exits 2 and prints only a JSON refusal', async () =
 // 2. status: one bounded read, one compact answer
 // ---------------------------------------------------------------------------
 
-test('status issues ONE bounded observation with waitMs 0 and prints a compact state', async () => {
+test('status issues ONE bounded observation with the smallest positive wait and prints a compact state', async () => {
   const { call, seen } = mockClient({
     observe: () => ({
       ok: true,
@@ -144,14 +164,22 @@ test('status issues ONE bounded observation with waitMs 0 and prints a compact s
         conversation: [{ role: 'user', text: 'transcript' }],
       },
       permission: null,
-      wait: { waitMs: 0, waitedMs: 0, activitySinceWait: false },
+      wait: { waitMs: STATUS_WAIT_MS, waitedMs: 0, activitySinceWait: false },
     }),
   });
   const outcome = await runControl(['status', 'task-1'], { callExecution: call });
 
   assert.equal(outcome.exitCode, EXIT.ok);
   assert.deepEqual(seen.map((entry) => entry.route), ['observe'], 'status must read through the observe route');
-  assert.deepEqual(seen[0].payload, { taskId: 'task-1', waitMs: 0 }, 'a zero bound is what makes it a status read');
+  // ZERO would be read by the engine and the monitor as "no bound requested" and
+  // replaced with their 25-second default; the smallest POSITIVE wait is what makes
+  // this a current-state read rather than a long poll.
+  assert.deepEqual(seen[0].payload, { taskId: 'task-1', waitMs: 1 }, 'status asks for the smallest positive bounded wait');
+  assert.equal(STATUS_WAIT_MS, 1);
+  assert.equal(seen[0].payload.waitMs > 0, true, 'a non-positive wait is replaced by the 25 s default downstream');
+  // No observer retry for this call, and the caller's own signal is handed down.
+  assert.equal(seen[0].context?.retry, false, 'the observation retry must be disabled for one control command');
+  assert.equal(typeof seen[0].context?.signal?.aborted, 'boolean', 'the whole-command budget reaches the client');
   assert.equal(outcome.output.ok, true);
   assert.equal(outcome.output.action, 'status');
   assert.equal(outcome.output.taskId, 'task-1');
@@ -188,7 +216,8 @@ test('cancel stops exactly the named task and reports its state', async () => {
   });
   const outcome = await runControl(['cancel', 'task-2'], { callExecution: call });
   assert.equal(outcome.exitCode, EXIT.ok);
-  assert.deepEqual(seen, [{ route: 'cancel', payload: { taskId: 'task-2' } }], 'one cancel, one task id');
+  assert.deepEqual(seen.map((entry) => [entry.route, entry.payload]), [['cancel', { taskId: 'task-2' }]],
+    'one cancel, one task id');
   assert.equal(outcome.output.state, 'cancelled');
   assert.equal(outcome.output.task.cancelledBy, 'connection');
 });
@@ -196,6 +225,123 @@ test('cancel stops exactly the named task and reports its state', async () => {
 // ---------------------------------------------------------------------------
 // 3. Refusals and the request bound
 // ---------------------------------------------------------------------------
+
+test('one whole-command budget bounds the call: a request that outlives it is a bounded timeout', async () => {
+  // The defect this replaces: the 10 s figures were only a per-request timeout, so a
+  // request the plane kept open longer (the 25 s a zero wait produced) was answered by
+  // the CLI itself only after the operator had given up. The budget is now one caller
+  // signal, and the answer is bounded JSON with its own code.
+  const seen = [];
+  const stuck = async (route, payload, context) => {
+    seen.push({ route, payload, context });
+    // A real client composes this signal with its own timeout and stops when it aborts;
+    // a seam that ignores it must still not extend the command past the budget.
+    await new Promise((resolvePromise) => {
+      if (context?.signal?.aborted === true) { resolvePromise(); return; }
+      context?.signal?.addEventListener?.('abort', resolvePromise, { once: true });
+      setTimeout(resolvePromise, 60_000).unref?.();
+    });
+    const error = new Error('the request was cancelled by the host');
+    error.code = 'MCP_REQUEST_CANCELLED';
+    throw error;
+  };
+  const started = Date.now();
+  const outcome = await runControl(['status', 'task-1'], {
+    callExecution: stuck,
+    config: { baseUrl: 'http://127.0.0.1:3210', discoveryFile: 'unused', timeoutMs: 40 },
+  });
+  const elapsed = Date.now() - started;
+  assert.equal(seen.length, 1, 'the budget must be spent on ONE request, never on a retry schedule');
+  assert.equal(seen[0].context?.retry, false, 'the observation retry is disabled for the control command');
+  assert.equal(outcome.exitCode, EXIT.refused, 'a command that did not answer is not a success');
+  assert.equal(outcome.output.ok, false);
+  assert.equal(outcome.output.error.code, 'CONTROL_TIMEOUT',
+    `an exhausted budget has its own code, saw ${JSON.stringify(outcome.output.error)}`);
+  assert.ok(elapsed < 5_000, `the command must end at its budget, took ${elapsed} ms`);
+});
+
+test('a missing or unusable config timeout never removes the bound: it is a bounded timeout, not a hang', async () => {
+  // `deps.config` is a test seam, not a way to lose the bound. Whatever the config says,
+  // the command must end with a bounded refusal instead of parking on its request, and
+  // the budget it reports must be the documented 10 s default, never 0 or Infinity.
+  //
+  // SCOPE, stated honestly: for each config shape this test asserts that a LIVE signal is
+  // handed to the client, that the retry is disabled for the call, and that the refusal is
+  // reported as data. It does NOT independently measure the derived budget per shape —
+  // `controlBudgetMs` is not exported, and the expected values below mirror its documented
+  // rule. What is genuinely OBSERVED about expiry is the single 10 s case at the end of
+  // this test, plus the short-budget case above and the end-to-end child processes.
+  const base = { baseUrl: 'http://127.0.0.1:3210', discoveryFile: 'unused' };
+  /** @returns {Error} the refusal a cancelled request produces. */
+  const cancelled = () => Object.assign(new Error('the request was cancelled by the host'), { code: 'MCP_REQUEST_CANCELLED' });
+  let armed = null;
+  for (const config of [
+    base,
+    { ...base, timeoutMs: 0 },
+    { ...base, timeoutMs: -1 },
+    { ...base, timeoutMs: 'nope' },
+    { ...base, timeoutMs: 250 },
+  ]) {
+    const seen = [];
+    const recorder = async (route, payload, context) => {
+      seen.push({ route, payload, context });
+      armed = context.signal;
+      // Answer immediately, but only AFTER proving a live signal was handed down: the
+      // property here is that configuration never disarms or disables the bound.
+      await new Promise((resolvePromise) => { setImmediate(resolvePromise); });
+      throw cancelled();
+    };
+    const outcome = await runControl(['status', 'task-1'], { callExecution: recorder, config });
+    assert.equal(seen.length, 1, `one request for config ${JSON.stringify(config)}`);
+    assert.equal(seen[0].context.retry, false, 'the observation retry is disabled for the control command');
+    assert.equal(armed instanceof AbortSignal, true, 'the caller signal must reach the client');
+    assert.equal(armed.aborted, false, 'a live budget signal must reach the client');
+    // The documented rule, restated as an expectation for this shape. It is a contract
+    // assertion, not an independent measurement of the implementation.
+    const expected = typeof config.timeoutMs === 'number' && Number.isFinite(config.timeoutMs) && config.timeoutMs > 0
+      ? Math.min(config.timeoutMs, CONTROL_TIMEOUT_MS)
+      : CONTROL_TIMEOUT_MS;
+    assert.ok(Number.isSafeInteger(expected) && expected > 0, `a finite budget is required for ${JSON.stringify(config)}`);
+    assert.equal(outcome.exitCode, EXIT.refused, 'the recorder refusal is reported as data');
+    assert.equal(outcome.output.error.code, 'MCP_REQUEST_CANCELLED',
+      `config ${JSON.stringify(config)} must reach the refusal path, not a broken budget`);
+    assert.equal(outcome.output.ok, false);
+  }
+
+  // And the arm/expire path itself, MEASURED: a config with no usable timeout must still
+  // end the command, on the documented 10 s default, with that budget named in the refusal.
+  const started = Date.now();
+  const outcome = await runControl(['status', 'task-1'], {
+    callExecution: async (route, payload, context) => {
+      await new Promise((resolvePromise) => {
+        if (context.signal.aborted === true) { resolvePromise(); return; }
+        context.signal.addEventListener('abort', resolvePromise, { once: true });
+      });
+      throw cancelled();
+    },
+    config: base,
+  });
+  const elapsed = Date.now() - started;
+  assert.equal(outcome.exitCode, EXIT.refused);
+  // This is the one call that really waits: it must end on the 10 s default and say so.
+  assert.equal(outcome.output.error.code, 'CONTROL_TIMEOUT');
+  assert.match(outcome.output.error.message, new RegExp(`within ${CONTROL_TIMEOUT_MS} ms`, 'u'));
+  assert.ok(elapsed >= 9_000 && elapsed < 15_000, `the 10 s default must be the real bound, saw ${elapsed} ms`);
+}, { timeout: 30_000 });
+
+test('a refusal is reported as data even when it arrives with an unusual error shape', async () => {
+  for (const thrown of [new TypeError('socket hang up'), 'a string', { code: 42, message: 42 }]) {
+    const outcome = await runControl(['status', 'task-1'], {
+      callExecution: async () => { throw thrown; },
+      config: { baseUrl: 'http://127.0.0.1:3210', discoveryFile: 'unused', timeoutMs: 1_000 },
+    });
+    assert.equal(outcome.exitCode, EXIT.refused);
+    assert.equal(outcome.output.ok, false);
+    assert.equal(typeof outcome.output.error.code, 'string', 'a code is always a string a script can switch on');
+    assert.equal(typeof outcome.output.error.message, 'string');
+    assert.equal(outcome.output.error.message.length <= 400, true);
+  }
+});
 
 test('a plane refusal is reported as JSON with a non-zero exit, never as a stack trace', async () => {
   const { stdout, stderr, io } = captureIo();
@@ -290,75 +436,154 @@ test('the compact answer is bounded end to end over the wire', async () => {
 // ---------------------------------------------------------------------------
 // 4. The real property: a control process while a long wait is outstanding
 // ---------------------------------------------------------------------------
+//
+// Everything on the serving side is the PRODUCT here: a real `JobEngine` over a real
+// temporary workspace with faked native services (no model is contacted), the real
+// `TaskMonitor` the engine owns, and the real `createExecutionHandler` behind a real
+// loopback HTTP server. The only doubles are the native services the engine is always
+// given in tests — exactly the ones `tests/engine.test.js` uses — plus a prompt the
+// runner never finishes, which is what keeps the task `running` while the CLI works.
+//
+// That matters for the regression this section pins: with a hand-written engine double
+// the test could only ASSERT that a non-positive wait is slow. Here the engine's own
+// `clampObserveWait` and the monitor's own `boundedWait` decide, so a `status` that went
+// back to `waitMs: 0` is parked for their real 25 s fallback and the child's 10 s budget
+// turns it into `CONTROL_TIMEOUT` — the exact failure observed against a live plane.
+
+/** The pinned commit the fake repository always reports. */
+const HEAD = 'a'.repeat(40);
 
 /**
- * A tiny scripted task store standing behind the REAL execution plane.
- *
- * It implements the two facts the plane's `observe`/`cancel` routes need — a bounded
- * wait that returns when the task settles, and a cancel that settles it — so the
- * whole path (control CLI → HTTP → plane → engine seam) is exercised without a model,
- * a workspace or a real job.
- * @returns {object} engine double with a `settle()` hook.
+ * A git runner answering in the NUL-delimited format the audit layer parses.
+ * @returns {object} runner function with `calls` history.
  */
-function scriptedEngine() {
-  const task = { taskId: 'task-live', state: 'running', phase: 'execute', connectionId: 'local-mcp', endedAt: null };
-  /** @type {null | (() => void)} */
-  let wake = null;
-  const engine = {
-    authorizationMode: 'switch',
-    posture: () => ({ authorized: true, mode: 'switch' }),
-    get: (taskId) => {
-      if (taskId !== task.taskId) throw Object.assign(new Error('no such task for this connection'), { code: 'JOB_TASK_NOT_FOUND' });
-      return task;
-    },
-    async observeTask(taskId, options = {}) {
-      const record = engine.get(taskId);
-      const waitMs = Math.min(MAX_OBSERVE_WAIT_MS, Math.max(0, options.waitMs ?? MAX_OBSERVE_WAIT_MS));
-      if (record.state !== 'running' || waitMs === 0) {
-        return {
-          task: { ...record },
-          reason: record.state === 'cancelled' ? 'cancelled' : 'heartbeat',
-          permission: null,
-          wait: { waitMs, waitedMs: 0, activitySinceWait: false },
-        };
-      }
-      await new Promise((resolvePromise) => {
-        const done = () => resolvePromise();
-        wake = done;
-        setTimeout(done, waitMs);
-        options.signal?.addEventListener?.('abort', done, { once: true });
-      });
-      return {
-        task: { ...record },
-        reason: record.state === 'cancelled' ? 'cancelled' : 'heartbeat',
-        permission: null,
-        wait: { waitMs, waitedMs: waitMs, activitySinceWait: false },
-      };
-    },
-    async cancel(taskId) {
-      const record = engine.get(taskId);
-      record.state = 'cancelled';
-      record.endedAt = Date.now();
-      wake?.();
-      return { ...record };
-    },
+function auditGit() {
+  const calls = [];
+  const runner = async (cwd, args) => {
+    calls.push({ cwd, args });
+    const key = args.join(' ');
+    if (key === '--version') return { stdout: 'git version 2.0.0\n', code: 0 };
+    if (key === 'rev-parse --is-inside-work-tree') return { stdout: 'true\n', code: 0 };
+    if (key === 'rev-parse --verify HEAD') return { stdout: `${HEAD}\n`, code: 0 };
+    if (args[0] === 'status') return { stdout: ' M src/a.js\u0000', code: 0 };
+    if (args[0] === 'diff' && args[1] === '--numstat') return { stdout: '2\t0\tsrc/a.js\u0000', code: 0 };
+    if (args[0] === 'diff') return { stdout: 'diff --git a/src/a.js b/src/a.js\n+work\n', code: 0 };
+    if (args[0] === 'ls-files') return { stdout: '', code: 0 };
+    return { stdout: '', code: 0 };
   };
-  return engine;
+  runner.calls = calls;
+  return runner;
 }
 
 /**
- * Start the real execution plane on a loopback port.
- * @param {object} engine - engine double.
+ * A prompt the runner delivers and then waits on forever.
+ *
+ * This is the one seam that makes a REAL job stay `running`: the placed run drives the
+ * resolved Agent, hands it the prompt, and then awaits `whenIdle()`. A never-idle agent is
+ * a genuinely unfinished execution, so only a cancel (or a timeout) ends it — no fake
+ * engine, no paused flag, no timer.
+ * @param {ReturnType<typeof fakeWorkspaceController>} workspaces - controller to bind to.
+ * @returns {object} session controller serving such agents.
+ */
+function hungSessionController(workspaces) {
+  const controller = fakeSessionController({ workspaces });
+  const resolveOriginal = controller.resolveAgent.bind(controller);
+  controller.resolveAgent = async (sessionId) => {
+    const found = await resolveOriginal(sessionId);
+    const agent = found.agent;
+    if (agent !== undefined) {
+      agent.followup = (message) => { agent.followups.push(message); };
+      agent.whenIdle = async () => { await new Promise(() => {}); };
+    }
+    return found;
+  };
+  return controller;
+}
+
+/** One plugin-owned review composition stand-in; reviews are off in this fixture. */
+function reviewPreset() {
+  const id = 'dsh-delegate-review-test';
+  return { get id() { return id; }, owns(candidate) { return candidate === id; }, async preparation() { return id; } };
+}
+
+/**
+ * Build ONE real plugin process over temporary storage.
+ *
+ * Mirrors how `src/index.js` wires the engine, minus everything that is not needed to
+ * run and observe one task: a real temporary workspace, real settings/authorization/lock
+ * services, the native workspace and session controllers, and the native policy services
+ * through which a delegated run verifies its sandbox policy.
+ * @param {object} [options] - `delegationEnabled`: whether the switch is on.
+ * @returns {Promise<object>} engine, workspace, host controllers and `close()`.
+ */
+async function realEngineFixture(options = {}) {
+  const root = await makeTempDir();
+  const workspace = await realpath(await mkdir(join(root, 'workspace'), { recursive: true }).then(() => join(root, 'workspace')));
+  const settings = new SettingsService(join(root, 'data'));
+  const enabled = options.delegationEnabled !== false;
+  await settings.replace({ ...validSettings(), delegationEnabled: enabled });
+  const auth = new AuthorizationRegistry();
+  const locks = new WorkspaceLocks();
+  const agents = fakeAgents({ respond: { text: 'implemented the change' } });
+  const workspaces = fakeWorkspaceController();
+  const sessionController = hungSessionController(workspaces);
+  const policyServices = await nativePolicyServices();
+  const deps = {
+    agents,
+    agentPresets: {
+      mounts: [],
+      async mount(ctx, id) {
+        this.mounts.push({ id });
+        // Mounting the preset is what installs the tool composition a review restricts.
+        ctx.tools.schemas = () => ['read', 'glob', 'grep'].map((name) => ({ name, description: name, parameters: {} }));
+        return { id: id ?? 'default-preset' };
+      },
+    },
+    reviewPresets: reviewPreset(),
+    sessions: { async flush() {} },
+    workspaces,
+    sessionController,
+    policyServices: () => policyServices,
+    llm: fakeLlm({ providers: { 'relay-native': llmTable().relay } }),
+    settings,
+    auth,
+    locks,
+    runGit: auditGit(),
+    providerRegistry: {
+      async ensure(providers) {
+        const routes = new Map();
+        for (const provider of providers) routes.set(provider.id, `${provider.id}-native`);
+        return { routes };
+      },
+    },
+    logger: { info() {}, warn() {} },
+    // The local-call switch is the authorization mode this channel serves, so the plane
+    // answers observe/cancel with the single `local-mcp` identity and no token.
+    authorizationMode: 'switch',
+    delegationEnabled: enabled,
+  };
+  const engine = new JobEngine(deps);
+  const handler = createExecutionHandler({ ...deps, engine, getBindHost: () => '127.0.0.1' });
+  return {
+    engine,
+    handler,
+    workspace,
+    settings,
+    sessionController,
+    locks,
+    async close() {
+      await engine.dispose();
+      await cleanup(root);
+    },
+  };
+}
+
+/**
+ * Start the REAL execution plane on a loopback port.
+ * @param {Function} handler - handler from `createExecutionHandler`.
  * @returns {Promise<{ url: string, close: () => Promise<void> }>} server handle.
  */
-async function startPlane(engine) {
-  const handler = createExecutionHandler({
-    engine,
-    auth: { authenticate: () => null, listGrants: () => [] },
-    settings: {},
-    logger: { warn: () => {} },
-    getBindHost: () => '127.0.0.1',
-  });
+async function startPlane(handler) {
   const server = createServer((req, res) => { void handler(req, res); });
   await new Promise((resolvePromise) => server.listen(0, '127.0.0.1', resolvePromise));
   const { port } = server.address();
@@ -388,8 +613,8 @@ function stdioHarness(server) {
   const done = serveStdio({ input, output, server });
   const send = (message) => input.push(`${JSON.stringify(message)}\n`);
   const replies = () => chunks.join('').split('\n').filter((line) => line.trim() !== '').map((line) => JSON.parse(line));
-  const replyTo = async (id) => {
-    for (let attempt = 0; attempt < 600; attempt += 1) {
+  const replyTo = async (id, attempts = 600) => {
+    for (let attempt = 0; attempt < attempts; attempt += 1) {
       const match = replies().find((line) => line.id === id);
       if (match !== undefined) return match;
       await new Promise((resolvePromise) => { setTimeout(resolvePromise, 10); });
@@ -507,14 +732,34 @@ function parseSoleJson(text) {
 }
 
 test('a SEPARATE control process queries and cancels while a long MCP wait is outstanding', async (t) => {
-  // The real property, exercised the way an operator gets it: the HTTP plane and the
-  // blocked MCP wait live in THIS process, and two independent `node
-  // dsh-delegate-control.js` child processes reach that same plane while the wait is
-  // still parked. If this test used `runControl` in-process it would prove nothing about
-  // the channel that exists FOR a serialising host.
-  const engine = scriptedEngine();
-  const plane = await startPlane(engine);
+  // The real property, exercised the way an operator gets it: a real engine, its real
+  // monitor and the real HTTP plane live in THIS process, a real stdio MCP `delegate_wait`
+  // is parked on the same task, and two independent `node dsh-delegate-control.js` child
+  // processes reach that plane while the wait is still outstanding. If this test used
+  // `runControl` in-process it would prove nothing about the channel that exists FOR a
+  // serialising host.
+  const fixture = await realEngineFixture();
+  const plane = await startPlane(fixture.handler);
   try {
+    // A REAL job, submitted through the product's own switch-authorized path, with a
+    // prompt the runner never finishes: the task stays `running` until something cancels it.
+    const started = await fixture.engine.start({
+      workspacePath: fixture.workspace,
+      prompt: 'hold this task running while the operator inspects it',
+    });
+    const taskId = started.taskId;
+    assert.match(taskId, /^task-/u, 'the engine issued a real task id');
+    // Wait until the run is actually executing (the monitor exists and the task is live).
+    for (let attempt = 0; attempt < 300; attempt += 1) {
+      const task = fixture.engine.get(taskId);
+      if (task?.state === 'running' && task?.monitor !== null && task?.native?.started === true) break;
+      await new Promise((resolvePromise) => { setTimeout(resolvePromise, 10); });
+    }
+    const live = fixture.engine.get(taskId);
+    assert.equal(live.state, 'running', 'the fixture must hold a genuinely running task');
+    assert.notEqual(live.monitor, null, 'the engine must own a real TaskMonitor for it');
+    assert.equal(fixture.locks.isLocked(fixture.workspace), true, 'a running task holds its workspace lock');
+
     const config = { baseUrl: plane.url, discoveryFile: join(tmpdir(), 'unused.json'), timeoutMs: 10_000 };
     const server = createMcpServer({ callExecution: createExecutionClient(config) });
     const harness = stdioHarness(server);
@@ -522,67 +767,106 @@ test('a SEPARATE control process queries and cancels while a long MCP wait is ou
     await harness.replyTo(1);
     harness.send({
       jsonrpc: '2.0', id: 2, method: 'tools/call',
-      params: { name: 'delegate_wait', arguments: { taskId: 'task-live', waitSeconds: 3_600 } },
+      params: { name: 'delegate_wait', arguments: { taskId, waitSeconds: 3_600 } },
     });
     await new Promise((resolvePromise) => { setTimeout(resolvePromise, 60); });
     assert.equal(harness.replies().some((line) => line.id === 2), false, 'the wait must still be outstanding');
 
     const childEnv = { DSH_DELEGATE_BASE_URL: plane.url, DSH_DELEGATE_DISCOVERY_FILE: '' };
 
-    // 1. An independent process reports the task WHILE the wait is parked.
-    const statusRun = await runChildOrSkip(t, ['status', 'task-live'], childEnv);
+    // 1. An independent process reports the running task WHILE the wait is parked.
+    const statusStarted = Date.now();
+    const statusRun = await runChildOrSkip(t, ['status', taskId], childEnv);
     if (statusRun === null) return;
+    const statusElapsed = Date.now() - statusStarted;
     assert.equal(statusRun.status, 0, statusRun.stderr);
     const statusBody = parseSoleJson(statusRun.stdout);
     assert.equal(statusBody.ok, true);
     assert.equal(statusBody.action, 'status');
-    assert.equal(statusBody.taskId, 'task-live');
+    assert.equal(statusBody.taskId, taskId);
     assert.equal(statusBody.task.state, 'running');
+    // THE REGRESSION. `status` asks for the smallest positive wait; both this engine's
+    // `clampObserveWait` and its monitor's `boundedWait` replace a non-positive value with
+    // their own 25 s default. So if `status` ever sends `waitMs: 0` again, this child is
+    // parked for 25 real seconds here — it cannot answer inside the CLI's 10 s budget, and
+    // this assertion fails. No fixture clock or fake engine is involved in that decision.
+    assert.ok(statusElapsed < CONTROL_TIMEOUT_MS,
+      `a status read must answer inside its own budget, took ${statusElapsed} ms`);
+    // The task was not disturbed: still running, still locked, wait still parked.
+    assert.equal(fixture.engine.get(taskId).state, 'running', 'a control read must not change the task');
+    assert.equal(fixture.locks.isLocked(fixture.workspace), true, 'a control read must not release the lock');
     assert.equal(harness.replies().some((line) => line.id === 2), false, 'a control read must not end the wait');
 
     // 2. A second independent process stops exactly that task.
-    const cancelRun = await runChildOrSkip(t, ['cancel', 'task-live'], childEnv);
+    const cancelStarted = Date.now();
+    const cancelRun = await runChildOrSkip(t, ['cancel', taskId], childEnv);
     if (cancelRun === null) return;
     assert.equal(cancelRun.status, 0, cancelRun.stderr);
+    assert.ok(Date.now() - cancelStarted < CONTROL_TIMEOUT_MS + 5_000,
+      'a cancel must answer inside one command budget, not wait out another request');
     const cancelBody = parseSoleJson(cancelRun.stdout);
     assert.equal(cancelBody.ok, true);
     assert.equal(cancelBody.action, 'cancel');
-    assert.equal(cancelBody.taskId, 'task-live');
+    assert.equal(cancelBody.taskId, taskId);
     assert.equal(cancelBody.state, 'cancelled');
 
-    // 3. The blocked wait learns the real outcome.
-    const waited = await harness.replyTo(2);
+    // 3. The blocked wait learns the REAL outcome of the same task.
+    const waited = await harness.replyTo(2, 300);
     const body = JSON.parse(waited.result.content[0].text);
     assert.equal(body.reason, 'cancelled', 'the wait reports the cancellation, not a timeout');
     assert.equal(body.terminal, true);
+    assert.equal(body.taskId, taskId, 'the wait describes the task the control process cancelled');
+    // And the engine agrees, after the wait: one task, cancelled, lock released.
+    for (let attempt = 0; attempt < 200 && fixture.engine.get(taskId).state !== 'cancelled'; attempt += 1) {
+      await new Promise((resolvePromise) => { setTimeout(resolvePromise, 10); });
+    }
+    assert.equal(fixture.engine.get(taskId).state, 'cancelled', 'the real task ended cancelled');
 
     harness.input.push(null);
     await harness.done;
   } finally {
     await plane.close();
+    await fixture.close();
   }
 });
 
 test('an independent process reports only the named task, and refuses an unknown one', async (t) => {
-  const engine = scriptedEngine();
-  const plane = await startPlane(engine);
+  const fixture = await realEngineFixture();
+  const plane = await startPlane(fixture.handler);
   try {
+    const started = await fixture.engine.start({
+      workspacePath: fixture.workspace,
+      prompt: 'hold this task running while an unknown id is asked for',
+    });
+    const taskId = started.taskId;
+    for (let attempt = 0; attempt < 300; attempt += 1) {
+      const task = fixture.engine.get(taskId);
+      if (task?.state === 'running' && task?.monitor !== null) break;
+      await new Promise((resolvePromise) => { setTimeout(resolvePromise, 10); });
+    }
+    assert.equal(fixture.engine.get(taskId).state, 'running');
+
     const childEnv = { DSH_DELEGATE_BASE_URL: plane.url, DSH_DELEGATE_DISCOVERY_FILE: '' };
-    const ok = await runChildOrSkip(t, ['status', 'task-live'], childEnv);
+    const ok = await runChildOrSkip(t, ['status', taskId], childEnv);
     if (ok === null) return;
     assert.equal(ok.status, 0, ok.stderr);
-    assert.equal(parseSoleJson(ok.stdout).taskId, 'task-live');
+    assert.equal(parseSoleJson(ok.stdout).taskId, taskId);
 
+    // An id this connection does not own is the SAME refusal as one that does not exist,
+    // produced by the real engine's own observation gate.
     const unknown = await runChildOrSkip(t, ['status', 'task-other'], childEnv);
     if (unknown === null) return;
     assert.equal(unknown.status, 1, 'an unknown task is a refusal, not a success');
     const body = parseSoleJson(unknown.stdout);
     assert.equal(body.ok, false);
     assert.equal(body.error.code, 'JOB_TASK_NOT_FOUND');
-    // The task it was pointed at is untouched: no cancel was issued.
-    assert.equal(engine.get('task-live').state, 'running');
+    // The real task it was pointed past is untouched: still running, still locked.
+    assert.equal(fixture.engine.get(taskId).state, 'running');
+    assert.equal(fixture.locks.isLocked(fixture.workspace), true);
+    await fixture.engine.cancel(taskId, 'test-cleanup');
   } finally {
     await plane.close();
+    await fixture.close();
   }
 });
 
@@ -627,11 +911,22 @@ test('a missing discovery file and a dead endpoint both end in JSON plus a non-z
 });
 
 test('the control command works through the shipped discovery file, exactly like the MCP server', async () => {
-  const engine = scriptedEngine();
-  const plane = await startPlane(engine);
+  const fixture = await realEngineFixture();
+  const plane = await startPlane(fixture.handler);
   const directory = mkdtempSync(join(tmpdir(), 'dsh-delegate-control-'));
   const discoveryFile = join(directory, 'runtime-endpoint.json');
   try {
+    const started = await fixture.engine.start({
+      workspacePath: fixture.workspace,
+      prompt: 'hold this task running across a discovered endpoint',
+    });
+    const taskId = started.taskId;
+    for (let attempt = 0; attempt < 300; attempt += 1) {
+      const task = fixture.engine.get(taskId);
+      if (task?.state === 'running' && task?.monitor !== null) break;
+      await new Promise((resolvePromise) => { setTimeout(resolvePromise, 10); });
+    }
+    assert.equal(fixture.engine.get(taskId).state, 'running');
     const published = await publishRuntimeEndpoint({
       filePath: discoveryFile,
       host: '127.0.0.1',
@@ -642,14 +937,18 @@ test('the control command works through the shipped discovery file, exactly like
     // No DSH_DELEGATE_BASE_URL: the client has to discover the plane itself.
     const config = readControlConfig({ DSH_DELEGATE_DISCOVERY_FILE: discoveryFile });
     assert.equal(config.baseUrl, null);
-    const status = await runControl(['status', 'task-live'], { config });
+    const status = await runControl(['status', taskId], { config });
     assert.equal(status.exitCode, EXIT.ok, JSON.stringify(status.output));
-    assert.equal(status.output.taskId, 'task-live');
+    assert.equal(status.output.taskId, taskId);
+    assert.equal(status.output.task.state, 'running');
+    assert.equal(fixture.engine.get(taskId).state, 'running', 'a discovered status read must not change the task');
     await published.dispose();
     assert.equal(existsSync(discoveryFile), false);
+    await fixture.engine.cancel(taskId, 'test-cleanup');
   } finally {
     rmSync(directory, { recursive: true, force: true });
     await plane.close();
+    await fixture.close();
   }
 });
 

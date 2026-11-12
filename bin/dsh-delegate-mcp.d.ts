@@ -58,9 +58,16 @@ export type ExecutionRoute = 'submit' | 'status' | 'result' | 'observe' | 'cance
  * `notifications/cancelled`). It is composed with the client's request timeout, so
  * an aborted call ends the HTTP request and nothing else: the harness answers a
  * disconnected observer without changing the task it was observing.
+ *
+ * `retry: false` disables the `observe` retry for THIS call only. It is for a caller
+ * whose whole contract is one short budget (the control CLI): the backoff schedule
+ * would outlive it and leave a request running afterwards. The default — `retry`
+ * absent or any other value — is unchanged, so `delegate_wait` keeps following a DSH
+ * restart onto a new port.
  */
 export interface ExecutionCallContext {
   signal?: AbortSignal;
+  retry?: boolean;
 }
 
 /**
@@ -103,7 +110,8 @@ export interface ExecutionClientOptions {
  * so a tool result says `GRANT_UNKNOWN` rather than `HTTP 404`. The runtime
  * discovery record is reread before EACH internal request, so a wait survives a
  * DSH restart onto another port; only the `observe` route retries an unreachable
- * endpoint (bounded backoff), because repeating a submission would be unsafe.
+ * endpoint (bounded backoff), because repeating a submission would be unsafe. A
+ * caller may opt its own call out of that retry with `{ retry: false }`.
  * @param config - value from {@link readConfig}.
  * @param options - optional test seams.
  */

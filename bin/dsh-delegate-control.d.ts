@@ -9,8 +9,17 @@ import type { ExecutionCallContext, ExecutionAnswer, ExecutionRoute, McpConfig }
 /** The only two verbs this CLI has. There is no submit, settings or switch verb. */
 export declare const CONTROL_ACTIONS: readonly ['status', 'cancel'];
 
-/** How long one control request may take, in milliseconds (10 s). */
+/** How long ONE control command may take end to end, in milliseconds (10 s). */
 export declare const CONTROL_TIMEOUT_MS: number;
+
+/**
+ * The observation bound `status` requests, in milliseconds (1).
+ *
+ * The smallest POSITIVE wait: the engine and the monitor treat a non-positive wait as
+ * "unspecified" and substitute their 25 s default, so `0` would be a long poll, not a
+ * status read.
+ */
+export declare const STATUS_WAIT_MS: number;
 
 /** Exit codes: a script can tell a refusal from a failure. */
 export declare const EXIT: Readonly<{ ok: 0, refused: 1, usage: 2 }>;
@@ -18,8 +27,9 @@ export declare const EXIT: Readonly<{ ok: 0, refused: 1, usage: 2 }>;
 /**
  * Configuration for one control invocation.
  *
- * `timeoutMs` is at most {@link CONTROL_TIMEOUT_MS}: the operator override
- * `DSH_DELEGATE_CONTROL_TIMEOUT_MS` may only LOWER the bound, never raise it.
+ * `timeoutMs` is the WHOLE-COMMAND budget and is at most {@link CONTROL_TIMEOUT_MS}: the
+ * operator override `DSH_DELEGATE_CONTROL_TIMEOUT_MS` may only LOWER the bound, never
+ * raise it. A missing or unusable `timeoutMs` falls back to the 10 s default.
  */
 export interface ControlConfig extends McpConfig {}
 
@@ -52,8 +62,11 @@ export interface ControlOutcome {
 /**
  * Run one control command against the loopback plane.
  *
- * `status` issues exactly one bounded `observe` with `waitMs: 0`; `cancel` issues one
- * `cancel` for the named task and nothing else. A refusal is reported as data
+ * `status` issues exactly one bounded `observe` with `waitMs: STATUS_WAIT_MS`; `cancel`
+ * issues one `cancel` for the named task and nothing else. The whole command runs under
+ * one caller budget: the client receives `{ signal, retry: false }`, so the observation
+ * retry is disabled for it and nothing keeps running after the answer. A refusal —
+ * including an exhausted budget (`CONTROL_TIMEOUT`) — is reported as data
  * (`{ ok: false, error: { code, message } }`) with a non-zero exit code.
  */
 export declare function runControl(

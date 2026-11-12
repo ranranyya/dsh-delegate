@@ -112,10 +112,17 @@ export const ENDPOINT_RETRY_BUDGET_MS = 30_000;
  * what lets a wait survive a DSH restart onto a new port. Only unpolled failures
  * are retried, and only for the observation route: an ordinary tool call keeps its
  * single attempt, because repeating a submission is not a safe thing to do.
+ *
+ * `context.retry === false` disables that observation retry for ONE call. It exists
+ * for the control CLI, whose whole contract is "answer inside one short budget": the
+ * retry schedule (1 s + 2 s + 5 s of sleeping, plus four attempts) would either
+ * outlive that budget or leave a request running after the CLI has answered. The
+ * default (absent context, or any other value) is unchanged, so `delegate_wait`
+ * keeps following a DSH restart exactly as before.
  * @param {object} config - value from {@link readConfig}.
  * @param {object} [options] - `sleep` (injectable for tests), `now`, `fetch` (injectable
  *   transport, for tests and for a caller that owns its own HTTP stack).
- * @returns {(route: string, payload: object, context?: { signal?: AbortSignal }) => Promise<object>} call function.
+ * @returns {(route: string, payload: object, context?: { signal?: AbortSignal, retry?: boolean }) => Promise<object>} call function.
  */
 export function createExecutionClient(config, options = {}) {
   const sleep = options.sleep ?? ((ms) => new Promise((resolvePromise) => { setTimeout(resolvePromise, ms); }));
@@ -138,8 +145,10 @@ export function createExecutionClient(config, options = {}) {
     }
     const callerSignal = context?.signal;
     // A route that is safe to repeat may back off and try again; everything else
-    // gets exactly one attempt.
-    const retryable = route === 'observe';
+    // gets exactly one attempt. A caller may also opt out of the retry for its own
+    // call (`context.retry === false`): only an explicit `false` disables it, so a
+    // caller that passes no context keeps the default MCP policy untouched.
+    const retryable = route === 'observe' && context?.retry !== false;
     const delays = retryable ? ENDPOINT_RETRY_DELAYS_MS : [];
     let spent = 0;
     for (let attempt = 0; ; attempt += 1) {

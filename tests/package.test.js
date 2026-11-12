@@ -370,6 +370,23 @@ test('the stdio MCP executable is declared as a bin and points at a real script'
   assert.match(controlSource, /^#!\/usr\/bin\/env node/u, 'a bin needs a shebang');
   assert.match(controlSource, /CONTROL_ACTIONS = Object\.freeze\(\['status', 'cancel'\]\)/u,
     'the control channel has exactly two verbs');
+  // The status read is the smallest POSITIVE wait: 0 is read downstream as "no bound
+  // requested" and replaced by the 25 s long-poll default, which is what made a status
+  // command outlive its own 10 s budget against a real plane.
+  assert.match(controlSource, /export const STATUS_WAIT_MS = 1;/u,
+    'status must ask for the smallest positive observation bound');
+  // No CODE path may request a zero wait: the comments are allowed to explain why, the
+  // request is not allowed to do it.
+  const controlCode = controlSource
+    .replace(/\/\*[\s\S]*?\*\//gu, '')
+    .replace(/^\s*\/\/.*$/gmu, '')
+    .replace(/^\s*\*.*$/gmu, '');
+  assert.equal(/waitMs: 0\b/u.test(controlCode), false, 'the shipped CLI must never request a zero wait');
+  // One whole-command budget, enforced through the caller signal, with the observation
+  // retry disabled so nothing sleeps out a backoff schedule after the answer.
+  assert.match(controlSource, /export const CONTROL_TIMEOUT_MS = 10_000;/u,
+    'the documented whole-command budget is ten seconds');
+  assert.match(controlSource, /retry: false/u, 'the control call must opt out of the observation retry');
   assert.ok(PACKED.includes('codex/dsh-delegate.toml'), 'the custom-agent template must be published');
   const codexAgent = readFileSync(join(ROOT, 'codex/dsh-delegate.toml'), 'utf8');
   assert.match(codexAgent, /^name = "dsh-delegate"$/mu);

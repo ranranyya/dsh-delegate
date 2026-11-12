@@ -41,13 +41,33 @@ acceptance evidence belongs in the Release notes.
 - The plugin's own stdio MCP transport already serves concurrent requests; a serialising
   HOST is what blocks a session behind one long `delegate_wait`.
 - New `dsh-delegate-control` binary (`bin/dsh-delegate-control.js`, registered in `bin`):
-  `status <taskId>` (one bounded `observe` with `waitMs: 0`, compact JSON) and
+  `status <taskId>` (one bounded `observe` with `waitMs: STATUS_WAIT_MS`, i.e. 1 ms —
+  the smallest positive bound the engine and the monitor both keep — compact JSON) and
   `cancel <taskId>` (stops exactly that task). Both use the existing
   `createExecutionClient` and endpoint discovery against the existing loopback plane.
+- `status` used to send `waitMs: 0`. The HTTP route accepts 0, but the engine
+  (`clampObserveWait`) and the monitor (`boundedWait`) both read a non-positive wait as
+  "no bound requested" and substitute their 25 s default. Against a real running plane
+  that made one status read last 25 s, past the command's own 10 s budget, and the
+  observation retry then extended the command further — observed as an independent
+  `status` timeout during the 1.2.0 candidate acceptance. The wait is now the smallest
+  POSITIVE value, and the mock-only assertion on the request payload is replaced by
+  tests that pin the real behaviour (see Tests).
+- One whole-command budget now bounds everything: 10 s by default,
+  `DSH_DELEGATE_CONTROL_TIMEOUT_MS` may only lower it, and a config with no usable
+  `timeoutMs` still gets the 10 s default. It is enforced through a single caller
+  `AbortSignal` composed with the request timeout, plus `{ retry: false }` on this call —
+  the observation retry (1 s/2 s/5 s) is disabled for the control command so a dead or
+  slow endpoint cannot outlive the budget or leave a request running after the answer.
+  There is no `Promise.race` and no background request or process.
+- Any disconnect or timeout is a bounded JSON document and a non-zero exit
+  (`CONTROL_TIMEOUT` for an exhausted budget), with no stack trace and no secrets.
 - No submit, no settings, no switch, no grant, no batch cancel, no daemon, no new endpoint,
-  permission or configuration surface. Finite request timeout (10 s default, operator may
-  lower it), stable JSON on stdout, diagnostics on stderr, exit code 0/1/2 for
-  answered/refused/usage.
+  permission or configuration surface. Stable JSON on stdout, diagnostics on stderr,
+  exit code 0/1/2 for answered/refused-or-timed-out/usage.
+- The default MCP behaviour is unchanged: `delegate_wait` keeps its bounded retry, which
+  is what lets a wait survive a DSH restart onto a new port. A normal wait never polls
+  the control binary.
 - A wait listener that goes away releases only that observation: cancellation is always an
   explicit `cancel`.
 - The Codex companion gains one narrow rule: when the operator asks to stop or inspect the
@@ -117,7 +137,23 @@ acceptance evidence belongs in the Release notes.
   `node dsh-delegate-control.js` child processes while the parent holds an HTTP plane and a
   parked MCP wait — that `status` and `cancel` both arrive before the wait ends and cancel
   exactly the named task. A bad environment, a missing discovery file and a dead endpoint
-  are each bounded JSON refusals with a non-zero exit.
+  are each bounded JSON refusals with a non-zero exit. The `status` case now pins the
+  defect it exists for with the REAL serving side — a `JobEngine` running a real task over a
+  real temporary workspace with its own `TaskMonitor`, behind the real
+  `createExecutionHandler` on a loopback HTTP server (only the native services every engine
+  test fakes are faked; the task really stays `running` because its prompt never finishes):
+  a separate `node dsh-delegate-control.js` child must report that running task inside its
+  own budget while the parent's `delegate_wait` is still parked, and a second child must
+  cancel the SAME task so the parked wait then returns `cancelled`. Because the engine's
+  own `clampObserveWait` and the monitor's own `boundedWait` decide the wait, a `status`
+  that sent `waitMs: 0` again would be parked for their real 25 s fallback and fail the
+  child's 10 s budget with `CONTROL_TIMEOUT` — the failure observed on the live plane. The
+  request is asserted to carry `waitMs: 1` and `{ retry: false }`; and separate cases
+  cover the whole-command budget (`CONTROL_TIMEOUT`), a missing/unusable config timeout,
+  and refusals thrown with unusual error shapes.
+- `tests/mcp.test.js`: a caller's `{ retry: false }` makes exactly one `observe` attempt
+  with no backoff, while no context, `{}` and `{ retry: true }` all keep the documented
+  1 s/2 s/5 s schedule — the MCP wait's restart-following behaviour is unchanged.
 - `tests/codex-integration.test.js`: the write gate (wrapper refused, extra args refused, the
   core missing-timeout case accepted), an end-to-end startup run that never rewrites a
   wrapper, the DETERMINISTIC check-then-write race (the config changes after the plan; the

@@ -103,15 +103,24 @@
 插件**不承诺**改变宿主的调度器，也不把长等待退化成轮询。可用的是独立本地控制程序：
 
 ```bash
-node bin/dsh-delegate-control.js status <taskId>   # 紧凑 JSON 状态（observe + waitMs: 0）
+node bin/dsh-delegate-control.js status <taskId>   # 紧凑 JSON 状态（observe + 最小有界观察）
 node bin/dsh-delegate-control.js cancel <taskId>   # 只停止这一个任务
 ```
 
 - 与 MCP 服务器使用**同一个** `createExecutionClient` 与端点发现，调用现有 loopback 执行面；
   不新增权限、开关、配置接口，也没有常驻后台进程。
 - 只有这两个动作：没有提交、设置、总开关、批量取消或默认放行。
-- 请求有有限超时：默认 **10 秒**，`DSH_DELEGATE_CONTROL_TIMEOUT_MS` 只能把它**调小**（填更大的值会被夹回 10 秒）；
-  stdout 只有一个稳定 JSON 文档，诊断走 stderr；退出码 `0` 有答案、`1` 被拒绝、`2` 用法错误。
+- `status` 请求的是**最小有界观察**（`waitMs: 1`，引擎与监控都保留的最小正数），不是
+  `waitMs: 0`。`0` 在这两处都被理解成"调用方没指定上界"，会被替换成 25 秒的默认长等待，
+  反而让一次状态查询超出这条命令自己的预算。它仍然只回答**当前状态**：已结束的任务和待授权
+  请求在任何定时器启动前就返回，仍在运行的任务只观察一个切片；永远不读完整结果、diff 或对话。
+- **整次命令只有一份总预算**：默认 **10 秒**，`DSH_DELEGATE_CONTROL_TIMEOUT_MS` 只能把它**调小**
+  （填更大的值会被夹回 10 秒；缺省或不可用的 `timeoutMs` 也按 10 秒算）。这份预算通过调用方的
+  `AbortSignal` 生效，同时**对本次调用禁用观察重试**——否则 1 秒/2 秒/5 秒的退避会超出预算，
+  或者在命令已经回答之后还留着请求在跑。没有 `Promise.race`，也不留后台请求或进程。
+- 任何断线、超时都变成有界 JSON + 非零退出码（预算耗尽是 `CONTROL_TIMEOUT`），没有堆栈、没有秘密；
+  退出码 `0` 有答案、`1` 被拒绝或超时、`2` 用法错误。
+- 普通等待**不会周期性跑 status**：这个通道只在操作者或用例显式调用时才发起请求。
 - 等待监听断开只释放观察，**取消永远是显式 `cancel`**。
 - 工具目录补上了准确的 MCP `annotations`（例如 `readOnlyHint`），便于支持并发的客户端识别
   长等待是只读调用。注解不是修复，串行客户端照样忽略它。

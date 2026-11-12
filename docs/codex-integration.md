@@ -782,6 +782,16 @@ one fails the build:
     script), using the same `node` executable. It cannot submit, change a setting or
     the switch, act on another task, resubmit the work or switch models, and during a
     normal wait it stays silent instead of polling that binary.
+
+    What the command guarantees, so the expected output is never mistaken for a hang:
+    `status` reads the task's CURRENT compact state through ONE observation with the
+    smallest positive wait (`waitMs: 1`) — not `waitMs: 0`, which the engine reads as
+    "no bound requested" and replaces with a 25-second long poll. The commands answer
+    inside a single budget (10 s by default; `DSH_DELEGATE_CONTROL_TIMEOUT_MS` may only
+    lower it), enforced through one caller `AbortSignal` with the observation retry
+    disabled for that call, so a dead endpoint cannot spend a backoff schedule after
+    the answer. A failure — including an exhausted budget, `CONTROL_TIMEOUT` — is one
+    bounded JSON document on stdout plus a non-zero exit code, never a stack trace.
 11. **Evidence, not approval.** Return state, the actual provider/model/effort,
     changed-file summary, verification evidence, limitations, and the preflight
     facts with the isolation reason actually used. Executing is not accepting:
