@@ -13,27 +13,27 @@ const ROOT = resolve(fileURLToPath(new URL('..', import.meta.url)));
 const manifest = JSON.parse(await readFile(join(ROOT, 'package.json'), 'utf8'));
 
 test('public identity changes while the actual managed data and MCP identifiers remain compatible', async () => {
-  assert.equal(manifest.name, 'dsh-taskdispatch');
-  assert.equal(manifest.version, '1.3.0');
+  assert.equal(manifest.name, 'dsh-taskbridge');
+  assert.equal(manifest.version, '1.3.1');
   const home = join(tmpdir(), 'taskdispatch-home-fixture');
   assert.equal(installationRecordPath({ DSH_HOME: home }), join(home, 'data', 'dsh-delegate', 'codex-installation.json'));
   assert.equal(manifest.bin['dsh-delegate-mcp'], 'bin/dsh-delegate-mcp.js');
   assert.equal(manifest.bin['dsh-delegate-control'], 'bin/dsh-delegate-control.js');
   for (const language of ['en', 'zh']) {
     const locale = JSON.parse(await readFile(join(ROOT, 'locale', `${language}.json`), 'utf8'));
-    assert.equal(locale.meta.title, 'DSH TaskDispatch');
+    assert.equal(locale.meta.title, 'DSH TaskBridge');
     assert.match(locale.meta.description, /Claude Code/u);
     assert.match(locale.meta.description, /Codex/u);
     await readFile(join(ROOT, locale.meta.detail));
   }
 });
 
-test('the real published 1.2.0 fixture remains recognized in exact LF and CRLF forms', async () => {
-  const prior = await readFile(join(ROOT, 'tests/fixtures/codex-agent-1.2.0.toml'), 'utf8');
+for (const version of ['1.2.0', '1.3.0']) test(`the real published ${version} fixture remains recognized in exact LF and CRLF forms`, async () => {
+  const prior = await readFile(join(ROOT, `tests/fixtures/codex-agent-${version}.toml`), 'utf8');
   const lf = prior.replaceAll('\r\n', '\n');
   for (const text of [lf, lf.replaceAll('\n', '\r\n')]) {
     const sha256 = createHash('sha256').update(text).digest('hex');
-    assert.ok(KNOWN_AGENT_TEMPLATES.some(entry => entry.version === '1.2.0' && entry.sha256 === sha256));
+    assert.ok(KNOWN_AGENT_TEMPLATES.some(entry => entry.version === version && entry.sha256 === sha256));
   }
 });
 
@@ -46,9 +46,12 @@ test('explicit moved-install proof accepts own old/new packages and rejects fore
     const desired = join(root, 'different-install/bin/dsh-delegate-mcp.js');
     const cases = [
       ['dsh-delegate', 'https://github.com/ranranyya/dsh-delegate.git', true],
-      ['dsh-taskdispatch', 'git+https://github.com/ranranyya/dsh-taskdispatch.git', true],
-      ['dsh-delegate', 'https://github.com/dushaobindoudou/dsh-plugin.git', false],
+      ['dsh-taskdispatch', 'https://github.com/ranranyya/dsh-taskdispatch.git', true],
+      ['dsh-taskbridge', 'git+https://github.com/ranranyya/dsh-taskbridge.git', true],
+      ['dsh-taskbridge', 'https://github.com/ranranyya/dsh-taskdispatch.git', true],
       ['dsh-taskdispatch', 'https://github.com/someone-else/dsh-taskdispatch.git', false],
+      ['dsh-delegate', 'https://github.com/dushaobindoudou/dsh-plugin.git', false],
+      ['dsh-taskbridge', 'https://github.com/someone-else/dsh-taskbridge.git', false],
       ['dsh-delegate', undefined, false],
       ['dsh-delegate', 'https://github.com/ranranyya/dsh-delegate.git?claim=own', false],
     ];
@@ -56,7 +59,7 @@ test('explicit moved-install proof accepts own old/new packages and rejects fore
       await writeFile(join(root, 'package.json'), JSON.stringify({ name, repository, bin: { 'dsh-delegate-mcp': 'bin/dsh-delegate-mcp.js' } }));
       assert.equal(await isOwnedEntryScript(entry, desired), expected, `${name}: ${repository}`);
     }
-    await writeFile(join(root, 'package.json'), JSON.stringify({ name: 'dsh-taskdispatch', repository: manifest.repository, bin: { 'dsh-delegate-mcp': 'bin/wrapper.js' } }));
+    await writeFile(join(root, 'package.json'), JSON.stringify({ name: 'dsh-taskbridge', repository: manifest.repository, bin: { 'dsh-delegate-mcp': 'bin/wrapper.js' } }));
     assert.equal(await isOwnedEntryScript(entry, desired), false, 'repository identity cannot replace the existing bin proof');
   } finally { await rm(root, { recursive: true, force: true }); }
 });
@@ -71,7 +74,7 @@ test('generated public index pins the real Git source and carries the exact vers
     assert.equal(doc.plugins[0].name, manifest.name);
     assert.equal(doc.plugins[0].versions[0].version, manifest.version);
     assert.equal(doc.plugins[0].versions[0].engines.dsh, manifest.engines.dsh);
-    assert.deepEqual(doc.plugins[0].versions[0].source, { type: 'git', url: 'https://github.com/ranranyya/dsh-taskdispatch', commit });
+    assert.deepEqual(doc.plugins[0].versions[0].source, { type: 'git', url: 'https://github.com/ranranyya/dsh-taskbridge', commit });
     assert.match(doc.plugins[0].description.zh, /思考强度/u);
     assert.match(doc.plugins[0].description.zh, /Claude Code/u);
     assert.deepEqual(await readFile(join(outputDir, doc.plugins[0].icon)), await readFile(join(ROOT, 'icon.svg')));

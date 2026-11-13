@@ -1,6 +1,6 @@
 {
   "meta": {
-    "title": "DSH TaskDispatch",
+    "title": "DSH TaskBridge",
     "description": "让 Claude Code 或 Codex 指挥 DSH 完成任务。在 DSH 插件中选择已接入的 API、执行模型和思考强度，管理任务派工、权限审批、执行跟踪与集中审查。",
     "detail": "docs/INTRODUCTION.zh.md"
   }

@@ -1,15 +1,15 @@
 {
-  "name": "dsh-taskdispatch",
-  "version": "1.3.0",
+  "name": "dsh-taskbridge",
+  "version": "1.3.1",
   "description": "让 Claude Code 或 Codex 指挥 DSH 完成任务；在 DSH 插件中配置 API、执行模型、思考强度、权限审批与集中审查。",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/ranranyya/dsh-taskdispatch.git"
+    "url": "https://github.com/ranranyya/dsh-taskbridge.git"
   },
-  "homepage": "https://github.com/ranranyya/dsh-taskdispatch#readme",
+  "homepage": "https://github.com/ranranyya/dsh-taskbridge#readme",
   "bugs": {
-    "url": "https://github.com/ranranyya/dsh-taskdispatch/issues"
+    "url": "https://github.com/ranranyya/dsh-taskbridge/issues"
   },
   "type": "module",
   "engines": {
@@ -69,7 +69,8 @@
     "docs/INTRODUCTION.md",
     "docs/taskdispatch-upgrade.md",
     "docs/claude-code.md",
-    "docs/plugin-market.md"
+    "docs/plugin-market.md",
+    "docs/taskbridge-upgrade.md"
   ],
   "dsh": {
     "manifestVersion": 1,
@@ -125,7 +126,7 @@
     "dsh",
     "dsh-plugin",
     "deepseek-harness",
-    "taskdispatch",
+    "taskbridge",
     "codex",
     "claude-code",
     "mcp",

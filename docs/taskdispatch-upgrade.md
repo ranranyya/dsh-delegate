@@ -1,5 +1,7 @@
 # 从 DSH Delegate 升级到 DSH TaskDispatch
 
+> 这是 1.3.0 的历史说明。当前项目已统一为 **DSH TaskBridge**，请阅读 [1.3.1 升级说明](taskbridge-upgrade.md)。本文件保留旧链接兼容，不作为当前安装指南。
+
 1.3.0 的展示名为 **DSH TaskDispatch**，包名为 **dsh-taskdispatch**。旧包 `dsh-delegate` 与 npm 上他人的同名占位包不是同一个项目。当前发布信息以本仓库和正式 Release 为准。
 
 ## 升级步骤

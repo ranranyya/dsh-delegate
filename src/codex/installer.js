@@ -305,6 +305,9 @@ export const KNOWN_AGENT_TEMPLATES = [
     version: '1.1.0',
     sha256: '93d580bd849bb6d2c30c2db6286695ef3e0356896a88e552abae5f03eafc7601',
   },
+  // Exact published 1.3.0 bytes (archive fixture, LF and CRLF forms).
+  { version: '1.3.0', sha256: '63695008f53aa2c19a0df9e2cb37285f631b775cb98f26c1d280cfbc54a0d9e8' },
+  { version: '1.3.0', sha256: '31b0ba3149032058fe31e1e884e5c24a9a3d6459b7dd35df6420c7f3756d6257' },
   // Exact published 1.2.0 bytes (archive fixture, LF and CRLF forms).
   { version: '1.2.0', sha256: '8479c8ab418d71b15fb30880aa5149fb1070d194e8444a110a2a614cebf4eaf4' },
   { version: '1.2.0', sha256: '947f3fb8a8e9ae5cc6fb3c9d379c69b595af4c46f89ac77f69aa1edf696a8f8e' },
@@ -363,7 +366,7 @@ const PACKAGE_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..'
  * This package's own name, the identity an older installation's `package.json` must
  * declare before its entry point can be adopted by an automatic migration.
  */
-const PACKAGE_NAME = 'dsh-taskdispatch';
+const PACKAGE_NAME = 'dsh-taskbridge';
 const TEMPLATE_PATH = join(PACKAGE_ROOT, 'codex', AGENT_FILENAME);
 const PACKAGE_MANIFEST_PATH = join(PACKAGE_ROOT, 'package.json');
 
@@ -1540,10 +1543,10 @@ function doesManifestMapEntry(manifest, rootDir) {
  */
 function isOwnPackageManifest(manifest, packageName) {
   // A rename must not adopt the unrelated public npm package with our old name.
-  // Both identities need our repository provenance in addition to the existing
+  // All accepted identities need our repository provenance in addition to the existing
   // real-file and exact bin-mapping proof. Custom test identities stay exact.
   if (packageName !== PACKAGE_NAME) return manifest.name === packageName;
-  if (!['dsh-taskdispatch', 'dsh-delegate'].includes(manifest.name)) return false;
+  if (!['dsh-taskbridge', 'dsh-taskdispatch', 'dsh-delegate'].includes(manifest.name)) return false;
   const repository = typeof manifest.repository === 'string'
     ? manifest.repository : manifest.repository?.url;
   if (typeof repository !== 'string') return false;
@@ -1552,7 +1555,7 @@ function isOwnPackageManifest(manifest, packageName) {
     if (url.protocol !== 'https:' || url.hostname !== 'github.com' || url.port
       || url.username || url.password || url.search || url.hash) return false;
     const path = url.pathname.replace(/\/$/u, '').replace(/\.git$/u, '');
-    return ['/ranranyya/dsh-delegate', '/ranranyya/dsh-taskdispatch'].includes(path);
+    return ['/ranranyya/dsh-delegate', '/ranranyya/dsh-taskdispatch', '/ranranyya/dsh-taskbridge'].includes(path);
   } catch { return false; }
 }
 

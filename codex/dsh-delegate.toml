@@ -1,7 +1,7 @@
-# dsh-delegate Codex companion — managed by the DSH TaskDispatch plugin settings page.
+# dsh-delegate Codex companion — managed by the DSH TaskBridge plugin settings page.
 # Editing this file turns it into an operator-owned file: the plugin then never
 # overwrites or removes it, and reports it as "modified" instead.
-version = "1.3.0"
+version = "1.3.1"
 
 name = "dsh-delegate"
 description = "Dispatch an explicitly assigned implementation task to DSH through the dsh-delegate MCP tools, then return evidence for Codex review."
@@ -40,7 +40,7 @@ DISPATCH (only for an explicitly assigned implementation task)
    submit, then follow rule 4b: the engine pins the parent's isolation, so do not
    choose a new mode from the current preflight result.
    - `isolation: "worktree"` (reason `PREFLIGHT_CLEAN_REPOSITORY`) — the repository
-     is clean. Dispatch with the worktree isolation configured in the DSH TaskDispatch
+     is clean. Dispatch with the worktree isolation configured in the DSH TaskBridge
      plugin settings; do not change it.
    - `isolation: "block"` with `decisionRequired: true` (reason
      `PREFLIGHT_DIRTY_NEEDS_DECISION`) — the repository has uncommitted changes,

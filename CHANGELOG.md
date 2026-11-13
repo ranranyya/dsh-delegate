@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.3.1 — DSH TaskBridge identity and npm distribution
+
+- Unify the project, GitHub repository, plugin title, package and bundle identity as **DSH TaskBridge** / `dsh-taskbridge`. The previous GitHub-only `dsh-taskdispatch` name was rejected by npm's similarity protection; it never became an npm package.
+- Add npm installation instructions alongside the pinned-Git custom plugin index. Keep the 1.3.0 release and tag intact; use a new patch release for the different package identity.
+- Retain existing task data, `delegate_*` tools, CLI names and managed Codex identifiers. Recognize the exact published 1.3.0 agent template and this project's historical repository identities during explicit migration.
+- Update bilingual introductions and migration guidance. Execution, wait, permission and review behavior remains the same as 1.2.0; this release changes identity, distribution and compatibility metadata.
+- Forward the control CLI's injected test dependencies into `runControl`; the entry-point refusal test now stays isolated from the operator's actual harness instead of accidentally depending on its response. Default CLI behavior is unchanged.
+
 ## 1.3.0 — DSH TaskDispatch identity and public plugin index
 
 - Public package/bundle identity changes from `dsh-delegate` to `dsh-taskdispatch`; the display title is **DSH TaskDispatch**. Existing data paths, endpoint discovery, environment variables, MCP `delegate_*` tools, binaries and the managed Codex agent/server identifiers remain stable.

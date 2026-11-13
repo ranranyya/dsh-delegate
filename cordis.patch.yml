@@ -2,5 +2,5 @@
 # The plugin is inert on load: local MCP dispatch stays OFF until the operator
 # enables the single switch in the DSH plugin settings page.
 - insert:
-    - id: dsh-taskdispatch
-      name: dsh-taskdispatch
+    - id: dsh-taskbridge
+      name: dsh-taskbridge

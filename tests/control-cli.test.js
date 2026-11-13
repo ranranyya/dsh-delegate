@@ -348,7 +348,10 @@ test('a plane refusal is reported as JSON with a non-zero exit, never as a stack
   const { call } = mockClient({}, {
     fail: Object.assign(new Error('no such task for this connection'), { code: 'JOB_TASK_NOT_FOUND' }),
   });
-  const exitCode = await main(['status', 'missing'], { ...io, callExecution: call });
+  const exitCode = await main(['status', 'missing'], {
+    ...io, callExecution: call,
+    config: { baseUrl: 'http://127.0.0.1:3210', discoveryFile: 'unused', timeoutMs: 1_000 },
+  });
   assert.equal(exitCode, EXIT.refused);
   const body = JSON.parse(stdout[0]);
   assert.equal(body.ok, false);

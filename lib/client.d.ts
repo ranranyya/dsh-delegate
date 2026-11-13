@@ -4,7 +4,7 @@
 // client's module table, produced by `scripts/build-client.mjs` from
 // `src/client/index.jsx`:
 //
-//     window.__ModuleLoader__.load({ id: "dsh-taskdispatch", factory: (require) => … })
+//     window.__ModuleLoader__.load({ id: "dsh-taskbridge", factory: (require) => … })
 //
 // The factory returns `module.exports`, whose shape is declared here as
 // {@link DelegateClientModule}. The bundle declares `dsh.client.platform: "web"`,
@@ -29,7 +29,7 @@ export declare const PLUGIN_CONFIG_SLOT: 'plugins.bundle.config';
  * Key of the registration: exactly the bundle's npm package name. The manager
  * looks the entry up by `pkg.name`; any other key never renders.
  */
-export declare const PLUGIN_BUNDLE_KEY: 'dsh-taskdispatch';
+export declare const PLUGIN_BUNDLE_KEY: 'dsh-taskbridge';
 
 /** Required client services: slot registration only. */
 export declare const inject: readonly ['slots'];

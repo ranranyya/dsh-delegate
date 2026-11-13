@@ -1,4 +1,4 @@
-# DSH TaskDispatch
+# DSH TaskBridge
 
 **让 Claude Code 或 Codex 指挥 DSH 完成任务，在 DSH 插件里配置执行所用的 API、模型和思考强度。**
 
@@ -25,7 +25,7 @@
 
 ## 安装、升级和边界
 
-项目原名 DSH Delegate。1.3.0 起发布包名为 `dsh-taskdispatch`，避免与他人的 npm 同名包混淆。从旧包升级请先阅读 [更名升级说明](taskdispatch-upgrade.md)。当前提供 GitHub 安装包及固定 Git 提交的 DSH 自定义插件索引；未完成 npm 发布时，不要把裸包名当作已经可用的安装渠道。
+项目原名 DSH Delegate，1.3.0 曾使用 DSH TaskDispatch。1.3.1 起统一为 **DSH TaskBridge**，包名为 `dsh-taskbridge`。从旧包升级请先阅读 [更名升级说明](taskbridge-upgrade.md)。在 DSH“添加插件”中输入 `dsh-taskbridge@1.3.1`；中国大陆镜像若尚未同步，改选 npm 官方源。GitHub Release 同时提供安装包。
 
 [插件索引与更新说明](plugin-market.md)介绍如何添加索引，在 DSH 的“发现”中搜索本插件。发布自定义索引不代表已进入官方内置市场；DSH 当前需要用户自行添加可信索引。
 

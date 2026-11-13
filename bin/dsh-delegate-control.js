@@ -413,7 +413,8 @@ export const USAGE = [
  * Process entry point: one JSON document on stdout, diagnostics on stderr, and an
  * exit code that says what happened.
  * @param {string[]} argv - arguments after the script path.
- * @param {object} [io] - `stdout`/`stderr` writers, for tests.
+ * @param {object} [io] - `stdout`/`stderr` writers and optional `callExecution`/`config`
+ *   dependencies, so an imported entry-point test never contacts the real harness.
  * @returns {Promise<number>} exit code.
  */
 export async function main(argv = process.argv.slice(2), io = {}) {
@@ -429,7 +430,7 @@ export async function main(argv = process.argv.slice(2), io = {}) {
   // whole contract is machine-readable output.
   let outcome;
   try {
-    outcome = await runControl(argv);
+    outcome = await runControl(argv, io);
   } catch (error) {
     const code = typeof error?.code === 'string' ? error.code : 'CONTROL_INTERNAL';
     outcome = { exitCode: EXIT.refused, output: { ok: false, action: null, error: { code, message: 'the control command failed' } } };

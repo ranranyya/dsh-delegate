@@ -1,6 +1,6 @@
 # Claude Code 手动接入
 
-DSH TaskDispatch 提供标准 stdio MCP 服务，Claude Code 可作为指挥端连接它。这里提供配置方法，不代表已经完成真实 Claude Code 客户端验收；目前也没有一键安装 Claude Code 智能体的按钮。
+DSH TaskBridge 提供标准 stdio MCP 服务，Claude Code 可作为指挥端连接它。这里提供配置方法，不代表已经完成真实 Claude Code 客户端验收；目前也没有一键安装 Claude Code 智能体的按钮。
 
 ## 连接
 
@@ -9,7 +9,7 @@ DSH TaskDispatch 提供标准 stdio MCP 服务，Claude Code 可作为指挥端�
 ```json
 {
   "mcpServers": {
-    "dsh-taskdispatch": {
+    "dsh-taskbridge": {
       "command": "<Node.js 可执行文件绝对路径>",
       "args": ["<本插件安装目录>/bin/dsh-delegate-mcp.js"],
       "env": {

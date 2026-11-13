@@ -1,6 +1,6 @@
 # Codex integration contract
 
-Status: implemented in 1.3.0 (1.1.0 shipped the wait rules; 1.2.0 adds the installed-integration upgrade). Scope: Codex only. Claude Code and other hosts are
+Status: implemented in 1.3.1 (1.1.0 shipped the wait rules; 1.2.0 adds the installed-integration upgrade). Scope: Codex only. Claude Code and other hosts are
 out of scope and no surface for them is provided.
 
 This document is the contract between the plugin's settings page (browser half),
@@ -488,7 +488,7 @@ successful diagnosis.
 ```jsonc
 {
   "codexHome": "…",
-  "packageVersion": "1.3.0",
+  "packageVersion": "1.3.1",
   "boundary": { "blocked": false, "link": null, "unknown": false, "home": "directory", "agents": "directory" },
   "agent": {
     "path": "…", "state": "installed", "installed": true, "managed": true,

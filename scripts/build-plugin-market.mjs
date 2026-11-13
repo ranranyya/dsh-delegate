@@ -19,15 +19,15 @@ export async function buildMarketSite({ commit, publishedAt, outputDir }) {
   }
   if (typeof outputDir !== 'string' || outputDir.trim() === '') throw new Error('outputDir is required');
   const manifest = JSON.parse(await readFile(join(ROOT, 'package.json'), 'utf8'));
-  if (manifest.name !== 'dsh-taskdispatch' || !/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/u.test(manifest.version)) {
+  if (manifest.name !== 'dsh-taskbridge' || !/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/u.test(manifest.version)) {
     throw new Error('unexpected package identity/version');
   }
   const en = JSON.parse(await readFile(join(ROOT, 'locale/en.json'), 'utf8')).meta;
   const zh = JSON.parse(await readFile(join(ROOT, 'locale/zh.json'), 'utf8')).meta;
-  const repository = 'https://github.com/ranranyya/dsh-taskdispatch';
+  const repository = 'https://github.com/ranranyya/dsh-taskbridge';
   const document = {
     format: 1,
-    title: { en: 'DSH TaskDispatch plugins', zh: 'DSH TaskDispatch 插件索引' },
+    title: { en: 'DSH TaskBridge plugins', zh: 'DSH TaskBridge 插件索引' },
     description: { en: 'Public releases maintained by ranranyya.', zh: '本项目维护的正式发布源；添加后可在 DSH 中搜索和安装。' },
     plugins: [{
       name: manifest.name,

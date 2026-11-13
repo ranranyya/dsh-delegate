@@ -1,7 +1,7 @@
 # Runtime compatibility
 
-This document states which DSH runtimes this plugin build (`1.3.0`, package
-`dsh-taskdispatch-1.3.0.tgz`) may be loaded into, what changed in the newest one, and what
+This document states which DSH runtimes this plugin build (`1.3.1`, package
+`dsh-taskbridge-1.3.1.tgz`) may be loaded into, what changed in the newest one, and what
 has and has not been verified on it. It is a compatibility note, not an acceptance
 report; the package is distributed through the GitHub Release.
 
@@ -194,10 +194,10 @@ What remains genuinely unverified:
 
 ## 5. Upgrading from an older plugin build
 
-1. Download `dsh-taskdispatch-1.3.0.tgz` from the GitHub Release, or build the package locally (`npm pack`).
+1. Download `dsh-taskbridge-1.3.1.tgz` from the GitHub Release, or build the package locally (`npm pack`).
 2. Install it the way your surface requires: the Desktop **Plugins manager** for a
    Desktop profile (npm/CLI operations on that profile are refused), or
-   `dsh plugin --profile <name> add ./dsh-taskdispatch-1.3.0.tgz` for a CLI profile you
+   `dsh plugin --profile <name> add ./dsh-taskbridge-1.3.1.tgz` for a CLI profile you
    start yourself.
 3. The settings, the switch value and the task history are preserved
    (`$DSH_HOME/data/dsh-delegate`); nothing is migrated destructively.

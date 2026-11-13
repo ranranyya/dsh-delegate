@@ -1,4 +1,4 @@
-# DSH TaskDispatch
+# DSH TaskBridge
 
 Let Claude Code or Codex direct DSH tasks. Choose the execution API, model and supported reasoning effort in the DSH plugin settings.
 
@@ -10,6 +10,6 @@ The quiet wait observes execution inside the program and returns at actionable b
 
 Codex has an existing managed agent/MCP installation button. Claude Code connects using standard stdio MCP; see [the manual guide](claude-code.md). A Claude one-click installer and native client mention selection are not promised.
 
-Version 1.3.0 changes the package identity from `dsh-delegate` to `dsh-taskdispatch`. Read the [upgrade guide](taskdispatch-upgrade.md) before replacing an old installation. Historical data, MCP tools, environment variables and the Codex `dsh-delegate` technical identifier remain compatible. Do not run old and new bundles together.
+Version 1.3.1 adopts DSH TaskBridge and the package identity `dsh-taskbridge`, replacing `dsh-delegate` and the GitHub-only `dsh-taskdispatch` 1.3.0. Read the [upgrade guide](taskbridge-upgrade.md) before replacing an old installation. Historical data, MCP tools, environment variables and the Codex `dsh-delegate` technical identifier remain compatible. Do not run old and new bundles together.
 
-Distribution uses GitHub releases and a [DSH custom plugin index](plugin-market.md) pinned to exact Git commits. This is not universal official marketplace inclusion, and npm is not an installation channel until publication is explicitly verified. Actual token savings and a full real Desktop update/restart have not been measured.
+In DSH's Add plugin dialog, use `dsh-taskbridge@1.3.1`; use the official npm registry if a regional mirror has not synchronized yet. Distribution also uses GitHub releases and a [DSH custom plugin index](plugin-market.md) pinned to exact Git commits. This is not universal official marketplace inclusion. Actual token savings and a full real Desktop update/restart have not been measured.
