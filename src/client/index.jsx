@@ -85,14 +85,17 @@ import {
   isCancellable,
   hasLiveTasks,
   formatDuration,
+  hostReviewLine,
   isLiveTask,
   minutesToSeconds,
+  monitoringDraftOf,
   monitoringOf,
   pendingPermission,
   permissionSummary,
   precheckDraft,
   precheckMonitoring,
   previewEffective,
+  repeatFailureLine,
   secondsToMinutes,
   SELF_CHECK_LABELS,
   taskActivity,
@@ -1454,22 +1457,45 @@ function PresetsCard({ store, snapshot }) {
  */
 function MonitoringCard({ store, snapshot }) {
   const draft = snapshot.draft;
-  const monitoring = monitoringOf(draft);
+  // The RAW block is what the inputs display and what the save validates. Binding the
+  // inputs to the display-normalized block instead would make a cleared field
+  // immediately re-render as the documented default, hiding the edit.
+  const raw = monitoringDraftOf(draft);
   const saved = monitoringOf(snapshot.settings);
   const [saving, setSaving] = useState(false);
-  const problems = precheckMonitoring(monitoring);
-  const dirty = monitoring.selfCheckSeconds !== saved.selfCheckSeconds
-    || monitoring.attentionSeconds !== saved.attentionSeconds;
+  const problems = precheckMonitoring(raw);
+  const dirty = raw.selfCheckSeconds !== saved.selfCheckSeconds
+    || raw.attentionSeconds !== saved.attentionSeconds
+    || raw.repeatFailureThreshold !== saved.repeatFailureThreshold;
 
   /**
    * Write one field, converting minutes back to the stored unit.
+   *
+   * The block is spread from the RAW draft, not from `monitoringOf`: normalizing here
+   * would rewrite the operator's other half-typed fields (for example a cleared count)
+   * back to their defaults on every keystroke.
    * @param {'selfCheckSeconds' | 'attentionSeconds'} field - target field.
-   * @param {unknown} raw - operator input, in minutes.
+   * @param {unknown} rawMinutes - operator input, in minutes.
    * @returns {void}
    */
-  const edit = (field, raw) => {
+  const edit = (field, rawMinutes) => {
     store.editDraft((current) => {
-      current.monitoring = { ...monitoringOf(current), [field]: minutesToSeconds(raw) };
+      current.monitoring = { ...monitoringDraftOf(current), [field]: minutesToSeconds(rawMinutes) };
+    });
+  };
+
+  /**
+   * Write the repeated-failure count. A blank field becomes `''`, which the precheck
+   * reports rather than turning into an accidental default.
+   * @param {unknown} value - operator input, a count.
+   * @returns {void}
+   */
+  const editFailureCount = (value) => {
+    store.editDraft((current) => {
+      current.monitoring = {
+        ...monitoringDraftOf(current),
+        repeatFailureThreshold: value === '' ? '' : Number(value),
+      };
     });
   };
 
@@ -1484,7 +1510,7 @@ function MonitoringCard({ store, snapshot }) {
         <Field
           label="程序自检间隔（分钟）"
           htmlFor="dshdg-monitoring-selfcheck"
-          hint={`${LIMITS.selfCheckSecondsMin / 60}–${LIMITS.selfCheckSecondsMax / 60} 分钟；存成整秒（当前 ${monitoring.selfCheckSeconds} 秒）`}
+          hint={`${LIMITS.selfCheckSecondsMin / 60}–${LIMITS.selfCheckSecondsMax / 60} 分钟；存成整秒（当前 ${raw.selfCheckSeconds === '' ? '未填' : `${raw.selfCheckSeconds} 秒`}）`}
         >
           <input
             id="dshdg-monitoring-selfcheck"
@@ -1493,17 +1519,17 @@ function MonitoringCard({ store, snapshot }) {
             min={LIMITS.selfCheckSecondsMin / 60}
             max={LIMITS.selfCheckSecondsMax / 60}
             step={0.5}
-            value={String(Number.isFinite(secondsToMinutes(monitoring.selfCheckSeconds)) ? secondsToMinutes(monitoring.selfCheckSeconds) : '')}
+            value={String(Number.isFinite(secondsToMinutes(raw.selfCheckSeconds)) ? secondsToMinutes(raw.selfCheckSeconds) : '')}
             onChange={(event) => {
-              const raw = event.target.value;
-              edit('selfCheckSeconds', raw === '' ? '' : raw);
+              const value = event.target.value;
+              edit('selfCheckSeconds', value === '' ? '' : value);
             }}
           />
         </Field>
         <Field
           label="提醒你的间隔（分钟）"
           htmlFor="dshdg-monitoring-attention"
-          hint={`${LIMITS.attentionSecondsMin / 60}–${LIMITS.attentionSecondsMax / 60} 分钟，且必须大于自检间隔；存成整秒（当前 ${monitoring.attentionSeconds} 秒）`}
+          hint={`${LIMITS.attentionSecondsMin / 60}–${LIMITS.attentionSecondsMax / 60} 分钟，且必须大于自检间隔；存成整秒（当前 ${raw.attentionSeconds === '' ? '未填' : `${raw.attentionSeconds} 秒`}）`}
         >
           <input
             id="dshdg-monitoring-attention"
@@ -1512,11 +1538,27 @@ function MonitoringCard({ store, snapshot }) {
             min={LIMITS.attentionSecondsMin / 60}
             max={LIMITS.attentionSecondsMax / 60}
             step={0.5}
-            value={String(Number.isFinite(secondsToMinutes(monitoring.attentionSeconds)) ? secondsToMinutes(monitoring.attentionSeconds) : '')}
+            value={String(Number.isFinite(secondsToMinutes(raw.attentionSeconds)) ? secondsToMinutes(raw.attentionSeconds) : '')}
             onChange={(event) => {
-              const raw = event.target.value;
-              edit('attentionSeconds', raw === '' ? '' : raw);
+              const value = event.target.value;
+              edit('attentionSeconds', value === '' ? '' : value);
             }}
+          />
+        </Field>
+        <Field
+          label="重复失败提醒（次）"
+          htmlFor="dshdg-monitoring-repeat"
+          hint={`同一工具、同一操作、同一失败连续这么多次时提醒一次；${LIMITS.repeatFailureThresholdMin} 表示关闭（当前 ${raw.repeatFailureThreshold === '' ? '未填' : `${raw.repeatFailureThreshold} 次`}）`}
+        >
+          <input
+            id="dshdg-monitoring-repeat"
+            type="number"
+            inputMode="numeric"
+            min={LIMITS.repeatFailureThresholdMin}
+            max={LIMITS.repeatFailureThresholdMax}
+            step={1}
+            value={String(raw.repeatFailureThreshold)}
+            onChange={(event) => { editFailureCount(event.target.value); }}
           />
         </Field>
       </div>
@@ -1524,6 +1566,7 @@ function MonitoringCard({ store, snapshot }) {
       <ul className="dshdg-hint">
         <li>「没有新进展」本身不等于失败：插件不会因为安静、也不会因为单个工具跑得久就判定任务失败。</li>
         <li>只有确实没有进展、并且超过「提醒你的间隔」之后，才会把这件事报告给派工方。</li>
+        <li>重复失败提醒与上面两个间隔<strong>互相独立</strong>：它数的是同一操作连续失败了几次，而不是安静了多久，所以正在忙碌地反复失败也会被提醒。它只提醒一次，不会自动取消任务、更换模型或改动超时。</li>
         <li>修改只影响<strong>之后新提交</strong>的任务；已经运行的任务保留它开始时的那份间隔快照。</li>
         <li>程序自检只读取本机已有的事实（任务是否还在、当前阶段、有没有待决定的调用、正在跑哪个工具），不读取代码差异，也不会读取你的文件内容。</li>
       </ul>
@@ -1534,7 +1577,9 @@ function MonitoringCard({ store, snapshot }) {
           onClick={async () => {
             setSaving(true);
             try {
-              await store.saveMonitoring(monitoring);
+              // Send exactly what was validated. The button is disabled while
+              // `problems` is non-empty, so this is a well-formed block by construction.
+              await store.saveMonitoring(monitoringDraftOf(draft));
             } finally {
               setSaving(false);
             }
@@ -1753,15 +1798,15 @@ function TaskDetail({ store, task }) {
   const permission = permissionSummary(task);
   const pending = pendingPermission(task);
   const evidence = Array.isArray(task.permission?.evidence) ? task.permission.evidence : [];
-  const badgeTone = isAwaitingPermission(task)
-    ? 'warn'
-    : (task.state === 'awaiting-host-review' ? 'warn' : (task.state === 'failed' ? 'warn' : 'off'));
+  // The detail header uses the SAME headline as the list, so a task that was reviewed
+  // never still says "等待宿主审查" here while the list says "审查通过".
+  const badgeTone = isAwaitingPermission(task) ? 'warn' : outcome.tone;
   return (
     <div className="dshdg-item">
       <div className="dshdg-item-head">
         <strong>{task.title || task.taskId}</strong>
         <Badge tone={badgeTone}>
-          {taskStateLabel(task.state)}
+          {outcome.label}
         </Badge>
         {isAwaitingPermission(task) ? <Badge tone="warn">{PERMISSION_STATE_LABELS.pending}</Badge> : null}
         <span className="dshdg-spacer" />
@@ -1804,7 +1849,11 @@ function TaskDetail({ store, task }) {
               : `新开 · 工作区 ${execution.conversation.workspaceId ?? '—'}`)}
         </dd>
         <dt>阶段</dt>
-        <dd>{taskPhaseLabel(task.phase)}</dd>
+        <dd>
+          {/* A finished/reviewed run never says "waiting for host review" here: that is the
+              headline's job. What remains true is that the execution is over. */}
+          {outcome.decided || task.state === 'awaiting-host-review' ? '执行已结束' : taskPhaseLabel(task.phase)}
+        </dd>
         <dt>最近进展</dt>
         <dd>
           {activity === null || activity.lastActivityAt === null
@@ -1830,6 +1879,8 @@ function TaskDetail({ store, task }) {
             ? '未采集到'
             : `自检 ${formatDuration(activity.selfCheckSeconds * 1000)} · 提醒 ${formatDuration((activity.attentionSeconds ?? 0) * 1000)}`}
         </dd>
+        <dt>重复失败提醒</dt>
+        <dd>{repeatFailureLine(activity)}</dd>
         <dt>创建</dt>
         <dd>{formatTime(task.createdAt)}</dd>
         <dt>结束</dt>
@@ -1844,7 +1895,7 @@ function TaskDetail({ store, task }) {
             : ` · ${REVIEW_VERDICT_LABELS[review.verdict] ?? review.verdict}`}
         </dd>
         <dt>宿主验收</dt>
-        <dd>{task.hostAcceptance === null || task.hostAcceptance === undefined ? '未记录（插件不会自行验收）' : '已由宿主记录'}</dd>
+        <dd>{hostReviewLine(task, formatTime)}</dd>
       </dl>
 
       <h4>改动文件</h4>
@@ -2019,16 +2070,20 @@ function TasksPanel({ store, snapshot }) {
         <div className="dshdg-list">
           {tasks.map((task) => {
             const progress = taskProgress(task);
+            // The ONE headline for this task: it already reflects a recorded review, so
+            // the raw state label can never sit next to a "审查通过" badge contradicting it.
+            const outcome = taskOutcome(task);
+            // Only a phase that says something DIFFERENT is shown (a live run); a finished
+            // or reviewed task would otherwise repeat its own headline.
+            const phase = outcome.phaseLabel;
             return (
               <div className="dshdg-item" key={task.taskId}>
                 <div className="dshdg-item-head">
                   <span>{task.title || task.taskId}</span>
-                  <Badge tone={isAwaitingPermission(task)
-                    ? 'warn'
-                    : (task.state === 'awaiting-host-review' ? 'warn' : (task.state === 'failed' ? 'warn' : 'off'))}>
-                    {taskStateLabel(task.state)}
+                  <Badge tone={isAwaitingPermission(task) ? 'warn' : outcome.tone}>
+                    {outcome.label}
                   </Badge>
-                  <Badge tone={progress.tone}>{taskPhaseLabel(task.phase)}</Badge>
+                  {phase === null ? null : <Badge tone={progress.tone}>{phase}</Badge>}
                   {isAwaitingPermission(task) ? <Badge tone="warn">{PERMISSION_STATE_LABELS.pending}</Badge> : null}
                   <span className="dshdg-mono dshdg-faint">
                     {task.config?.worker?.model ?? task.effective?.worker?.model ?? '—'}

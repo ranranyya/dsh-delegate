@@ -859,24 +859,36 @@ test('a refused native registration does not block remote discovery', async () =
 // Monitoring settings route
 // ---------------------------------------------------------------------------
 
-test('the monitoring route writes only the two thresholds and returns the committed document', async () => {
+test('the monitoring route writes only the thresholds and the failure count, and returns the committed document', async () => {
   const { dir, deps, settings } = await fixture();
   try {
     const routes = wrapUserPlaneRoutes(deps);
     const result = await call(routes, 'POST', `${USER_PLANE_PREFIX}/monitoring`, {
-      monitoring: { selfCheckSeconds: 120, attentionSeconds: 300 },
+      monitoring: { selfCheckSeconds: 120, attentionSeconds: 300, repeatFailureThreshold: 5 },
     });
     assert.equal(result.status, 200);
-    assert.deepEqual(result.body.monitoring, { selfCheckSeconds: 120, attentionSeconds: 300 });
+    assert.deepEqual(result.body.monitoring,
+      { selfCheckSeconds: 120, attentionSeconds: 300, repeatFailureThreshold: 5 });
     // The committed document comes back so the page does not need a second read.
-    assert.deepEqual(result.body.settings.monitoring, { selfCheckSeconds: 120, attentionSeconds: 300 });
+    assert.deepEqual(result.body.settings.monitoring,
+      { selfCheckSeconds: 120, attentionSeconds: 300, repeatFailureThreshold: 5 });
 
     // It really persisted, and it rewrote nothing else.
     const stored = await settings.read();
-    assert.deepEqual(stored.monitoring, { selfCheckSeconds: 120, attentionSeconds: 300 });
+    assert.deepEqual(stored.monitoring,
+      { selfCheckSeconds: 120, attentionSeconds: 300, repeatFailureThreshold: 5 });
     assert.equal(stored.delegationEnabled, false, 'the switch is untouched');
     assert.equal(stored.worker.model, 'deepseek-chat', 'the worker selection is untouched');
     assert.equal(stored.providers.length, 1);
+
+    // A block that omits the new field keeps the stored/default value rather than
+    // clearing it to something the operator never chose.
+    const omitted = await call(routes, 'POST', `${USER_PLANE_PREFIX}/monitoring`, {
+      monitoring: { selfCheckSeconds: 150, attentionSeconds: 400 },
+    });
+    assert.equal(omitted.status, 200);
+    assert.equal(omitted.body.monitoring.repeatFailureThreshold, 3,
+      'omitting the count takes the documented default, which is what validation documents');
   } finally {
     await cleanup(dir);
   }
@@ -894,6 +906,10 @@ test('the monitoring route refuses invalid timers as a 400 and writes nothing', 
       [{ selfCheckSeconds: 300, attentionSeconds: 7201 }, 'MONITORING_INVALID'],
       [{ selfCheckSeconds: 300.5, attentionSeconds: 600 }, 'MONITORING_INVALID'],
       [{ atentionSeconds: 900 }, 'MONITORING_INVALID'],
+      // The repeated-failure count is bounded too, and `0` is legal (off), not an error.
+      [{ selfCheckSeconds: 300, attentionSeconds: 600, repeatFailureThreshold: -1 }, 'MONITORING_INVALID'],
+      [{ selfCheckSeconds: 300, attentionSeconds: 600, repeatFailureThreshold: 21 }, 'MONITORING_INVALID'],
+      [{ selfCheckSeconds: 300, attentionSeconds: 600, repeatFailureThreshold: 1.5 }, 'MONITORING_INVALID'],
     ]) {
       const result = await call(routes, 'POST', `${USER_PLANE_PREFIX}/monitoring`, { monitoring: block });
       // A refused TIMER is the caller's mistake, not a server fault.

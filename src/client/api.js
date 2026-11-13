@@ -426,9 +426,10 @@ export function conversationModeLabel(mode) {
  * inconsistent pair is passed through so the operator sees what they typed and the
  * precheck can explain it. Only a missing block, a non-object, or a non-finite value
  * falls back to the documented default — an older stored document (no `monitoring`
- * key) therefore opens at 300/600 s, i.e. 5/10 minutes.
+ * key) therefore opens at 300/600 s, i.e. 5/10 minutes, with the repeated-failure
+ * reminder at its default of 3.
  * @param {object | null} source - served document, draft, or raw block.
- * @returns {{ selfCheckSeconds: number, attentionSeconds: number }} normalized block.
+ * @returns {{ selfCheckSeconds: number, attentionSeconds: number, repeatFailureThreshold: number }} normalized block.
  */
 export function monitoringOf(source) {
   const block = source?.monitoring;
@@ -437,6 +438,36 @@ export function monitoringOf(source) {
   return {
     selfCheckSeconds: whole(block.selfCheckSeconds, MONITORING_DEFAULTS.selfCheckSeconds),
     attentionSeconds: whole(block.attentionSeconds, MONITORING_DEFAULTS.attentionSeconds),
+    repeatFailureThreshold: whole(block.repeatFailureThreshold, MONITORING_DEFAULTS.repeatFailureThreshold),
+  };
+}
+
+/**
+ * The RAW monitoring block of a draft, for validation only.
+ *
+ * `monitoringOf` is a display normalizer: it turns a blank or non-finite field into the
+ * documented default so the inputs still render. That is exactly wrong for validating
+ * an edit — a cleared field would silently look like the default and the save button
+ * would stay enabled. This keeps whatever the operator actually typed (including `''`),
+ * so the shared precheck can refuse it. Only a missing block falls back to the defaults.
+ *
+ * One narrow exception: a block that predates the repeated-failure count has no such key
+ * at all, and an absent key is not an operator error — it is the documented default. So
+ * `undefined` becomes the default value (making the field editable for an older document),
+ * while an explicit `''`, `null`, fractional or out-of-range value is preserved exactly so
+ * the precheck still refuses it.
+ * @param {object | null} source - draft or served document.
+ * @returns {object} the block as stored, or the defaults when there is none.
+ */
+export function monitoringDraftOf(source) {
+  const block = source?.monitoring;
+  if (block === null || typeof block !== 'object' || Array.isArray(block)) return { ...MONITORING_DEFAULTS };
+  return {
+    selfCheckSeconds: block.selfCheckSeconds,
+    attentionSeconds: block.attentionSeconds,
+    repeatFailureThreshold: block.repeatFailureThreshold === undefined
+      ? MONITORING_DEFAULTS.repeatFailureThreshold
+      : block.repeatFailureThreshold,
   };
 }
 
@@ -590,10 +621,13 @@ export const LIMITS = Object.freeze({
   selfCheckSecondsMax: 3600,
   attentionSecondsMin: 31,
   attentionSecondsMax: 7200,
+  // Repeated-failure reminder: a COUNT of consecutive identical failures, 0 = off.
+  repeatFailureThresholdMin: 0,
+  repeatFailureThresholdMax: 20,
 });
 
 /**
- * Default silence thresholds, mirroring `MONITORING_DEFAULTS`.
+ * Default silence thresholds and failure count, mirroring `MONITORING_DEFAULTS`.
  *
  * Stored as whole SECONDS (300 / 600). The panel presents them as minutes because
  * that is how an operator thinks about them; a value that is not a whole number of
@@ -602,6 +636,7 @@ export const LIMITS = Object.freeze({
 export const MONITORING_DEFAULTS = Object.freeze({
   selfCheckSeconds: 300,
   attentionSeconds: 600,
+  repeatFailureThreshold: 3,
 });
 
 /** Chinese labels for the self-check verdicts the host publishes. */
@@ -613,6 +648,30 @@ export const SELF_CHECK_LABELS = Object.freeze({
   'waiting-for-permission': '正在等待本次调用授权决定',
   settled: '任务已经结束',
 });
+
+/** Chinese label for the repeated-failure reminder kind. */
+export const REPEATED_FAILURE_LABEL = '同一操作连续失败';
+
+/**
+ * One line describing the repeated-failure reminder on a task page.
+ *
+ * The engine already reduced this to a tool name, a failure code and counts, so this
+ * is a formatter and nothing else: no arguments, output or error prose is available
+ * here even if a stored record somehow carried it.
+ * @param {object | null} activity - the task's activity block.
+ * @returns {string} display text.
+ */
+export function repeatFailureLine(activity) {
+  const block = activity?.repeatFailure;
+  if (block === null || block === undefined) return '未采集到';
+  const reported = Array.isArray(block.reported) ? block.reported : [];
+  if (reported.length === 0) {
+    return block.threshold === 0 ? '已关闭' : `尚未触发（连续 ${block.threshold} 次才提醒）`;
+  }
+  return reported
+    .map((entry) => `${entry.toolName ?? '工具'} · ${entry.failureCode ?? 'error'} 连续 ${entry.consecutive} 次`)
+    .join('；');
+}
 
 /** Chinese labels for the reasons a wait returns. */
 export const WAIT_REASON_LABELS = Object.freeze({
@@ -1006,25 +1065,12 @@ export function precheckDraft(draft) {
   if (!Number.isInteger(parallelism) || parallelism < LIMITS.maxParallelismMin || parallelism > LIMITS.maxParallelismMax) {
     problems.push(`最大并发需为 ${LIMITS.maxParallelismMin}–${LIMITS.maxParallelismMax} 之间的整数`);
   }
-  const monitoring = monitoringOf(draft);
-  for (const [field, label] of [
-    ['selfCheckSeconds', '程序自检间隔'],
-    ['attentionSeconds', '提醒你的间隔'],
-  ]) {
-    const value = monitoring[field];
-    const min = field === 'selfCheckSeconds' ? LIMITS.selfCheckSecondsMin : LIMITS.attentionSecondsMin;
-    const max = field === 'selfCheckSeconds' ? LIMITS.selfCheckSecondsMax : LIMITS.attentionSecondsMax;
-    if (!Number.isInteger(value) || value < min || value > max) {
-      problems.push(`${label}需为 ${min}–${max} 秒之间的整数`);
-    }
-  }
-  // The ordering rule mirrors `validateMonitoringSettings`: an attention threshold at
-  // or below the self-check one would alert about something the self-check has not
-  // even examined yet.
-  if (Number.isInteger(monitoring.selfCheckSeconds) && Number.isInteger(monitoring.attentionSeconds)
-    && monitoring.attentionSeconds <= monitoring.selfCheckSeconds) {
-    problems.push('提醒你的间隔必须大于程序自检间隔');
-  }
+  // The RAW block, not the display-normalized one: a cleared field must be refused
+  // here instead of silently becoming the documented default on save. The rules
+  // themselves live in exactly one place — `precheckMonitoring` — so a field can never
+  // be validated by the narrow monitoring button and forgotten by this whole-draft check
+  // (which is what happened to the repeated-failure count).
+  problems.push(...precheckMonitoring(monitoringDraftOf(draft)));
   return problems;
 }
 
@@ -1209,7 +1255,11 @@ export function taskActivity(task) {
  */
 export function taskProgress(task) {
   const activity = taskActivity(task);
-  const phase = taskPhaseLabel(task?.phase);
+  // The headline must not contradict the task's own status badge. `taskOutcome` owns the
+  // headline wording, so a recorded review (or a finished run) says THAT here instead of
+  // repeating the raw phase label a second time.
+  const outcome = taskOutcome(task);
+  const phase = outcome.label;
   if (activity === null) {
     return {
       available: false,
@@ -1297,18 +1347,36 @@ export function hasLiveTasks(tasks) {
 }
 
 /**
- * Pre-flight checks for the two silence thresholds.
+ * Pre-flight checks for the silence thresholds AND the repeated-failure count.
  *
  * Mirrors `validateMonitoringSettings`. Kept separate because the monitoring save has
  * its own narrow button: a bad timer must not block saving the rest of the settings,
  * and a bad provider block must not block saving a timer.
- * @param {{ selfCheckSeconds: number, attentionSeconds: number }} monitoring - normalized block.
+ *
+ * The block passed in must be the RAW one (`monitoringDraftOf`), not the display-normalized
+ * `monitoringOf`: the latter replaces a cleared field with the documented default, which
+ * would make an empty input look valid. This is the single validation path — `precheckDraft`
+ * and the monitoring card both delegate here, so the count cannot be checked in one place
+ * and forgotten in another.
+ *
+ * Backwards compatible with an older document or an older host that has no
+ * `repeatFailureThreshold` at all: an ABSENT value takes the documented default, exactly as
+ * the host validator does. A value that is present but wrong is still refused.
+ * @param {{ selfCheckSeconds: number, attentionSeconds: number, repeatFailureThreshold?: number }} monitoring - raw block.
  * @returns {string[]} Chinese problem descriptions; empty when plausible.
  */
 export function precheckMonitoring(monitoring) {
   const problems = [];
   const self = monitoring?.selfCheckSeconds;
   const attention = monitoring?.attentionSeconds;
+  // An ABSENT count is not an operator error: a document written before this setting
+  // existed has no such key, and the host fills in the documented default. Anything the
+  // operator actually supplied — `''`, `null`, a fraction, an out-of-range number — is
+  // validated exactly as given. There is deliberately no `Number()` coercion and no
+  // rounding, so nothing is "repaired" into a value nobody chose.
+  const repeat = monitoring?.repeatFailureThreshold === undefined
+    ? MONITORING_DEFAULTS.repeatFailureThreshold
+    : monitoring.repeatFailureThreshold;
   if (!Number.isInteger(self) || self < LIMITS.selfCheckSecondsMin || self > LIMITS.selfCheckSecondsMax) {
     problems.push(`程序自检间隔需为 ${LIMITS.selfCheckSecondsMin}–${LIMITS.selfCheckSecondsMax} 秒之间的整数`);
   }
@@ -1318,34 +1386,121 @@ export function precheckMonitoring(monitoring) {
   if (Number.isInteger(self) && Number.isInteger(attention) && attention <= self) {
     problems.push('提醒你的间隔必须大于程序自检间隔');
   }
+  // The repeated-failure reminder is a COUNT of consecutive identical failures; `0` is a
+  // legal "off" value, so the range starts at zero rather than at one.
+  if (!Number.isInteger(repeat)
+    || repeat < LIMITS.repeatFailureThresholdMin
+    || repeat > LIMITS.repeatFailureThresholdMax) {
+    problems.push(`重复失败提醒次数需为 ${LIMITS.repeatFailureThresholdMin}–${LIMITS.repeatFailureThresholdMax} 之间的整数（0 表示关闭）`);
+  }
   return problems;
 }
 
 /**
- * Honest execution/acceptance summary for one task.
+ * Honest execution/acceptance summary for one task — the ONE source of a task's headline.
  *
- * The engine reports `awaiting-host-review` after successful execution. That is
- * not acceptance: `selfApproved` is always false and `hostAcceptance` is null
- * until the host records its own decision, so the summary never says "验收通过".
+ * The engine reports `awaiting-host-review` after successful execution. That is NOT
+ * acceptance: `selfApproved` is always false, and only a recorded host decision with
+ * `accepted === true` counts. A recorded `changes-requested` is a real conclusion too —
+ * "reviewed and needs correction" — and must never read as accepted.
+ *
+ * `label` is what a list or a detail header shows INSTEAD of the raw state, so a task with
+ * a recorded conclusion never keeps reading "等待宿主审查". The underlying `state` is
+ * untouched (older clients and `continueFromTaskId` depend on it); this is presentation
+ * only.
  * @param {object} task - task view.
- * @returns {{ label: string, executed: boolean, accepted: boolean, note: string }} summary.
+ * @returns {{ label: string, tone: string, executed: boolean, accepted: boolean, decided: boolean,
+ *   phaseLabel: string | null, note: string }} summary. `phaseLabel` is `null` when the
+ *   phase would repeat the label.
  */
 export function taskOutcome(task) {
   const state = String(task?.state ?? '');
-  const accepted = task?.hostAcceptance !== null && task?.hostAcceptance !== undefined;
-  const executed = state === 'awaiting-host-review' || accepted === true;
-  const note = state === 'awaiting-host-review'
-    ? '执行已完成，等待宿主（Codex）审查；插件不会自行验收。'
-    : accepted === true
-      ? '宿主已记录验收结论。'
-      : state === 'failed'
-        ? '执行失败；错误详情见下方证据。'
-        : state === 'cancelled'
-          ? '任务已取消，未产生验收结论。'
-          : '任务尚未产生结果。';
-  return { label: taskStateLabel(state), executed, accepted, note };
+  const acceptance = task?.hostAcceptance;
+  // Only an explicit `accepted === true` is acceptance. The presence of an object is NOT
+  // enough: a `changes-requested` record is also an object.
+  const accepted = acceptance !== null && acceptance !== undefined && acceptance.accepted === true;
+  const decided = acceptance !== null && acceptance !== undefined;
+  const executed = state === 'awaiting-host-review' || decided;
+  let label;
+  let tone;
+  let note;
+  let phaseLabel;
+  if (accepted) {
+    label = '审查通过';
+    tone = 'on';
+    note = '宿主已记录验收结论：审查通过。';
+    // The run is over AND reviewed, so the phase would only repeat itself.
+    phaseLabel = null;
+  } else if (decided) {
+    label = '需要修正';
+    tone = 'warn';
+    note = '宿主已记录验收结论：需要修正（本任务的执行结果未被接受）。';
+    phaseLabel = null;
+  } else if (state === 'awaiting-host-review') {
+    label = '等待宿主审查';
+    tone = 'warn';
+    note = '执行已完成，等待宿主（Codex）审查；插件不会自行验收。';
+    // Stated once, as the headline above; a second identical phase badge is noise.
+    phaseLabel = null;
+  } else if (state === 'failed') {
+    label = taskStateLabel(state);
+    tone = 'warn';
+    note = '执行失败；错误详情见下方证据。';
+    phaseLabel = null;
+  } else if (state === 'cancelled') {
+    label = taskStateLabel(state);
+    tone = 'off';
+    note = '任务已取消，未产生验收结论。';
+    phaseLabel = null;
+  } else {
+    label = taskStateLabel(state);
+    tone = state === 'running' ? 'on' : 'off';
+    note = '任务尚未产生结果。';
+    // A live run DOES keep a distinct phase badge: it says what is happening right now,
+    // which the state label does not. That is information, not a contradiction.
+    phaseLabel = taskPhaseLabel(task?.phase);
+  }
+  return { label, tone, executed, accepted, decided, phaseLabel, note };
 }
 
+/**
+ * The host-review badge for one task, or `null` when the headline already says it.
+ *
+ * `taskOutcome(...).label` is the primary status; this exists so a caller that wants a
+ * SEPARATE review badge gets exactly the same wording and tone rather than a second,
+ * possibly contradictory, string. It returns `null` whenever the headline already carries
+ * the review state, which is what keeps "等待审查" from appearing twice — or alongside
+ * "审查通过".
+ * @param {object} task - task view.
+ * @returns {{ label: string, tone: string } | null} badge, or null to show nothing.
+ */
+export function hostReviewBadge(task) {
+  const acceptance = task?.hostAcceptance;
+  if (acceptance === null || acceptance === undefined) return null;
+  // Derive from the same helper, so the two can never disagree.
+  const { label, tone } = taskOutcome(task);
+  return { label, tone };
+}
+
+/**
+ * A task's recorded review conclusion as one bounded display line.
+ *
+ * Only a short note and the time are shown: the stored note is already redacted, and
+ * nothing else about the review exists.
+ * @param {object} task - task view.
+ * @param {(at: number) => string} formatTime - time formatter from the page.
+ * @returns {string} display text.
+ */
+export function hostReviewLine(task, formatTime) {
+  const acceptance = task?.hostAcceptance;
+  if (acceptance === null || acceptance === undefined) return '未记录（插件不会自行验收）';
+  const label = acceptance.accepted === true ? '审查通过' : '需要修正';
+  const at = typeof acceptance.acceptedAt === 'number' ? `（${formatTime(acceptance.acceptedAt)}）` : '';
+  const note = typeof acceptance.note === 'string' && acceptance.note !== ''
+    ? `：${boundedText(acceptance.note, 200)}`
+    : '';
+  return `${label}${at}${note}`;
+}
 /**
  * Discoverable changed-file list in a task's diff payload.
  *
@@ -2183,22 +2338,26 @@ export function createStore(options = {}) {
     },
 
     /**
-     * Replace only the two silence thresholds.
+     * Replace the silence thresholds and the repeated-failure count.
      *
      * The narrow route exists so an operator adjusting a timer cannot rewrite a
      * provider list. On success the committed document is adopted for `settings` and
      * the draft's monitoring block, and OTHER unsaved draft edits are left alone —
      * a timer save must never discard a half-finished provider edit.
-     * @param {{ selfCheckSeconds: number, attentionSeconds: number }} monitoring - already-validated block.
+     *
+     * Order matters: the RAW block is validated first and only then normalized for the
+     * wire. Validating the normalized block would accept a cleared field, because
+     * `monitoringOf` replaces it with the documented default.
+     * @param {{ selfCheckSeconds: number, attentionSeconds: number, repeatFailureThreshold: number }} monitoring - the block as the operator typed it.
      * @returns {Promise<{ ok: boolean, error?: unknown }>} outcome.
      */
     async saveMonitoring(monitoring) {
-      const normalized = monitoringOf({ monitoring });
-      const problems = precheckMonitoring(normalized);
+      const problems = precheckMonitoring(monitoring);
       if (problems.length > 0) {
         notify('error', `未保存：${problems.join('；')}`);
         return { ok: false, problems };
       }
+      const normalized = monitoringOf({ monitoring });
       return await track('monitoring', async () => {
         try {
           const body = await api.putMonitoring(normalized);

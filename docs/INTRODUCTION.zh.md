@@ -18,6 +18,8 @@
 
 需要更大权限的工具调用会暂停，指挥端根据准确操作和指纹决定单次允许或拒绝，不是默认全部放行。交付后集中审查，修正通过 `continueFromTaskId` 续接原对话与执行工作区。
 
+1.4.0 明确长等待及同一等待单元续接规则，新增默认 3 次的重复工具失败提醒（可调整，0 关闭）。指挥端审查交付后通过 `delegate_review` 写回结论，任务页区分“审查通过”“需要修正”和尚未审查，避免记录始终停在待审。
+
 1.3.2 起，新建的 DSH 工作区按实际工作内容命名，例如“制作潘德 G 版装备表”，不再只显示工作树的任务编号。指挥端随派工提交标题，旧客户端则从任务目标提取；续接同一任务时保留原名称与对话。
 
 ## 连接 Claude Code 与 Codex
@@ -27,8 +29,8 @@
 
 ## 安装、升级和边界
 
-项目原名 DSH Delegate，1.3.0 曾使用 DSH TaskDispatch。1.3.1 起统一为 **DSH TaskBridge**，包名为 `dsh-taskbridge`。从旧包升级请先阅读 [更名升级说明](taskbridge-upgrade.md)。在 DSH“添加插件”中输入 `dsh-taskbridge@1.3.2`；中国大陆镜像若尚未同步，改选 npm 官方源。GitHub Release 同时提供安装包。
+项目原名 DSH Delegate，1.3.0 曾使用 DSH TaskDispatch。1.3.1 起统一为 **DSH TaskBridge**，包名为 `dsh-taskbridge`。从旧包升级请先阅读 [更名升级说明](taskbridge-upgrade.md)。在 DSH“添加插件”中输入 `dsh-taskbridge@1.4.0`；中国大陆镜像若尚未同步，改选 npm 官方源。GitHub Release 同时提供安装包。
 
 [插件索引与更新说明](plugin-market.md)介绍如何添加索引，在 DSH 的“发现”中搜索本插件。发布自定义索引不代表已进入官方内置市场；DSH 当前需要用户自行添加可信索引。
 
-插件并不保证客户端完全零唤醒，实际 token 节省比例尚未量化。Windows 自动测试和临时目录迁移验收不等同于所有平台、完整 Desktop 更新/重启或所有 MCP 客户端均已验收。
+同一 Codex 模型的约 45 秒等待对照样本中，长等待把模型响应从 3 次减少为 1 次，记录的等待阶段 token 总量减少 66.58%。这不是整个任务或账单的节省比例；方法与边界见[测量报告](releases/1.4.0-token-benchmark.zh.md)。插件不保证所有客户端完全零唤醒，Windows 与隔离迁移测试也不等同于所有平台和客户端均已验收。

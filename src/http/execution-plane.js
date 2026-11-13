@@ -64,6 +64,13 @@ export function createExecutionHandler(deps) {
     // The switch gate below applies to it exactly as it does to a submission,
     // because a decision is an authorization exercise like any other.
     ['POST /tasks/permission', decidePermission],
+    // The commander's DELIVERY REVIEW of one finished task. It is the only write that
+    // records `hostAcceptance`, and it is narrow on purpose: it decides no permission,
+    // changes no switch/provider/model/isolation/credential, merges no file and creates
+    // no task. Because it only records a conclusion about a result that already exists, it
+    // is NOT gated by the delegation switch — like `/tasks/get` and `/tasks/cancel`, it
+    // stays answerable with the switch off.
+    ['POST /tasks/review', recordHostReview],
     // Read-only workspace inspection for a dispatcher: the facts and the isolation
     // recommendation that used to be discovered only when a job admitted. It is a
     // separate route — not a field on `/tasks` — because it neither authorizes nor
@@ -109,10 +116,11 @@ export function createExecutionHandler(deps) {
 
       let connection;
       if (deps.engine.authorizationMode === 'switch') {
-        // Both AUTHORIZING verbs need the switch: a submission creates work and a
-        // decision releases a paused call. Reads, cancel and preflight stay
-        // answerable while the switch is off, so an operator can always observe and
-        // stop what already exists.
+        // Only the two AUTHORIZING verbs need the switch: a submission creates work and a
+        // decision releases a paused call. A delivery REVIEW is not one of them: it records
+        // a conclusion about an already-finished result, so it stays answerable with the
+        // switch off, exactly like reading or cancelling a task. Reads, cancel and
+        // preflight are equally unaffected.
         const gated = key === 'POST /tasks' || key === 'POST /tasks/permission';
         if (gated && deps.engine.posture().authorized !== true) {
           sendJson(res, 403, {
@@ -309,6 +317,52 @@ async function decidePermission({ req, res, connection, deps }) {
     decision: body.decision,
     ...(typeof body.reason === 'string' ? { reason: body.reason } : {}),
     ...(typeof body.fingerprint === 'string' ? { fingerprint: body.fingerprint } : {}),
+  });
+  sendJson(res, 200, { ok: true, ...result });
+}
+
+/** Body fields `POST /tasks/review` accepts. Everything else is refused. */
+const REVIEW_FIELDS = Object.freeze(['taskId', 'decision', 'note']);
+
+/** Longest review note the route will even read, in characters. */
+const REVIEW_NOTE_MAX_CHARS = 1_000;
+
+/**
+ * Record the commander's delivery review of one finished task.
+ *
+ * The body is validated here as well as in the engine and in the MCP server, because this
+ * route is reachable by any local caller: a closed field set, a closed decision vocabulary
+ * and a bounded non-empty note are refused before anything is read or written. The
+ * connection identity is taken from the authenticated request, never from the body, so a
+ * caller can only review its OWN task.
+ * @param {object} context - `req`, `res`, `connection`, `deps`.
+ * @returns {Promise<void>} resolves after the answer is sent.
+ */
+async function recordHostReview({ req, res, connection, deps }) {
+  const body = await readJsonBody(req);
+  for (const key of Object.keys(body)) {
+    if (!REVIEW_FIELDS.includes(key)) {
+      throw new HttpError(400, 'REVIEW_ARGUMENT_UNKNOWN', `tasks/review does not accept ${JSON.stringify(key)}`);
+    }
+  }
+  if (typeof body.taskId !== 'string' || body.taskId.trim() === '') {
+    throw new HttpError(400, 'TASK_ID_REQUIRED', 'taskId is required');
+  }
+  if (body.decision !== 'accepted' && body.decision !== 'changes-requested') {
+    throw new HttpError(400, 'REVIEW_DECISION_INVALID', 'decision must be accepted or changes-requested');
+  }
+  if (typeof body.note !== 'string' || body.note.trim() === '') {
+    throw new HttpError(400, 'REVIEW_NOTE_REQUIRED', 'note must be a non-empty string');
+  }
+  if (body.note.trim().length > REVIEW_NOTE_MAX_CHARS) {
+    throw new HttpError(400, 'REVIEW_NOTE_TOO_LONG', `note must be at most ${REVIEW_NOTE_MAX_CHARS} characters`);
+  }
+  const result = await deps.engine.recordHostReview({
+    // The verified connection, not `body.connectionId`: a caller cannot name an owner.
+    connectionId: connection.connectionId,
+    taskId: body.taskId,
+    decision: body.decision,
+    note: body.note,
   });
   sendJson(res, 200, { ok: true, ...result });
 }

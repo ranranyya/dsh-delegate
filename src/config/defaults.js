@@ -79,6 +79,11 @@ export const LIMITS = Object.freeze({
   selfCheckSecondsMax: 60 * 60,
   attentionSecondsMin: 31,
   attentionSecondsMax: 2 * 60 * 60,
+  // Repeated-failure reminder. `0` disables it, so the minimum is a switch rather
+  // than an error; the ceiling keeps a silly value from being indistinguishable from
+  // "off" in practice. This is a COUNT, not a duration.
+  repeatFailureThresholdMin: 0,
+  repeatFailureThresholdMax: 20,
   promptChars: 200_000,
   reviewPromptChars: 400_000,
 });
@@ -95,6 +100,13 @@ export const MONITORING_DEFAULTS = Object.freeze({
   selfCheckSeconds: 300,
   /** Idle span after which the wait reports `attention` instead of `heartbeat`. */
   attentionSeconds: 600,
+  /**
+   * How many CONSECUTIVE identical tool failures are reported once, or `0` to disable.
+   *
+   * Independent of the two silence thresholds: a run can be busy and still be failing
+   * the same way, which is the case this exists for.
+   */
+  repeatFailureThreshold: 3,
 });
 
 /**

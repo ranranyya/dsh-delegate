@@ -1007,6 +1007,12 @@ export function validSettings(overrides = {}) {
     projectOverrides: overrides.projectOverrides ?? {},
     // Omitted unless a test asks for it, so the "document written before this
     // field existed" case is what a plain fixture models — and validation has to
+    // fill in the default. When a test DOES pass a block it is forwarded verbatim,
+    // including `repeatFailureThreshold`, so a test can prove the frozen value the
+    // task actually ran under instead of silently getting the default.
+    ...(overrides.monitoring === undefined ? {} : { monitoring: { ...overrides.monitoring } }),
+    // Omitted unless a test asks for it, so the "document written before this
+    // field existed" case is what a plain fixture models — and validation has to
     // fill in the default.
     ...(overrides.conversation === undefined ? {} : { conversation: overrides.conversation }),
   };

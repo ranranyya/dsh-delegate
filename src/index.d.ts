@@ -227,6 +227,17 @@ export interface DelegateTaskActivity {
   selfCheckSeconds: number;
   attentionSeconds: number;
   /**
+   * The repeated-failure reminder: how many consecutive identical tool failures are
+   * reported once (`0` = off), and the bounded trail of episodes already reported.
+   *
+   * Optional and nullable: a record stored by an older build has no such field, and
+   * `repeatFailureOf` projects one as `null`, so a stored history row may omit it.
+   */
+  repeatFailure?: {
+    threshold: number;
+    reported: DelegateRepeatedFailure[];
+  } | null;
+  /**
    * `null` while the run is live. Once the task ended it holds the recorded end, and
    * every elapsed value above is measured against it — a stored or queried record
    * therefore does not keep growing.
@@ -240,6 +251,40 @@ export interface DelegateTaskActivity {
   interrupted?: true;
   /** Present only in a STORED record: the tool that was cut off by the restart. */
   interruptedTool?: { name: string | null; callId: string | null; startedAt: number | null; elapsedMs: number | null } | null;
+}
+
+/**
+ * One reported repeated-failure episode.
+ *
+ * Only identifiers, a digest and counts: the native tool arguments, the result content,
+ * the error's free text and any model output are never retained, so nothing here can
+ * carry them.
+ */
+export interface DelegateRepeatedFailure {
+  /** Fixed discriminator, so a client can tell this apart from a silence report. */
+  kind: 'repeated-tool-failure';
+  /** The native tool name. */
+  toolName: string;
+  /**
+   * A recognized common tool failure code (for example `ENOENT`, `EACCES`, `TIMEOUT`), or
+   * `TOOL_ERROR` for anything this build does not positively recognize. An arbitrary
+   * `error.code`/`error.name` is never echoed: it is free text that can carry a path or a
+   * token.
+   */
+  failureCode: string;
+  /** 16-hex digest of the operation, never the operation itself. */
+  operationDigest: string;
+  /** How many identical failures were counted when the reminder fired. */
+  consecutive: number;
+  /** The threshold in force for this task. */
+  threshold: number;
+  /**
+   * When the FIRST failure of this episode happened, not when the threshold was reached:
+   * the episode is older than the reminder.
+   */
+  firstSeenAt: number;
+  /** When the failure that completed the threshold happened. */
+  lastSeenAt: number;
 }
 
 /** Why one observation of a running task returned. */
@@ -274,12 +319,61 @@ export interface DelegateObservationSummary {
     model: string | null;
     reasoningEffort: string | null;
     isolation: string | null;
-    monitoring: { selfCheckSeconds: number | null; attentionSeconds: number | null };
+    monitoring: {
+      selfCheckSeconds: number | null;
+      attentionSeconds: number | null;
+      repeatFailureThreshold: number | null;
+    };
   } | null;
   connectionId: string | null;
   /** Always false: execution completion is not host acceptance. */
   selfApproved: false;
-  hostAcceptance: null;
+  /** The commander's recorded delivery review, or null while none exists. */
+  hostAcceptance: DelegateHostAcceptance | null;
+}
+
+/**
+ * A replayed (idempotent) review request and its answer.
+ *
+ * `decision` is the closed vocabulary the review verb accepts; a note is required and
+ * bounded. Repeating the same decision with the same note is a no-op; a different
+ * conclusion is refused.
+ */
+export interface DelegateReviewRequest {
+  taskId: string;
+  decision: 'accepted' | 'changes-requested';
+  /** Required, non-empty, at most 1000 characters; stored redacted. */
+  note: string;
+}
+
+/** Answer of one recorded delivery review. */
+export interface DelegateReviewResult {
+  /**
+   * The public task view after the decision. Its `state` stays `awaiting-host-review`
+   * (that is the compatible underlying state); the conclusion is `hostAcceptance`.
+   */
+  task: { taskId: string; state: string; phase: string; hostAcceptance: DelegateHostAcceptance | null };
+  hostAcceptance: DelegateHostAcceptance;
+}
+
+/**
+ * The commander's recorded delivery review of one finished task.
+ *
+ * This is the ONLY record that turns "execution finished" into a host conclusion. It is
+ * written by the review verb, never derived from a task's state, and the first decision is
+ * final for that task.
+ */
+export interface DelegateHostAcceptance {
+  /** True only when the recorded decision was `accepted`. */
+  accepted: boolean;
+  /** The recorded conclusion. */
+  state: 'accepted' | 'changes-requested';
+  /** When the decision was recorded, in epoch milliseconds. */
+  acceptedAt: number;
+  /** Fixed marker for who recorded it; never a caller-supplied name. */
+  by: string;
+  /** The redacted, bounded conclusion. */
+  note: string;
 }
 
 /** Result of one bounded observation of a delegated task. */
@@ -292,6 +386,12 @@ export interface DelegateObservation {
    * never shortened into an undecidable summary.
    */
   permission: DelegatePendingPermission | null;
+  /**
+   * Present only when `reason` is `attention` AND the reminder is about repeated
+   * failures rather than silence. `null`/absent for an ordinary silence report, which
+   * keeps the two distinguishable without a new reason value.
+   */
+  failure?: DelegateRepeatedFailure | null;
   activity: DelegateTaskActivity | null;
   selfCheck: { episode: number | null; checkedAt: number | null; verdict: string | null } | null;
   /**

@@ -70,6 +70,10 @@ const ROUTES = Object.freeze({
   // plane registers exactly this path, and a name-to-path guess would 404 with
   // `EXECUTION_ROUTE_UNKNOWN` on the one call that unblocks a paused worker.
   permission: Object.freeze({ method: 'POST', path: '/tasks/permission' }),
+  // The commander's delivery review. Spelled out like every other route: the plane
+  // registers exactly `/tasks/review`, so a missing entry here refused the one call that
+  // records `hostAcceptance` with `MCP_ROUTE_UNMAPPED` before any request was sent.
+  review: Object.freeze({ method: 'POST', path: '/tasks/review' }),
   // Read-only workspace facts. Registered on the execution plane beside `/status`
   // so it answers with the switch off; it creates nothing to clean up.
   preflight: Object.freeze({ method: 'POST', path: '/workspace/preflight' }),

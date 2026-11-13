@@ -632,6 +632,7 @@ function effectiveView(value) {
       ? {
         selfCheckSeconds: count(value.monitoring.selfCheckSeconds),
         attentionSeconds: count(value.monitoring.attentionSeconds),
+        repeatFailureThreshold: count(value.monitoring.repeatFailureThreshold),
       }
       : null,
     provenance: {
@@ -1029,6 +1030,33 @@ function activityView(value) {
       }
       : {}),
     kinds,
+    // The repeated-failure reminder as bounded evidence: a tool NAME, a failure CODE,
+    // an operation digest and counts. No arguments, no output, no error prose — the
+    // live monitor already reduced it to that, and this keeps the same shape.
+    repeatFailure: repeatFailureOf(value.repeatFailure),
+  };
+}
+
+/**
+ * Project a stored `repeatFailure` block, dropping anything but the bounded facts.
+ * @param {unknown} value - candidate block.
+ * @returns {object | null} projection.
+ */
+function repeatFailureOf(value) {
+  if (!isPlainObject(value)) return null;
+  const reported = Array.isArray(value.reported) ? value.reported : [];
+  return {
+    threshold: count(value.threshold),
+    reported: reported.filter(isPlainObject).slice(0, 32).map((entry) => ({
+      kind: label(entry.kind),
+      toolName: label(entry.toolName),
+      failureCode: label(entry.failureCode),
+      operationDigest: label(entry.operationDigest),
+      consecutive: count(entry.consecutive),
+      threshold: count(entry.threshold),
+      firstSeenAt: time(entry.firstSeenAt),
+      lastSeenAt: time(entry.lastSeenAt),
+    })),
   };
 }
 

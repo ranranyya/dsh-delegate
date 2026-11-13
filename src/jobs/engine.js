@@ -46,6 +46,12 @@
 // an operator who cancelled did ask to stop, and reporting a timeout instead
 // would misattribute the outcome.
 //
+// Phases. A phase is what the task is doing now, and every terminal branch publishes
+// the phase matching the state it recorded (`failed`, `cancelled`,
+// `awaiting-host-review`). `execute` is published only from the executor's own
+// recognised event ({@link onExecutionEvent}): a pending native create is not
+// execution, and no late event overwrites `awaiting-permission` or a terminal phase.
+//
 // Cleanup. Release of a lease, release of the concurrency slot and completion of a
 // prepared tree all happen in {@link finalize}, which is idempotent and runs on
 // every exit path — successful completion, cancellation, timeout, failure and an
@@ -134,6 +140,16 @@ export const JOB_CODES = Object.freeze({
   // still `running`; the PHASE says it is waiting for the commander's decision.
   // `waitingForPermission` is not a terminal state and is not a failure.
   permissionPending: 'JOB_PERMISSION_PENDING',
+  // Host review (delivery acceptance). These are refusals of the REVIEW verb, not new
+  // task states: the task keeps `awaiting-host-review` and its underlying outcome.
+  //  * notReviewable: the task is not waiting for review (still running, failed,
+  //    cancelled, interrupted, or already has a DIFFERENT recorded decision);
+  //  * invalid: the decision/note did not pass the closed vocabulary or the bound;
+  //  * notPersisted: the decision was made but could not be written to history, so the
+  //    caller is TOLD it was not saved instead of being told it succeeded.
+  reviewNotReviewable: 'JOB_REVIEW_NOT_REVIEWABLE',
+  reviewInvalid: 'JOB_REVIEW_INVALID',
+  reviewNotPersisted: 'JOB_REVIEW_NOT_PERSISTED',
 });
 
 /** Default interval of the internal authorization sweep. */
@@ -182,6 +198,25 @@ const HISTORY_WRITE_TIMEOUT_MS = 5000;
 const MAX_RETAINED_TASKS = 256;
 
 /**
+ * The closed vocabulary of host-review decisions.
+ *
+ * `accepted` is the host saying "I reviewed the delivered evidence and it is right".
+ * `changes-requested` is the same review with a different conclusion. Neither is a task
+ * state: the run stays `awaiting-host-review`, which is what keeps older clients and a
+ * later `continueFromTaskId` follow-up compatible.
+ */
+export const HOST_REVIEW_STATES = Object.freeze({
+  accepted: 'accepted',
+  changesRequested: 'changes-requested',
+});
+
+/** Bounds on a review note: non-empty for a decision, and never unbounded. */
+const REVIEW_NOTE_MAX_CHARS = 1_000;
+
+/** The fixed marker recorded as the reviewer, so a stored decision is not a free name. */
+const HOST_REVIEW_BY = 'host-commander';
+
+/**
  * The phase a running task reports while a permission request is outstanding.
  *
  * It is a PHASE, not a state, on purpose: the worker is still running and its
@@ -192,6 +227,25 @@ const MAX_RETAINED_TASKS = 256;
  */
 const PHASE_AWAITING_PERMISSION = 'awaiting-permission';
 const PHASE_EXECUTE = 'execute';
+
+/**
+ * The phase a running task reports until its executor demonstrably does work.
+ *
+ * Every admission step has finished and the runner has been called, but a native
+ * create may still be pending (a placement is resolved through the controllers
+ * first), so this phase claims only "submitted", never "executing".
+ */
+const PHASE_BEFORE_CREATE = 'before-create';
+
+/**
+ * Session event types that prove the executor itself is working.
+ *
+ * The durable lifecycle types only: an opened turn, an opened model step and a
+ * native tool call/result cannot be produced by a pending create, whereas a
+ * streaming delta can arrive empty while a provider is still connecting.
+ * @type {ReadonlySet<string>}
+ */
+const EXECUTION_EVIDENCE_EVENTS = Object.freeze(new Set(['turn/start', 'step/start', 'tool/call', 'tool/result']));
 
 /**
  * The closed vocabulary of reasons one observation may report to a caller.
@@ -293,6 +347,9 @@ export class JobEngine {
     // Observers currently waiting, so disposal can release them without touching
     // the workers they were only watching.
     this.observers = new Set();
+    // One in-flight host-review write per task, so two concurrent identical requests
+    // cannot both claim success before the durable write has actually landed.
+    this.reviewWrites = new Map();
     this.listen();
   }
 
@@ -2169,6 +2226,182 @@ export class JobEngine {
   }
 
   /**
+   * Record the commander's delivery review for one finished task.
+   *
+   * This is the ONLY writer of a task's `hostAcceptance`, and it is deliberately the
+   * narrowest write in the plugin. It does not decide a permission, change the switch,
+   * a provider, a model, the isolation or a credential, merge a file, or create work:
+   * it records "the host looked at what was delivered and concluded X" on a task whose
+   * execution has already ended.
+   *
+   * The run's STATE is left `awaiting-host-review`. That is the compatibility anchor: an
+   * older client keeps reading the same state, and `continueFromTaskId` keeps working.
+   * The review conclusion lives in its own field.
+   *
+   * The chain of checks, all refusals:
+   *  1. the task exists and belongs to the deciding connection (a foreign task answers
+   *     exactly like an unknown one);
+   *  2. the decision and note pass the closed vocabulary and the bound;
+   *  3. closing the delegation switch does not prevent reviewing an existing result;
+   *  4. the task is actually waiting for review AND its native executor has settled, so
+   *     "still running" can never be recorded as reviewed;
+   *  5. an existing decision is final: the SAME conclusion with the SAME note is an
+   *     idempotent no-op, and a DIFFERENT one is refused (a correction is a follow-up
+   *     task, not a rewrite of the record);
+   *  6. only then is it stored, and only reported as stored when the durable write
+   *     succeeded.
+   * @param {object} request - `taskId`, `decision`, `note`, and the authenticated
+   *   `connectionId` (from the plane, never from the caller's body).
+   * @returns {Promise<object>} `{ task, hostAcceptance }` where `task` is the public view.
+   * @throws {JobError} on any refusal.
+   */
+  async recordHostReview(request) {
+    const connectionId = typeof request?.connectionId === 'string' ? request.connectionId : null;
+    if (connectionId === null) {
+      // No verified identity means no ownership proof: the same answer an unknown task gets.
+      throw new JobError(JOB_CODES.taskNotFound, 'no such task for this connection', {});
+    }
+    const taskId = typeof request?.taskId === 'string' ? request.taskId.trim() : '';
+    if (taskId === '') {
+      throw new JobError(JOB_CODES.reviewInvalid, 'taskId is required', { field: 'taskId' });
+    }
+    const decision = request?.decision;
+    if (decision !== HOST_REVIEW_STATES.accepted && decision !== HOST_REVIEW_STATES.changesRequested) {
+      throw new JobError(JOB_CODES.reviewInvalid,
+        `decision must be ${HOST_REVIEW_STATES.accepted} or ${HOST_REVIEW_STATES.changesRequested}`,
+        { field: 'decision' });
+    }
+    const rawNote = typeof request?.note === 'string' ? request.note.trim() : '';
+    if (rawNote === '') {
+      throw new JobError(JOB_CODES.reviewInvalid, 'note must be a non-empty string', { field: 'note' });
+    }
+    if (rawNote.length > REVIEW_NOTE_MAX_CHARS) {
+      throw new JobError(JOB_CODES.reviewInvalid, `note must be at most ${REVIEW_NOTE_MAX_CHARS} characters`, {
+        field: 'note',
+        limit: REVIEW_NOTE_MAX_CHARS,
+        length: rawNote.length,
+      });
+    }
+
+    const task = this.tasks.get(taskId);
+    if (task === undefined || task.connectionId !== connectionId) {
+      throw new JobError(JOB_CODES.taskNotFound, 'no such task for this connection', { taskId });
+    }
+    // NO posture gate here, deliberately. A review records a conclusion about a result
+    // that already exists: it creates no work, releases no permission, issues no grant and
+    // changes no setting. Like reading a task or cancelling it, it therefore stays
+    // available after the operator closes the switch — you must still be able to review
+    // what you already paid for. Starting a NEW task and answering a permission request
+    // remain gated by the switch at their own entry points.
+    // Only a finished execution can be reviewed. `awaiting-host-review` is the state the
+    // engine records after a completed run, and `native.settled` is the second,
+    // independent proof that the executor is gone: neither can be inferred by the caller.
+    if (task.state !== TASK_STATES.awaitingHostReview || task.native?.settled !== true) {
+      throw new JobError(JOB_CODES.reviewNotReviewable, 'this task is not awaiting host review', {
+        taskId,
+        state: task.state,
+        phase: task.phase,
+      });
+    }
+
+    // The note is redacted through the same bounded redaction the rest of the projection
+    // uses, so a stored conclusion cannot smuggle a credential into history or a view.
+    const note = redactText(rawNote).slice(0, REVIEW_NOTE_MAX_CHARS);
+
+    // One review write per task at a time. Without this, a second identical request
+    // arriving while the first is still awaiting `history.save` would see the in-memory
+    // record and answer "idempotent success" before that write had actually landed — and
+    // if the write then failed, BOTH callers would have been told something that was not
+    // true. The latch is a promise chained on the previous attempt, so a failed write
+    // releases it and the next caller re-attempts rather than hanging.
+    const previous = this.reviewWrites.get(taskId) ?? Promise.resolve();
+    // A rejected predecessor must not poison the chain: every caller retries the write
+    // itself, it does not inherit the failure.
+    const attempt = previous.then(
+      () => this.applyHostReview(task, decision, note),
+      () => this.applyHostReview(task, decision, note),
+    );
+    // Store a latched (never-rejecting) form, so the next caller can chain on it without
+    // an unhandled rejection, and so a failure genuinely frees the duty to re-attempt.
+    const latched = attempt.then(() => undefined, () => undefined);
+    this.reviewWrites.set(taskId, latched);
+    try {
+      return await attempt;
+    } finally {
+      // Only the LAST attempt clears the latch. An earlier attempt finishing late must not
+      // expose a window in which a newer writer is not serialised behind it.
+      if (this.reviewWrites.get(taskId) === latched) this.reviewWrites.delete(taskId);
+    }
+  }
+
+  /**
+   * Apply one already-validated review decision and make it durable.
+   *
+   * Split out of {@link recordHostReview} so the caller can SERIALISE it per task: the
+   * read of the existing record, the decision and the durable write must happen as one
+   * step, or two concurrent identical requests could both observe "no decision yet" and
+   * both claim success before either had written anything.
+   * @param {object} task - the task record, already proven reviewable and owned.
+   * @param {string} decision - `accepted` or `changes-requested`.
+   * @param {string} note - already redacted and bounded.
+   * @returns {Promise<object>} `{ task, hostAcceptance }` public views.
+   * @throws {JobError} on a conflicting decision or a failed durable write.
+   */
+  async applyHostReview(task, decision, note) {
+    const existing = task.hostAcceptance;
+    if (existing !== null && existing !== undefined) {
+      if (existing.state === decision && existing.note === note) {
+        // The same conclusion replayed: an idempotent success, not a second record. It is
+        // only reached AFTER the first attempt settled, so a first write that failed was
+        // already rolled back and this caller really does record it.
+        const replayed = this.view(task);
+        return { task: replayed, hostAcceptance: replayed.hostAcceptance };
+      }
+      throw new JobError(JOB_CODES.reviewNotReviewable,
+        'this task already has a recorded review; send a follow-up task to record a correction', {
+          taskId: task.taskId,
+          state: task.state,
+          recorded: existing.state,
+          requested: decision,
+        });
+    }
+
+    task.hostAcceptance = {
+      accepted: decision === HOST_REVIEW_STATES.accepted,
+      state: decision,
+      acceptedAt: this.clock(),
+      by: HOST_REVIEW_BY,
+      note,
+    };
+    // The record must be durable before the caller is told it exists: a review that is
+    // lost on restart would silently put the task back to "not reviewed". With no history
+    // store at all — or one with no `save` to call — there is nothing to write to, and
+    // `persistHistory` answers success for that case (it is the ordinary "no durable
+    // history" posture), which would let a review be claimed as saved when it is not.
+    if (this.history === null || this.history === undefined || typeof this.history.save !== 'function') {
+      task.hostAcceptance = null;
+      throw new JobError(JOB_CODES.reviewNotPersisted,
+        'no durable history store is configured, so the review decision was not recorded', {
+          taskId: task.taskId,
+          historyError: null,
+        });
+    }
+    const saved = await this.persistHistory(task);
+    if (saved !== true) {
+      // The in-memory record is rolled back so the two cannot disagree, and the caller is
+      // told the decision was NOT saved rather than being told it succeeded.
+      task.hostAcceptance = null;
+      throw new JobError(JOB_CODES.reviewNotPersisted,
+        'the review decision could not be written to history, so it was not recorded', {
+          taskId: task.taskId,
+          historyError: task.historyError ?? null,
+        });
+    }
+    const view = this.view(task);
+    return { task: view, hostAcceptance: view.hostAcceptance };
+  }
+
+  /**
    * Stop every outstanding request of one task and disarm its bridge.
    *
    * Called from every path that ends a run — a terminal state, cancellation,
@@ -2449,7 +2682,7 @@ export class JobEngine {
 
       // The last gate before a native agent exists. Everything above awaited at
       // least once; this re-check runs in the same step as the creation call.
-      task.phase = 'before-create';
+      task.phase = PHASE_BEFORE_CREATE;
       this.assertLive(task, 'before-create');
 
       // The native executor comes into existence here. `started` is recorded
@@ -2466,6 +2699,10 @@ export class JobEngine {
       // the run keeps the fail-closed `never` stance and nothing about it changes.
       const bridge = this.createPermissionBridge(task);
       task.permission.bridge = bridge;
+      // `started` means "this task called the runner", not "the executor is
+      // running": placement resolves before the runner sees an Agent, so the task
+      // is handed over in `before-create` and only the executor's own events
+      // ({@link onExecutionEvent}) publish `execute`.
       task.native.started = true;
       const pending = runAgent(this.deps, {
         prompt,
@@ -2511,7 +2748,8 @@ export class JobEngine {
         // the event was progress, and (for a tool event) its name and call id.
         // Reasoning text, assistant text and tool arguments are never retained or
         // forwarded — there is no field in the summary they could travel in.
-        onEvent: (event) => { task.monitor?.onEvent(event, this.clock()); },
+        // This hook is also the only execution evidence the phase trusts.
+        onEvent: (event) => { this.onExecutionEvent(task, event); },
       });
       task.native.promise = pending;
       let run;
@@ -2574,12 +2812,16 @@ export class JobEngine {
       }
       if (run.outcome === RUN_OUTCOMES.timedOut) {
         task.state = TASK_STATES.failed;
+        task.phase = 'failed';
         task.error = { code: JOB_CODES.timeout, message: 'the task exceeded its time budget' };
         task.endedAt = Date.now();
         return;
       }
       if (run.outcome !== RUN_OUTCOMES.completed) {
         task.state = TASK_STATES.failed;
+        // The phase states the same ending as the state, so a failed run never keeps
+        // describing a creation or an execution.
+        task.phase = 'failed';
         // Three endings that are not completion, kept apart because they need
         // different fixes:
         //  * the model was stopped by its own output budget (`max-tokens`) — raise
@@ -2694,6 +2936,7 @@ export class JobEngine {
       waitSliceMs: this.observeSliceMs,
       selfCheckSeconds: monitoring?.selfCheckSeconds ?? MONITORING_DEFAULTS.selfCheckSeconds,
       attentionSeconds: monitoring?.attentionSeconds ?? MONITORING_DEFAULTS.attentionSeconds,
+      repeatFailureThreshold: monitoring?.repeatFailureThreshold ?? MONITORING_DEFAULTS.repeatFailureThreshold,
       log: (message, detail) => this.deps?.logger?.warn?.(message, detail),
     });
   }
@@ -2756,6 +2999,26 @@ export class JobEngine {
   }
 
   /**
+   * Feed one native executor event to the run's monitor and, on real evidence that
+   * the executor is working, publish `execute`.
+   *
+   * Only a live task still at {@link PHASE_BEFORE_CREATE} advances, so a late event
+   * can never overwrite `awaiting-permission`, `review`, a terminal phase or a
+   * `pending` task.
+   * @param {object} task - running task record.
+   * @param {unknown} event - native event dispatched by the runner.
+   * @returns {void}
+   */
+  onExecutionEvent(task, event) {
+    task.monitor?.onEvent(event, this.clock());
+    if (task.state === TASK_STATES.running
+      && task.phase === PHASE_BEFORE_CREATE
+      && EXECUTION_EVIDENCE_EVENTS.has(event?.type)) {
+      task.phase = PHASE_EXECUTE;
+    }
+  }
+
+  /**
    * The bounded, publishable activity block of one task view.
    *
    * Safe by construction: counts, timestamps and identifiers only. No transcript,
@@ -2814,8 +3077,11 @@ export class JobEngine {
    *    observer of the same task.
    * @param {string} taskId - task to observe.
    * @param {object} [options] - `connectionId`, `waitMs` (default 25000, max 25000), `signal`.
-   * @returns {Promise<{ task: object, reason: string, permission: object | null, activity: object | null,
+   * @returns {Promise<{ task: object, reason: string, permission: object | null,
+   *   failure: object | null, activity: object | null,
    *   selfCheck: object | null, wait: { waitMs: number, waitedMs: number, activitySinceWait: boolean } }>} observation.
+   *   `failure` is present only when `attention` reports a repeated-tool-failure
+   *   reminder; it carries a tool name, a failure code, an operation digest and counts.
    * @throws {JobError} `JOB_TASK_NOT_FOUND` for an unknown or foreign task.
    */
   async observeTask(taskId, options = {}) {
@@ -2854,7 +3120,11 @@ export class JobEngine {
     // request beats a silence report. `heartbeat` is the only reason that yields.
     const settled = this.settleReason(task);
     if (settled !== null) reason = settled;
-    return this.observationOf(task, reason, monitor, waitMs, outcome.waitedMs, outcome.activitySinceWait);
+    // A reminder superseded by a terminal state or a pending request above is dropped:
+    // those outrank it, and a failure report must not describe a task that now needs a
+    // different decision.
+    const failure = reason === OBSERVE_TASK_REASONS.attention ? (outcome.failure ?? null) : null;
+    return this.observationOf(task, reason, monitor, waitMs, outcome.waitedMs, outcome.activitySinceWait, failure);
   }
 
   /**
@@ -2949,9 +3219,11 @@ export class JobEngine {
    * @param {number} waitMs - the bound that applied.
    * @param {number} waitedMs - how long the wait actually took.
    * @param {boolean} activitySinceWait - whether activity arrived during the wait.
+   * @param {object | null} [failure] - the repeated-failure diagnostic, when that is
+   *   what ended the wait.
    * @returns {object} observation result.
    */
-  observationOf(task, reason, monitor, waitMs, waitedMs, activitySinceWait) {
+  observationOf(task, reason, monitor, waitMs, waitedMs, activitySinceWait, failure = null) {
     const at = this.clock();
     const summary = this.observationSummary(task, at);
     const pending = task?.permission?.pending ?? null;
@@ -2962,6 +3234,10 @@ export class JobEngine {
       reason,
       // The full, unshortened redacted request on the ONE reason that needs it.
       permission: reason === OBSERVE_TASK_REASONS.permission ? pending : null,
+      // The typed, bounded diagnostic for a repeated-failure reminder. It is the only
+      // thing that distinguishes that reminder from an ordinary silence report, whose
+      // own diagnostic is `selfCheck`.
+      failure: reason === OBSERVE_TASK_REASONS.attention && failure !== null ? failure : null,
       activity: summary.activity,
       selfCheck,
       wait: { waitMs, waitedMs: Math.max(0, Math.trunc(waitedMs)), activitySinceWait: activitySinceWait === true },
@@ -3007,9 +3283,12 @@ export class JobEngine {
       // finished run is described as having used.
       route: this.observationRoute(task),
       connectionId: task.connectionId ?? null,
-      // Stated so no consumer reads `awaiting-host-review` as acceptance.
+      // Stated so no consumer reads `awaiting-host-review` as acceptance by itself; the
+      // recorded review, when one exists, is reported separately below.
       selfApproved: false,
-      hostAcceptance: null,
+      // The commander's own decision, or null when none has been recorded yet. Never
+      // derived from the task state: a completed run is not an accepted one.
+      hostAcceptance: task.hostAcceptance ?? null,
     };
   }
 
@@ -3029,6 +3308,7 @@ export class JobEngine {
       monitoring: {
         selfCheckSeconds: task.effective.monitoring?.selfCheckSeconds ?? null,
         attentionSeconds: task.effective.monitoring?.attentionSeconds ?? null,
+        repeatFailureThreshold: task.effective.monitoring?.repeatFailureThreshold ?? null,
       },
     };
   }
@@ -3043,7 +3323,9 @@ export class JobEngine {
    * @returns {Promise<void>} resolves after bookkeeping.
    */
   async finishTask(task) {
-    task.hostAcceptance = null;
+    // `hostAcceptance` is NOT reset here. This path runs when a run ends, and a review
+    // can only be recorded after that — but a terminal task that somehow reaches this
+    // method again must not lose a decision the host already recorded.
     this.clearPreflightDeadline(task);
     // The run is over, so its answerer must go: an outstanding request is released
     // (the worker's paused tool call resumes `unavailable`) and the bridge can never
@@ -3073,11 +3355,12 @@ export class JobEngine {
    *     supported posture (the engine never reads history back to decide
    *     anything), so `history === null` is silent while a *failing* store is loud.
    * @param {object} task - terminal task record.
-   * @returns {Promise<void>} resolves after the attempt, never rejects.
+   * @returns {Promise<boolean>} true when the record is durable (or history is absent),
+   *   false when the write failed; never rejects.
    */
   async persistHistory(task) {
     const history = this.history;
-    if (history === null || history === undefined || typeof history.save !== 'function') return;
+    if (history === null || history === undefined || typeof history.save !== 'function') return true;
     let timer = null;
     try {
       const view = this.view(task);
@@ -3094,6 +3377,7 @@ export class JobEngine {
       await bounded;
       task.historyError = null;
       task.historySavedAt = Date.now();
+      return true;
     } catch (error) {
       // Recorded, not thrown: a history failure must not turn a completed task
       // into a failed one, and it must not escape into the release path.
@@ -3102,6 +3386,7 @@ export class JobEngine {
         message: diagnostic(error?.message ?? error, 300),
       };
       task.historySavedAt = null;
+      return false;
     } finally {
       if (timer !== null) clearTimeout(timer);
     }

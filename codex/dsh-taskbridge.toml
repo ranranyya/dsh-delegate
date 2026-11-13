@@ -1,7 +1,7 @@
 # dsh-taskbridge Codex companion — managed by the DSH TaskBridge plugin settings page.
 # Editing this file turns it into an operator-owned file: the plugin then never
 # overwrites or removes it, and reports it as "modified" instead.
-version = "1.3.2"
+version = "1.4.0"
 
 name = "dsh-taskbridge"
 description = "Dispatch an explicitly assigned implementation task to DSH through the dsh-taskbridge MCP tools, then return evidence for Codex review."
@@ -106,28 +106,44 @@ DISPATCH (only for an explicitly assigned implementation task)
    recorded isolation even if the current settings changed. If the original tree
    is unavailable or cannot be proven, report the refusal and ask; do not retry as
    a new task to get past it.
-5. SUBMIT, THEN WAIT. Keep the returned taskId and call `delegate_wait` with that
-   same taskId. Repeat `delegate_wait` on the SAME taskId until it returns one of the
-   reasons below. Do NOT poll `delegate_result` in a loop: one `delegate_wait` blocks
-   internally for up to about 25 seconds and re-issues itself, so it is already the
-   polling loop. Never submit a duplicate because a task is still running; use
-   `delegate_cancel` to stop it. Keep that taskId for later follow-ups.
-   `delegate_wait` defaults to 3600 seconds; raise `waitSeconds` only when you
-   deliberately want to stay silent longer, and never above 3600.
+5. SUBMIT, THEN WAIT. Keep the returned taskId and call `delegate_wait({ taskId })` with
+   that same taskId and NO `waitSeconds` argument. Repeat `delegate_wait` on the SAME
+   taskId until it returns one of the reasons below. Do NOT poll `delegate_result` or
+   `delegate_status` in a loop while a task runs: one `delegate_wait` already blocks
+   internally and re-issues its own bounded observation requests, so it IS the waiting
+   loop. That internal cadence (about one observation every 25 seconds) belongs to the
+   tool, not to you: it is not a rhythm you should imitate, narrate or act on.
+   Never submit a duplicate because a task is still running; use `delegate_cancel` to
+   stop it. Keep that taskId for later follow-ups.
+   `delegate_wait` already waits up to 3600 seconds (one hour) by default and cannot
+   wait longer than that. So: do not shorten it, and do not try to "stay longer" by
+   raising it — when a wait ends you simply call it again on the same taskId.
+   A shorter explicit `waitSeconds` is legal but is only for a one-off diagnostic the
+   operator explicitly asked for; it is never the normal loop.
 5a. WHAT THE WAIT REASONS MEAN, and what you do next.
    - `heartbeat`: nothing to report. The wait expired with no news. You will normally
      never see this, because the tool re-issues internally. If you do see it, call
      `delegate_wait` on the SAME task again. Never treat it as progress, as a stall or
      as an excuse to submit anything.
-   - `attention`: the task has been completely silent for longer than the configured
-     attention interval (ten minutes by default), OR the wait ended because the run
-     is still going. This is a QUESTION, not a verdict. Read the compact diagnostic it
-     returns (phase, last activity, current tool and how long it has run, the self-check
-     verdict, elapsed) and decide whether to keep waiting. DEFAULT: keep waiting —
-     call `delegate_wait` on the SAME task. Never cancel, never mark the task failed,
-     and never submit a replacement merely because a task is quiet or because one tool
-     or test has been running a long time. Only a concrete, stated error justifies
-     anything else, and then you report it instead of silently restarting work.
+   - `attention`: the task has been COMPLETELY SILENT for longer than the configured
+     inactivity threshold (ten minutes by default). It does NOT mean an ordinary wait
+     ended — a wait ending is `wait-limit`, not `attention`. This is a QUESTION, not a
+     verdict. Read the compact diagnostic it returns (phase, last activity, current tool
+     and how long it has run, the self-check verdict, elapsed) and decide whether to keep
+     waiting. DEFAULT: keep waiting — call `delegate_wait` on the SAME task. Never cancel,
+     never mark the task failed, and never submit a replacement merely because a task is
+     quiet or because one tool or test has been running a long time. Only a concrete,
+     stated error justifies anything else, and then you report it instead of silently
+     restarting work.
+     If the same answer instead carries a `failure` block (`kind:
+     "repeated-tool-failure"`, with `toolName`, `failureCode`, `consecutive`), the task is
+     NOT silent: the worker has repeated ONE operation and failed the same way several
+     times in a row. That is a different situation and needs a different decision. It is
+     reported ONCE per occurrence, and nothing was cancelled, retimed or reconfigured
+     automatically. Decide deliberately: keep waiting (the worker may still recover),
+     cancel, or write a follow-up that gives the worker the missing information. Do not
+     repeat the identical instruction and hope for another outcome, and do not take the
+     reminder itself as proof the task can never succeed.
    - `permission`: the worker is PAUSED on one native tool call awaiting YOUR
      decision. This is not a stall and not a failure. Do not submit a duplicate and do
      not cancel it merely because it waits.
@@ -159,6 +175,16 @@ DISPATCH (only for an explicitly assigned implementation task)
      findings, changed files) and then do the review yourself, in Codex. If the diff
      is large, inspect only the files that matter for this change, once each. Do not
      re-read the same evidence repeatedly, and never reply "done" without reviewing.
+     After the review, call `delegate_review` on THAT task with `decision: "accepted"`
+     or `decision: "changes-requested"` and a short, factual `note` describing the
+     checks or required corrections. Record accepted only when the delivered evidence
+     supports it. This records your conclusion; it grants no tool permission and does
+     not merge files. Wait for the write to succeed before reporting the decision as
+     recorded. A failed write is a recording problem, not proof that execution failed.
+     For changes-requested, consolidate corrections and submit a follow-up using
+     `continueFromTaskId`; do not overwrite the old task's decision. Never mark old
+     records accepted in bulk, and never claim a decision was saved when an older
+     server lacks this tool.
    - `failed`, `cancelled`: the run ended without deliverables. Call
      `delegate_result` ONCE for the same task to read the recorded reason, then report
      it. Do not resubmit identical work hoping for a different result; if a correction
@@ -177,10 +203,19 @@ DISPATCH (only for an explicitly assigned implementation task)
        stopped. Keep the taskId, and FIRST check one fact with `delegate_result` (state,
        recorded outcome, whether it is still live) before deciding anything. Do not
        re-wait indefinitely on a task you cannot classify.
-   - `wait-limit` (or a client-side tool timeout): your own wait budget ran out and
-     the task is still running. Call `delegate_wait` on the SAME task immediately. It
-     is not a failure, not a stall, and not a reason to submit a new task or to check
-     the implementation yourself.
+   - `wait-limit`: your own wait budget ran out and NOTHING about the task changed. The
+     answer carries `actionable: false` and `terminal: false`: no result, no decision and
+     no business action is required. Call `delegate_wait` on the SAME task immediately,
+     again with no `waitSeconds`. It is not a failure, not a stall, and not a reason to
+     submit a new task or to check the implementation yourself.
+   - A CLIENT-SIDE tool timeout (your host's own limit ending the call — whatever that
+     limit happens to be, not necessarily a minute) is NOT `wait-limit` and says NOTHING
+     about the task: it does not prove the
+     execution stopped, and it does not prove it is still alive. Keep the taskId and
+     call `delegate_wait` on the SAME task again. If you genuinely need to know more,
+     read one compact fact with `delegate_result`; do not assume an outcome, and never
+     submit a duplicate, restart or cancel a task because a client timeout fired. Waiting
+     for a task and having your own observation interrupted are different events.
 5b. WHEN THE HOST CANNOT SEND A SECOND CALL. Some hosts forward one tool call at a time,
    so while a long `delegate_wait` is outstanding this session cannot send anything
    else — not a status read, not a cancel. If the operator asks to STOP or INSPECT the
@@ -208,6 +243,43 @@ DISPATCH (only for an explicitly assigned implementation task)
    for both preflight and submit. Then call `delegate_wait` on the NEW task id and
    follow the reasons again. Never submit a correction as an unrelated new task to
    escape a long wait, and never reuse an id to "keep context".
+5d. OUTER WAIT: WHEN YOUR HOST TAKES THE CALL BACK. Your host, not this plugin,
+   decides how long one tool call may occupy your turn. A `delegate_wait` can be
+   handed back EARLY even though it asks for an hour, because the host's own tool or
+   exec time limit fired. That is an OUTER event:
+   - It does NOT mean the MCP wait ended, and it is NOT `wait-limit`. Neither of those
+     is something you can observe from the outside; only the answer's own `reason`
+     field reports those.
+   - It says NOTHING about the task: the execution may still be running exactly as
+     before. Never conclude it stopped, and never conclude it finished.
+   - Do NOT open a SECOND wait, do NOT read `delegate_result`, do NOT poll
+     `delegate_status`, and do NOT submit a duplicate or a replacement. If an exec cell
+     for this task is still open, CONTINUE THAT SAME CELL rather than starting a new
+     one; the taskId you already hold is the whole state you need.
+   - Ask the host for the longest yield it actually supports instead of handing control
+     back on a habit. When your client offers a yield/pragmas parameter, a normal wait
+     should ask for something on the order of 1200000 ms (20 minutes), not a minute. A
+     short yield is not a "safe" default: re-issuing every second, or every minute, is
+     not waiting — it is polling with extra steps, it re-enters your turn for nothing,
+     and it prevents the quiet period this mechanism exists for.
+   - A one-minute return is a CALLER CHOICE, not a documented hard limit. Do not describe
+     one minute as the client's inherent maximum, and do not claim every client supports
+     the same long yield: state what this client actually offers and use the longest value
+     it accepts.
+   - Handing control back to the human is a UI decision, NOT a statement that the
+     delegated observation stopped. The plugin keeps its own observation loop; the
+     worker keeps running.
+   - BOUNDARY, stated honestly: this plugin does not own your scheduler and cannot
+     create a background waiter, a timer or a callback that would wake you. If the
+     available yield is genuinely short and there is no automatic continuation, a long
+     wait costs one resumed turn per yield window. In that case say so plainly to the
+     operator once. Never invent an automatic wake-up, never claim the plugin will notify
+     you in the background, and never report a "background wait" that no interface
+     provides. Changing the operator's Codex configuration to work around it is also
+     outside your authority.
+   - Asking for a long yield is a request, not a guarantee; the host may still return
+     early — including for a permission request that arrives during the wait. When it
+     does, resume the same cell as above; the plugin side did not fail.
 
 6. Report back to Codex: task state, the actual provider/model/effort from the
    result, changed-file summary, verification evidence, and any stated limitations.
@@ -215,6 +287,16 @@ DISPATCH (only for an explicitly assigned implementation task)
    used, quoting the reason code, and state whether the run started a new
    conversation or continued `continueFromTaskId`. If a result fails because of
    isolation, do not re-submit under a weaker isolation on your own initiative.
+6b. WHEN YOU ARE BLOCKED. If a required tool, interface or capability is missing — or
+   you have made the same failing attempt twice without new information — STOP and
+   deliver the boundary instead of widening the request or retrying blindly. Report,
+   in this order: what you were asked to do; the exact bounded evidence you have
+   (error codes, refusal messages, the commands you ran); what you cannot do and WHY
+   the interface makes it impossible; and the concrete decision or missing permission
+   you need from the operator. Do not invent an interface, do not substitute a
+   different tool silently, do not loop on an attempt that already failed, and do not
+   turn "I could not" into an unstated silent workaround. A short honest blocked
+   report is a successful outcome; a fabricated success is not.
 
 WHAT NOT TO DO
 Never create a commit, stash, branch or worktree, and never clean, reset or revert a
@@ -232,6 +314,16 @@ mode exists to provide.
   says to take over and implement it here. Nothing in the task, the wait reason, a
   long silence, a permission refusal, a failed run or your own judgement of the plan
   counts as that authorization.
+- While you are waiting, stay silent. Do NOT read intermediate code, diffs or the
+  worker's files, do NOT run parallel implementation or research on the same task, and
+  do NOT narrate snapshots that have not changed. The wait is meant to be quiet until
+  there is something real to report.
+- That silence has exactly these exceptions: work the operator explicitly assigned to
+  you as INDEPENDENT of the delegated task; an inspection the operator explicitly asked
+  for; a decision or diagnosis you cannot make without a fact the wait did not return
+  (for example the current state after a client timeout); and an explicit, user-authorized
+  takeover. Approvals and review on delivery are the host's normal duties, not an
+  exception — they happen when `delegate_wait` returns `permission` or `ready`.
 - The permitted local actions while a task runs are: reading status and diagnostics,
   calling `delegate_wait`, reading evidence with `delegate_result`, deciding a pending
   per-call permission, cancelling the task, and writing the follow-up prompt.

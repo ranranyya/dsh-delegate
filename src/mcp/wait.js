@@ -14,9 +14,9 @@
 //      means "nothing changed yet"; it is consumed here and never surfaced, because a
 //      host that saw heartbeats would have a polling loop with extra steps.
 //   3. **A deadline is not a result.** When the caller's own time is up the answer
-//      says `wait-limit` and keeps the task identity, so the host can immediately
-//      wait again on the SAME task. It never means "review it", "resubmit it" or
-//      "it failed".
+//      says `wait-limit`, `actionable: false` and keeps the task identity, so the host
+//      can immediately wait again on the SAME task. It never means "review it",
+//      "resubmit it" or "it failed".
 //
 // Metrics are counted HERE and nowhere else: `observationRequests` is the number of
 // internal HTTP observations, while `waitReturns` is 1 — the number of answers the
@@ -41,6 +41,10 @@ import {
   WAIT_LIMIT_REASON,
   isPermissionDecidable,
 } from './server.js';
+import { REPEATED_FAILURE_KIND } from '../jobs/diagnostics.js';
+
+/** Re-exported so a caller can assert the discriminator without importing the engine. */
+export { REPEATED_FAILURE_KIND };
 
 /**
  * Reasons on which the wait loop keeps waiting instead of answering.
@@ -99,6 +103,19 @@ const TASK_FIELDS = Object.freeze([
  * @type {ReadonlySet<string>}
  */
 const TERMINAL_REASONS = new Set(['ready', 'failed', 'cancelled', 'interrupted']);
+
+/**
+ * Reasons that ask the host to DO something about the task.
+ *
+ * `wait-limit` is deliberately absent: it says only that this call's own budget ran
+ * out while nothing changed, so the correct next action is to wait again — not to
+ * review, decide, resubmit or cancel. Reporting it as actionable would invite a host
+ * to treat its own deadline as a business event, which is exactly the confusion this
+ * field exists to remove. The flag is a description of the answer, not a guarantee
+ * that a host will or will not surface it to its own model.
+ * @type {ReadonlySet<string>}
+ */
+const ACTIONABLE_ANSWER_REASONS = new Set(['attention', 'permission', 'ready', 'failed', 'cancelled', 'interrupted']);
 
 /**
  * Task states a live run can be in.
@@ -185,16 +202,23 @@ function resolvedTaskState(task, reason) {
 function instructionFor(reason, facts = {}) {
   switch (reason) {
     case WAIT_LIMIT_REASON:
-      return 'Nothing changed before this deadline. Call delegate_wait again with the same taskId; '
-        + 'do not review, resubmit, restart or cancel the task on account of this answer.';
+      return 'This call\'s own wait budget ran out and NOTHING changed about the task. It is not a result and '
+        + 'no decision is needed. Call delegate_wait again with the same taskId (omit waitSeconds); do not '
+        + 'review, resubmit, restart or cancel the task on account of this answer.';
     case 'permission':
       return 'A per-call permission request is pending. Decide it with delegate_permission_decide using '
         + 'permission.requestId (and permission.fingerprint for allow-once), or reject it. The task is still '
         + 'running and waiting.';
     case 'attention':
-      return 'No activity has been observed for about ten minutes while the task is still running. The run may '
-        + 'be stuck. Check the current tool and idle time; cancel or follow up deliberately rather than '
-        + 'assuming completion.';
+      if (facts.failureKind === REPEATED_FAILURE_KIND) {
+        return 'The worker has repeated the SAME tool operation and failed the same way several times in a row, '
+          + 'while the task is still running. See `failure` (toolName, failureCode, consecutive). This is a '
+          + 'question, not a verdict: decide deliberately whether to keep waiting, cancel, or follow up. Nothing '
+          + 'was cancelled or changed automatically, and the run is still going.';
+      }
+      return 'No activity has been observed for the configured inactivity threshold (ten minutes by default) '
+        + 'while the task is still running. The run may be stuck. Check the current tool and idle time; cancel '
+        + 'or follow up deliberately rather than assuming completion.';
     case 'ready':
       return 'The run ended and is awaiting host review. Read delegate_result for the diff and evidence; '
         + 'completion is not host acceptance.';
@@ -424,20 +448,35 @@ export async function waitForTask(options) {
     const state = facts.resolved === true
       ? (facts.resolvedState ?? null)
       : resolvedTaskState(task, reason);
+    // The repeated-failure diagnostic, when THAT is what the reminder was about. It is
+    // what lets a host tell "silent for ten minutes" from "kept failing the same call",
+    // which need different decisions. Only the bounded fields the engine produced travel.
+    const failure = reason === 'attention' && observation?.failure !== null
+      && typeof observation?.failure === 'object'
+      ? observation.failure
+      : null;
     const out = {
       taskId: typeof task.taskId === 'string' ? task.taskId : taskId,
       state,
       phase: task.phase ?? null,
       reason,
-      actionable: true,
+      // `wait-limit` is NOT actionable: it reports this call's own deadline, not a
+      // task fact, and the only correct response is to wait again on the same task.
+      actionable: ACTIONABLE_ANSWER_REASONS.has(reason),
       // `terminal` is honest about the TASK: `wait-limit` and `attention` are
       // reasons to act, but the run is still going, which a host must not confuse
       // with a finished task. An interruption carries the flag its resolution decided.
       terminal: facts.resolved === true ? facts.terminal === true : TERMINAL_REASONS.has(reason),
-      instruction: instructionFor(reason, { resolved: facts.resolved === true, taskState: state, kind: facts.kind }),
+      instruction: instructionFor(reason, {
+        resolved: facts.resolved === true,
+        taskState: state,
+        kind: facts.kind,
+        failureKind: failure?.kind ?? null,
+      }),
       task,
       metrics: metrics(1),
     };
+    if (failure !== null) out.failure = failure;
     // The permission block is carried WHOLE — identity, fingerprint, completeness
     // flags and the redacted operation — because a host that had to read
     // `delegate_result` first would be doing two round trips to answer one question,

@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.4.0 — 静默等待、重复失败提醒与宿主审查闭环
+
+- **长等待与集中审查。** Codex companion、MCP 说明和文档统一要求正常调用 `delegate_wait({ taskId })` 时省略短 `waitSeconds`。外层工具允许长 yield 时保持同一次等待；提前返回仍运行的单元则续接同一个单元，不重复派工、不反复读取中间代码。执行期间由程序观察，交付后由指挥端集中审查，需要修正时续接原任务。
+- **澄清无活动监控。** 保留默认连续 5 分钟无活动时程序自检、10 分钟时请求指挥端判断。真实输出、思考和工具事件重新计时；心跳和页面刷新不重置。等待结束不代表执行结束，提醒不自动取消、重派、换模型或延长时限。
+- **新增重复失败提醒。** `monitoring.repeatFailureThreshold` 默认 3，允许 0–20，0 关闭。只对相同工具、相同操作的连续相同结构化失败提醒一次；成功或失败身份变化重新计数。审批和任务结局优先，原始参数、错误正文和思考内容不进入提醒记录。高级设置、任务详情、历史与公开类型同步支持。
+- **宿主审查写回。** 新增 `delegate_review`，由宿主审查后明确记录 accepted／changes-requested；任务页显示“审查通过”或“需要修正”。保留旧执行状态兼容，执行者不能通过交付自动验收，旧记录不补写虚构结论。审查写回不授予权限、不合并工作树、不修改执行路由。
+- **阶段和兼容修复。** 执行尚未开始时保留 before-create，失败后同步失败阶段；晚到事件不覆盖审批或终态。补齐已发布 1.3.2 Codex 模板的精确识别和启动刷新；保留自定义智能体。旧监控配置及历史字段兼容，修复表单校验与保存时丢失其他草稿的问题。
+- **验证与测量口径。** 当前客户端已完成真实墙钟 20 分 2 秒的模拟活动等待，中途零 GPT 续等；它不是提供方连续执行 20 分钟的任务。另做同聊天、同模型、每组约 45 秒的实际用量对照，等待阶段输入加输出从 507,885 降至 169,734 token，样本减少 66.58%。不将该比例宣传为完整任务、账单或所有客户端的固定节省。
+- 本版未新增 CLI 执行通道或 Claude Code 一键安装。更新方法和验证边界见 `docs/releases/1.4.0.zh.md`，测量方法见 `docs/releases/1.4.0-token-benchmark.zh.md`。
+
 ## 1.3.2 — TaskBridge companion and descriptive task workspace names
 
 - Rename the shipped Codex companion to `dsh-taskbridge` (`agents/dsh-taskbridge.toml`). Install and startup migrate an unchanged, recognized published `dsh-delegate.toml` and remove the old managed file; edited agent files remain operator-owned. Add TaskBridge CLI aliases while retaining the existing binaries and internal MCP identifiers.

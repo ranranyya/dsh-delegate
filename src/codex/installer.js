@@ -311,6 +311,31 @@ export const KNOWN_AGENT_TEMPLATES = [
   // Exact published 1.3.0 bytes (archive fixture, LF and CRLF forms).
   { version: '1.3.0', sha256: '63695008f53aa2c19a0df9e2cb37285f631b775cb98f26c1d280cfbc54a0d9e8' },
   { version: '1.3.0', sha256: '31b0ba3149032058fe31e1e884e5c24a9a3d6459b7dd35df6420c7f3756d6257' },
+  // The published 1.3.2 companion — the file an existing 1.3.2 installation holds.
+  // The instruction body changed again in this release, so it is a DISTINCT published
+  // build: without these identities every existing 1.3.2 install would be reported
+  // `modified` ("somebody else's file") and never refreshed by startup or by install.
+  //
+  // Three exact byte identities, because three byte forms really exist on disk:
+  //
+  // * `46b5b98a…` — the PUBLISHED file itself, preserved byte for byte as
+  //   `tests/fixtures/codex-agent-1.3.2.toml` (18380 bytes). It is a MIXED form, not a
+  //   uniform one: most lines end CRLF but some end with a bare LF, so hashing it as
+  //   "the CRLF form" would be wrong. This is what the release shipped, so it is the
+  //   identity a real installation has.
+  // * `da14ba05…` — the same text with every `\r\n` turned into `\n`: the LF form a
+  //   POSIX checkout writes (18135 bytes).
+  // * `055079c5…` — that LF text with every `\n` turned into `\r\n`: the fully uniform
+  //   CRLF form an editor or a Windows checkout can produce (18382 bytes). It is a
+  //   genuinely different file from the published bytes above, which is why it needs its
+  //   own entry.
+  //
+  // Each is an exact content identity, never a normalized comparison: normalizing would
+  // also make an operator-edited file hash to a known value, which is the defect these
+  // digests exist to prevent.
+  { version: '1.3.2', sha256: '46b5b98a3489b59a9e7e437a100fea6072db6a34c1220496530efdf812117c17' },
+  { version: '1.3.2', sha256: 'da14ba0511ca25d9118670ccb2c39c104d7952d110b104c9b157376b330dccfc' },
+  { version: '1.3.2', sha256: '055079c5daf6ba44639bfaa1851c9d56b0b06e45b2f22331326117a64f350e6b' },
   // Exact published 1.2.0 bytes (archive fixture, LF and CRLF forms).
   { version: '1.2.0', sha256: '8479c8ab418d71b15fb30880aa5149fb1070d194e8444a110a2a614cebf4eaf4' },
   { version: '1.2.0', sha256: '947f3fb8a8e9ae5cc6fb3c9d379c69b595af4c46f89ac77f69aa1edf696a8f8e' },

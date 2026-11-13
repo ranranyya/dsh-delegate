@@ -683,23 +683,42 @@ test('a document without a monitoring block loads with the documented defaults',
   const without = validSettings();
   assert.equal(Object.hasOwn(without, 'monitoring'), false, 'the fixture models a pre-feature document');
   const settings = validateSettings(without);
-  assert.deepEqual(settings.monitoring, { selfCheckSeconds: 300, attentionSeconds: 600 });
+  assert.deepEqual(settings.monitoring, { selfCheckSeconds: 300, attentionSeconds: 600, repeatFailureThreshold: 3 });
 });
 
 test('monitoring accepts whole seconds inside the documented bounds', () => {
   assert.deepEqual(
     validateSettings({ ...validSettings(), monitoring: { selfCheckSeconds: 30, attentionSeconds: 31 } }).monitoring,
-    { selfCheckSeconds: 30, attentionSeconds: 31 },
+    { selfCheckSeconds: 30, attentionSeconds: 31, repeatFailureThreshold: 3 },
   );
   assert.deepEqual(
     validateSettings({ ...validSettings(), monitoring: { selfCheckSeconds: 3600, attentionSeconds: 7200 } }).monitoring,
-    { selfCheckSeconds: 3600, attentionSeconds: 7200 },
+    { selfCheckSeconds: 3600, attentionSeconds: 7200, repeatFailureThreshold: 3 },
   );
   // A partial block takes the default for the missing key.
   assert.deepEqual(
     validateSettings({ ...validSettings(), monitoring: { selfCheckSeconds: 120 } }).monitoring,
-    { selfCheckSeconds: 120, attentionSeconds: 600 },
+    { selfCheckSeconds: 120, attentionSeconds: 600, repeatFailureThreshold: 3 },
   );
+});
+
+test('the repeated-failure reminder is a count: 0 disables it, and older documents keep the default', () => {
+  const withCount = (repeatFailureThreshold) => validateSettings({
+    ...validSettings(),
+    monitoring: { selfCheckSeconds: 300, attentionSeconds: 600, repeatFailureThreshold },
+  }).monitoring.repeatFailureThreshold;
+  assert.equal(withCount(0), 0, '0 is the documented "off" value, not an error');
+  assert.equal(withCount(1), 1);
+  assert.equal(withCount(20), 20);
+  // A document written before this setting existed keeps the default rather than failing.
+  assert.equal(withCount(undefined), 3);
+  for (const bad of [-1, 21, 2.5, '3', null, Number.NaN]) {
+    assert.throws(
+      () => withCount(bad),
+      (error) => error.code === 'MONITORING_INVALID',
+      `${JSON.stringify(bad)} must be refused`,
+    );
+  }
 });
 
 test('monitoring refuses out-of-range, non-integer and wrongly typed values', () => {
@@ -742,11 +761,15 @@ test('monitoring refuses an unknown key instead of ignoring it', () => {
 });
 
 test('public settings, export and effective snapshots all carry monitoring', () => {
-  const settings = validateSettings({ ...validSettings(), monitoring: { selfCheckSeconds: 120, attentionSeconds: 240 } });
-  assert.deepEqual(publicSettings(settings).monitoring, { selfCheckSeconds: 120, attentionSeconds: 240 });
-  assert.deepEqual(exportSettings(settings).monitoring, { selfCheckSeconds: 120, attentionSeconds: 240 });
+  const settings = validateSettings({
+    ...validSettings(),
+    monitoring: { selfCheckSeconds: 120, attentionSeconds: 240, repeatFailureThreshold: 4 },
+  });
+  const block = { selfCheckSeconds: 120, attentionSeconds: 240, repeatFailureThreshold: 4 };
+  assert.deepEqual(publicSettings(settings).monitoring, block);
+  assert.deepEqual(exportSettings(settings).monitoring, block);
   const effective = resolveEffectiveConfig(settings, { projectPath: null });
-  assert.deepEqual(effective.monitoring, { selfCheckSeconds: 120, attentionSeconds: 240 });
+  assert.deepEqual(effective.monitoring, block);
   // Frozen like every other part of the snapshot.
   assert.equal(Object.isFrozen(effective), true);
   assert.equal(Object.isFrozen(effective.monitoring), true);
@@ -767,7 +790,8 @@ test('monitoring is global-only: no project override or per-job override can ret
   const effective = resolveEffectiveConfig(settings, { projectPath: 'C:\\fixtures\\repo' });
   assert.equal(effective.worker.timeoutSeconds, 900, 'the project override applied to its own block');
   assert.equal(effective.worker.reasoningEffort, 'low');
-  assert.deepEqual(effective.monitoring, { selfCheckSeconds: 300, attentionSeconds: 600 },
+  assert.deepEqual(effective.monitoring,
+    { selfCheckSeconds: 300, attentionSeconds: 600, repeatFailureThreshold: 3 },
     'and did not touch the monitoring thresholds');
   assert.throws(
     () => resolveEffectiveConfig(settings, { projectPath: null, overrides: { monitoring: { selfCheckSeconds: 60 } } }),
@@ -782,12 +806,15 @@ test('an export/import round trip preserves monitoring', async () => {
     await service.replace(validSettings());
     await service.setMonitoring({ selfCheckSeconds: 90, attentionSeconds: 300 });
     const exported = exportSettings(await service.read());
-    assert.deepEqual(exported.monitoring, { selfCheckSeconds: 90, attentionSeconds: 300 });
+    // The count was not named, so the documented default is what is persisted and
+    // exported; an older document must not gain a value nobody chose.
+    assert.deepEqual(exported.monitoring, { selfCheckSeconds: 90, attentionSeconds: 300, repeatFailureThreshold: 3 });
 
     const other = new SettingsService(await makeTempDir());
     try {
       await other.replaceValidated(exported);
-      assert.deepEqual((await other.read()).monitoring, { selfCheckSeconds: 90, attentionSeconds: 300 });
+      assert.deepEqual((await other.read()).monitoring,
+        { selfCheckSeconds: 90, attentionSeconds: 300, repeatFailureThreshold: 3 });
     } finally {
       await cleanup(other.document.path.replace(/[\\/][^\\/]+$/, ''));
     }
@@ -811,11 +838,13 @@ test('setMonitoring validates before writing and persists through the serialized
     assert.deepEqual((await service.read()).monitoring, before.monitoring);
 
     const committed = await service.setMonitoring({ selfCheckSeconds: 60, attentionSeconds: 120 });
-    assert.deepEqual(committed.monitoring, { selfCheckSeconds: 60, attentionSeconds: 120 });
+    assert.deepEqual(committed.monitoring,
+      { selfCheckSeconds: 60, attentionSeconds: 120, repeatFailureThreshold: 3 });
 
     // Reads, and a fresh service over the same directory, see it.
     const reopened = new SettingsService(dir);
-    assert.deepEqual((await reopened.read()).monitoring, { selfCheckSeconds: 60, attentionSeconds: 120 });
+    assert.deepEqual((await reopened.read()).monitoring,
+      { selfCheckSeconds: 60, attentionSeconds: 120, repeatFailureThreshold: 3 });
   } finally {
     await cleanup(dir);
   }
@@ -831,7 +860,8 @@ test('setMonitoring cannot lose a concurrent settings edit', async () => {
       service.setWorker({ providerId: 'relay', model: 'deepseek-reasoner', reasoningEffort: 'high', timeoutSeconds: 900 }),
     ]);
     const settings = await service.read();
-    assert.deepEqual(settings.monitoring, { selfCheckSeconds: 60, attentionSeconds: 120 });
+    assert.deepEqual(settings.monitoring,
+      { selfCheckSeconds: 60, attentionSeconds: 120, repeatFailureThreshold: 3 });
     assert.equal(settings.worker.model, 'deepseek-reasoner', 'the concurrent worker edit survived');
     assert.equal(settings.monitoring.check === undefined, true);
   } finally {

@@ -67,7 +67,7 @@ import { USER_PLANE_PREFIX, wrapUserPlaneRoutes } from '../src/http/user-plane.j
 import { PREFLIGHT_ISOLATIONS, PREFLIGHT_REASONS } from '../src/workspace/preflight.js';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
-const DELIVERABLE_VERSION = '1.3.2';
+const DELIVERABLE_VERSION = '1.4.0';
 // The baseline the current release upgrades *from*, pinned rather than derived: an
 // expectation that followed `DELIVERABLE_VERSION` would assert nothing.
 const PREVIOUS_VERSION = '0.1.14';
@@ -1394,6 +1394,12 @@ test('the published 0.1.13 agent is refreshed when unchanged and preserved when 
  * is the only honest input for these tests.
  */
 const HISTORICAL_AGENT_FIXTURES = Object.freeze([
+  {
+    version: '1.3.2',
+    path: join(ROOT, 'tests', 'fixtures', 'codex-agent-1.3.2.toml'),
+    packed: '46b5b98a3489b59a9e7e437a100fea6072db6a34c1220496530efdf812117c17',
+    lf: 'da14ba0511ca25d9118670ccb2c39c104d7952d110b104c9b157376b330dccfc',
+  },
   { version: '1.3.1', path: join(ROOT, 'tests', 'fixtures', 'codex-agent-1.3.1.toml'), packed: '2793b656be4a1906e16edfdd0103540bfad05681a413c166b578b02333ea2618', lf: 'b48558d6d6acca58b94a01029d6c884c4789488c7926cdaca40cb6cd15eea2ae' },
   {
     version: '1.3.0',
@@ -1467,8 +1473,12 @@ for (const release of HISTORICAL_AGENT_FIXTURES) {
 
       // 3. An operator edit on top of the published bytes is THEIRS: the version line is
       //    not the proof, so no action may write, refresh or remove it.
-      const edited = published.replace('name = "dsh-delegate"', '# my own note\r\nname = "dsh-delegate"');
-      assert.notEqual(edited, published);
+      //    The edit is anchored on the file's own version line rather than on a
+      //    `name = "..."` value: releases renamed the agent (`dsh-delegate` →
+      //    `dsh-taskbridge`), so a name-keyed edit silently produced NO edit for 1.3.2
+      //    and the assertion below would have proved nothing.
+      const edited = published.replace(/^(version = ".*")$/mu, '# my own note\r\n$1');
+      assert.notEqual(edited, published, 'the edit must really change the published bytes');
       writeFileSync(fixture.agentPath, edited);
       const editedStatus = await runCodexAction('status', { codexHome: fixture.home, env: isolatedEnv(fixture.home), version: DELIVERABLE_VERSION });
       assert.equal(editedStatus.status.agent.state, 'modified', `an edited ${release.version} file is not a known build`);
@@ -1485,6 +1495,48 @@ for (const release of HISTORICAL_AGENT_FIXTURES) {
     }
   });
 }
+
+test('the published 1.3.2 fixture is the release this build must refresh, not merely tolerate', async () => {
+  // 1.3.2 is the release whose companion THIS build rewrites (the wait contract
+  // changed under it), so the upgrade path is pinned on its own rather than only
+  // through the loop above: an existing 1.3.2 installation must be recognized as
+  // `outdated` and replaced by the new rules, while an edited 1.3.2 file stays the
+  // operator's own.
+  const fixture = codexHomeFixture();
+  const release = HISTORICAL_AGENT_FIXTURES.find((entry) => entry.version === '1.3.2');
+  assert.ok(release !== undefined, 'the 1.3.2 fixture must be enumerated');
+  const published = readFileSync(release.path, 'utf8');
+  const template = readFileSync(join(ROOT, 'codex', AGENT_FILENAME), 'utf8');
+  try {
+    mkdirSync(dirname(fixture.agentPath), { recursive: true });
+    writeFileSync(fixture.agentPath, published);
+    const before = await runCodexAction('status', { codexHome: fixture.home, env: isolatedEnv(fixture.home), version: DELIVERABLE_VERSION });
+    assert.equal(before.status.agent.state, 'outdated', 'an unedited 1.3.2 file is a known build, not a foreign one');
+    assert.equal(before.status.agent.managed, true);
+
+    const migrated = await createCodexSeam({ codexHome: fixture.home, env: isolatedEnv(fixture.home), version: DELIVERABLE_VERSION })
+      .refreshManagedIntegration();
+    assert.deepEqual(migrated.changed, ['agent'], 'startup refreshes it');
+    const refreshed = readFileSync(fixture.agentPath, 'utf8');
+    assert.equal(refreshed, template);
+    // The refreshed rules are the new contract, which is the point of the upgrade.
+    assert.match(refreshed, /delegate_wait\(\{ taskId \}\)/u);
+    assert.doesNotMatch(refreshed, /raise `waitSeconds` only when you\s+deliberately want to stay silent longer/u);
+
+    // The same published bytes with one operator line added are NOT ours.
+    const edited = published.replace('name = "dsh-taskbridge"', '# my own note\r\nname = "dsh-taskbridge"');
+    writeFileSync(fixture.agentPath, edited);
+    const editedStatus = await runCodexAction('status', { codexHome: fixture.home, env: isolatedEnv(fixture.home), version: DELIVERABLE_VERSION });
+    assert.equal(editedStatus.status.agent.state, 'modified', 'an edited 1.3.2 file is the operator\'s');
+    for (const action of ['install', 'repair', 'remove']) {
+      const outcome = await runCodexAction(action, { codexHome: fixture.home, env: isolatedEnv(fixture.home), version: DELIVERABLE_VERSION });
+      assert.equal(outcome.changed.includes('agent'), false, `${action} must not write the edited file`);
+      assert.equal(readFileSync(fixture.agentPath, 'utf8'), edited, `${action} must leave it byte-identical`);
+    }
+  } finally {
+    fixture.cleanup();
+  }
+});
 
 test('the published 1.0.0 and 1.1.0 fixtures are never packed', () => {
   // They are test inputs, not product data: a published archive that shipped a prior

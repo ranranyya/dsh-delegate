@@ -32,6 +32,21 @@ function isolatedEnv(codexHome) {
   return { CODEX_HOME: codexHome, DSH_HOME: '', DSH_DELEGATE_DISCOVERY_FILE: '' };
 }
 
+/**
+ * The shipped agent file with every run of whitespace collapsed to one space.
+ *
+ * The template is a wrapped prose document: the same sentence reflows whenever a word
+ * is added above it. Assertions about what the rules SAY are therefore made against the
+ * reflowed text, so the requirement is preserved and only the line breaks stop mattering.
+ * Nothing is normalised away: wording, order and every word are still checked.
+ * @returns {string} the template with normalised whitespace.
+ */
+function shippedAgentText() {
+  return readFileSync(join(ROOT, 'codex', 'dsh-taskbridge.toml'), 'utf8')
+    .replace(/\s+/gu, ' ')
+    .trim();
+}
+
 // The installer proves `$CODEX_HOME` and `$CODEX_HOME/agents` are real directories.
 // On Windows that answer comes from a `powershell.exe` child, and this suite has to run
 // where a child cannot be spawned at all, so the suite answers through the documented
@@ -187,9 +202,10 @@ test('the shipped companion drives delegate_wait and never polls delegate_result
   assert.match(template, /`heartbeat`: nothing to report/u);
   // Ready is explicitly not acceptance.
   assert.match(template, /is not\s+acceptance/iu);
-  // Attention defaults to waiting, not to cancelling or failing.
+  // Attention defaults to waiting, not to cancelling or failing. Matched against the
+  // reflowed text, because this sentence wraps differently as the rules above change.
   assert.match(template, /DEFAULT: keep waiting/u);
-  assert.match(template, /Never cancel, never mark the task failed/u);
+  assert.match(shippedAgentText(), /Never cancel, never mark the task failed/u);
   // Result evidence is read ONCE, not repeatedly.
   assert.match(template, /`delegate_result` ONCE/u);
 });
@@ -246,4 +262,36 @@ test('the shipped companion keeps its activation and safety rules unchanged', ()
   ]) {
     assert.ok(template.includes(anchor), `the template must still contain ${anchor}`);
   }
+});
+
+test('the shipped companion states the normal wait contract: omit waitSeconds, stay silent', () => {
+  const template = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'codex', 'dsh-taskbridge.toml'), 'utf8');
+  // The normal call shape, and the parameter being optional rather than something to tune.
+  assert.match(template, /delegate_wait\(\{ taskId \}\)/u);
+  assert.match(template, /NO `waitSeconds` argument/u);
+  // The contradiction must be gone: the old rule said "raise it to stay silent longer,
+  // never above 3600", which describes a knob that does not exist above its default.
+  assert.doesNotMatch(template, /raise `waitSeconds` only when you\s+deliberately want to stay silent longer/u);
+  assert.match(template, /do not try to "stay longer" by\s+raising it/u);
+  assert.match(template, /cannot\s+wait longer than that/u);
+  // A short explicit wait stays legal, but only for a requested one-off diagnostic.
+  assert.match(template, /one-off diagnostic the\s+operator explicitly asked for/u);
+  // `attention` is the inactivity threshold, NOT any ordinary wait ending.
+  assert.match(template, /It does NOT mean an ordinary wait\s+ended/u);
+  assert.doesNotMatch(template, /OR the wait ended because the run\s+is still going/u);
+  // `wait-limit` is non-actionable; a client-side timeout proves nothing about the run.
+  assert.match(template, /`actionable: false` and `terminal: false`/u);
+  assert.match(template, /CLIENT-SIDE tool timeout/u);
+  assert.match(template, /does not prove the\s+execution stopped/u);
+  // The phrase spans a line break in the template, so the reflowed text is what is
+  // matched: the requirement (never duplicate/restart/cancel on a client timeout) is
+  // unchanged, only its line wrapping stops being part of the assertion.
+  assert.match(shippedAgentText(), /never submit a duplicate, restart or cancel a task because a client timeout/u);
+  // The internal cadence belongs to the program, not to the model's polling.
+  assert.match(template, /belongs to the\s+tool, not to you/u);
+  // Silence while waiting, with only the stated exceptions.
+  assert.match(template, /While you are waiting, stay silent/u);
+  assert.match(template, /do NOT narrate snapshots that have not changed/u);
+  assert.match(template, /INDEPENDENT of the delegated task/u);
+  assert.match(template, /an inspection the operator explicitly asked\s+for/u);
 });

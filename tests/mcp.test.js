@@ -92,6 +92,7 @@ const EXPECTED_TOOLS = [
   'delegate_permission_decide',
   'delegate_preflight',
   'delegate_result',
+  'delegate_review',
   'delegate_status',
   'delegate_submit',
   'delegate_wait',
@@ -101,8 +102,9 @@ const EXPECTED_TOOLS = [
 // 1. The exposed surface cannot authorize, configure or touch credentials
 // ---------------------------------------------------------------------------
 
-test('the MCP surface exposes exactly seven bounded tools and no control-plane tool', () => {
+test('the MCP surface exposes exactly eight bounded tools and no control-plane tool', () => {
   assert.deepEqual(TOOLS.map((tool) => tool.name).sort(), EXPECTED_TOOLS);
+  assert.equal(TOOLS.length, 8);
   // Named explicitly so the reason is in the failure message, not only in a diff.
   for (const forbidden of ['connection', 'grant', 'settings', 'credential', 'secret', 'authorize']) {
     for (const tool of TOOLS) {
@@ -172,6 +174,7 @@ test('every tool carries accurate MCP annotations, and the long wait is marked r
       ['delegate_wait', true],
       ['delegate_cancel', false],
       ['delegate_permission_decide', false],
+      ['delegate_review', false],
       ['delegate_preflight', true],
     ],
   );
@@ -191,6 +194,8 @@ test('each tool reaches exactly its own execution-plane route', async () => {
     ['delegate_permission_decide', { taskId: 't1', requestId: 'permission-t1-1', decision: 'reject', reason: 'no',
       fingerprint: 'sha256:abc' }, 'permission',
     { taskId: 't1', requestId: 'permission-t1-1', decision: 'reject', reason: 'no', fingerprint: 'sha256:abc' }],
+    ['delegate_review', { taskId: 't1', decision: 'accepted', note: 'reviewed' }, 'review',
+      { taskId: 't1', decision: 'accepted', note: 'reviewed' }],
     ['delegate_preflight', { workspacePath: 'C:\\w' }, 'preflight', { workspacePath: 'C:\\w' }],
     ['delegate_preflight', { workspacePath: 'C:\\w', allowShared: true }, 'preflight',
       { workspacePath: 'C:\\w', allowShared: true }],
@@ -632,6 +637,79 @@ test('the execution client uses the loopback endpoint without a connection token
       assert.equal(call.url.includes(TOKEN), false, 'a token must never appear in a URL');
     }
     assert.equal(calls[0].init.body, undefined, 'a GET must carry no body');
+  } finally {
+    globalThis.fetch = original;
+  }
+});
+
+test('the real execution client maps delegate_review to POST /tasks/review and forwards its payload', async () => {
+  // The delegated review must reach the plane through the REAL client, not a fake
+  // `callExecution`: a missing entry in the client's route table refused it with
+  // `MCP_ROUTE_UNMAPPED` before any request was sent, and a fake `callExecution` could
+  // never have caught that. This drives the real mapping against a stubbed fetch.
+  const calls = [];
+  const original = globalThis.fetch;
+  globalThis.fetch = async (url, init) => {
+    calls.push({ url, init });
+    return new Response(JSON.stringify({ ok: true, hostAcceptance: { accepted: true, state: 'accepted' } }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    });
+  };
+  try {
+    const client = createExecutionClient({
+      baseUrl: 'http://127.0.0.1:3210',
+      token: TOKEN,
+      timeoutMs: 1000,
+    });
+    const payload = { taskId: 'task-review-1', decision: 'changes-requested', note: 'the retry path is missing' };
+    const answer = await client('review', payload);
+
+    assert.equal(calls.length, 1, 'review must issue exactly one request');
+    assert.equal(calls[0].url, 'http://127.0.0.1:3210/dsh-delegate/x/tasks/review', 'the plane registers this exact path');
+    assert.equal(calls[0].init.method, 'POST');
+    assert.deepEqual(JSON.parse(calls[0].init.body), payload, 'taskId, decision and note must be forwarded verbatim');
+    // The answer is the plane's own, passed through rather than reshaped.
+    assert.equal(answer.ok, true);
+    assert.equal(answer.hostAcceptance.state, 'accepted');
+    // A token travels in the header, never in the URL.
+    assert.equal(calls[0].url.includes(TOKEN), false);
+  } finally {
+    globalThis.fetch = original;
+  }
+});
+
+test('every advertised tool route is mapped by the real execution client', async () => {
+  // The guard against the whole class of defect: a tool can be added to the catalog and
+  // the plane while the client's route table is forgotten. Driving every route through
+  // the real client makes that a failure here instead of at acceptance.
+  const origin = 'http://127.0.0.1:3210';
+  const calls = [];
+  const original = globalThis.fetch;
+  globalThis.fetch = async (url, init) => {
+    calls.push({ url, init });
+    return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'content-type': 'application/json' } });
+  };
+  try {
+    const client = createExecutionClient({ baseUrl: origin, token: TOKEN, timeoutMs: 1000 });
+    const routes = new Map([
+      ['status', 'GET /status'],
+      ['submit', 'POST /tasks'],
+      ['result', 'POST /tasks/get'],
+      ['cancel', 'POST /tasks/cancel'],
+      ['observe', 'POST /tasks/observe'],
+      ['permission', 'POST /tasks/permission'],
+      ['review', 'POST /tasks/review'],
+      ['preflight', 'POST /workspace/preflight'],
+    ]);
+    for (const [route, expected] of routes) {
+      calls.length = 0;
+      // A minimal well-formed payload; the plane's schema is not what is under test.
+      await client(route, { taskId: 't1', decision: 'accepted', note: 'ok', workspacePath: '/w', prompt: 'go' });
+      assert.equal(calls.length, 1, `${route} must issue exactly one request`);
+      assert.equal(`${calls[0].init.method} ${new URL(calls[0].url).pathname.replace('/dsh-delegate/x', '')}`, expected,
+        `${route} must map to ${expected}`);
+    }
   } finally {
     globalThis.fetch = original;
   }

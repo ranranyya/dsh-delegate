@@ -423,7 +423,7 @@ export function validateReviewSettings(value, providers) {
 /**
  * Validate the activity-monitoring block.
  *
- * Two silence thresholds, both in whole seconds, both bounded:
+ * Two silence thresholds and one failure-count threshold:
  *
  *  * `selfCheckSeconds` is when the engine performs ONE read-only local
  *    inspection of the executor it already holds (alive, phase, pending request,
@@ -431,33 +431,39 @@ export function validateReviewSettings(value, providers) {
  *    call and never touches the task's state, budget or deadline.
  *  * `attentionSeconds` is when a wait stops keeping quiet and reports
  *    `attention` to the commander instead of `heartbeat`.
+ *  * `repeatFailureThreshold` is how many CONSECUTIVE identical tool failures are
+ *    reported once, or `0` to switch that reminder off. It is a count, so it is
+ *    independent of the two silence thresholds: a busy run that keeps failing the
+ *    same way never reaches either of them.
  *
  * A missing block is the documented default (backwards compatible: documents
- * written before this field existed keep loading). Everything else is refused
- * rather than repaired — an unknown key (a typo such as `atentionSeconds` would
- * otherwise silently keep the default), a wrong type, a non-integer, an
+ * written before this field existed keep loading, and a document that has the other
+ * two but not this one gets the default rather than an error). Everything else is
+ * refused rather than repaired — an unknown key (a typo such as `atentionSeconds`
+ * would otherwise silently keep the default), a wrong type, a non-integer, an
  * out-of-range value, and any pair where the attention threshold is not strictly
- * greater than the self-check one. A repaired value would make the two timers
- * disagree with what the operator stored, which is exactly the class of silent
- * mismatch this plugin refuses everywhere else.
+ * greater than the self-check one. A repaired value would make the timers disagree
+ * with what the operator stored, which is exactly the class of silent mismatch this
+ * plugin refuses everywhere else.
  * @param {unknown} value - candidate monitoring block.
- * @returns {{ selfCheckSeconds: number, attentionSeconds: number }} normalized block.
+ * @returns {{ selfCheckSeconds: number, attentionSeconds: number, repeatFailureThreshold: number }} normalized block.
  */
 export function validateMonitoringSettings(value) {
   if (value === undefined || value === null) {
     return {
       selfCheckSeconds: MONITORING_DEFAULTS.selfCheckSeconds,
       attentionSeconds: MONITORING_DEFAULTS.attentionSeconds,
+      repeatFailureThreshold: MONITORING_DEFAULTS.repeatFailureThreshold,
     };
   }
   if (typeof value !== 'object' || Array.isArray(value)) {
     throw new ConfigError('MONITORING_INVALID', 'monitoring settings must be an object', { field: 'monitoring' });
   }
   for (const key of Object.keys(value)) {
-    if (key !== 'selfCheckSeconds' && key !== 'attentionSeconds') {
+    if (key !== 'selfCheckSeconds' && key !== 'attentionSeconds' && key !== 'repeatFailureThreshold') {
       throw new ConfigError('MONITORING_INVALID', `monitoring setting ${key} is not supported`, {
         field: `monitoring.${key}`,
-        supported: ['selfCheckSeconds', 'attentionSeconds'],
+        supported: ['selfCheckSeconds', 'attentionSeconds', 'repeatFailureThreshold'],
       });
     }
   }
@@ -482,7 +488,16 @@ export function validateMonitoringSettings(value) {
       { field: 'monitoring.attentionSeconds', selfCheckSeconds, attentionSeconds },
     );
   }
-  return { selfCheckSeconds, attentionSeconds };
+  const repeatFailureThreshold = requireInt(
+    value.repeatFailureThreshold === undefined
+      ? MONITORING_DEFAULTS.repeatFailureThreshold
+      : value.repeatFailureThreshold,
+    'MONITORING_INVALID',
+    'monitoring.repeatFailureThreshold',
+    LIMITS.repeatFailureThresholdMin,
+    LIMITS.repeatFailureThresholdMax,
+  );
+  return { selfCheckSeconds, attentionSeconds, repeatFailureThreshold };
 }
 
 /** Validate legacy grant TTLs kept for backwards-compatible imports. */

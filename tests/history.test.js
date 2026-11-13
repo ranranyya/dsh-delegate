@@ -639,9 +639,50 @@ function fixtureActivity(overrides = {}) {
     attentionSeconds: 600,
     selfCheck: { episode: 4, checkedAt: 1_700_000_030_000, verdict: 'tool-running' },
     kinds: { 'text-delta': 9, 'tool-call': 3, 'tool-result': 2 },
+    repeatFailure: { threshold: 3, reported: [] },
     ...overrides,
   };
 }
+
+test('the stored repeated-failure evidence keeps only bounded facts', async () => {
+  const dir = await dataDir();
+  try {
+    const store = new HistoryStore(dir);
+    await store.save(fixtureView({
+      activity: fixtureActivity({
+        repeatFailure: {
+          threshold: 3,
+          reported: [{
+            kind: 'repeated-tool-failure',
+            toolName: 'bash',
+            failureCode: 'ENOENT',
+            operationDigest: 'b'.repeat(16),
+            consecutive: 3,
+            threshold: 3,
+            firstSeenAt: 1_700_000_010_000,
+            // A field the engine never produces: it must not survive the projection.
+            arguments: 'SECRET ARGUMENTS',
+            output: 'SECRET OUTPUT',
+          }],
+        },
+      }),
+    }));
+    await store.flush();
+    const [row] = await new HistoryStore(dir).load();
+    assert.equal(row.activity.repeatFailure.threshold, 3);
+    assert.equal(row.activity.repeatFailure.reported.length, 1);
+    const entry = row.activity.repeatFailure.reported[0];
+    assert.equal(entry.toolName, 'bash');
+    assert.equal(entry.failureCode, 'ENOENT');
+    assert.equal(entry.consecutive, 3);
+    const serialized = JSON.stringify(row);
+    for (const secret of ['SECRET ARGUMENTS', 'SECRET OUTPUT']) {
+      assert.equal(serialized.includes(secret), false, `stored history must not carry ${secret}`);
+    }
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
 
 test('a bounded activity summary round-trips through the file unchanged', async () => {
   const dir = await dataDir();
@@ -800,7 +841,10 @@ test('the frozen monitoring thresholds are stored with the effective snapshot', 
     await store.flush();
 
     const [row] = await new HistoryStore(dir).load();
-    assert.deepEqual(row.effective.monitoring, { selfCheckSeconds: 120, attentionSeconds: 240 });
+    // A record written before the failure count existed carries `null` for it rather
+    // than inventing a threshold the task never ran under.
+    assert.deepEqual(row.effective.monitoring,
+      { selfCheckSeconds: 120, attentionSeconds: 240, repeatFailureThreshold: null });
     // The activity block keeps the same thresholds, so a stored "idle for 12 min"
     // can still be interpreted against the threshold it was measured under.
     assert.equal(row.activity.selfCheckSeconds, 120);

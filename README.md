@@ -8,7 +8,7 @@
 - [从 DSH Delegate／TaskDispatch 迁移到 TaskBridge](docs/taskbridge-upgrade.md)：包名为 `dsh-taskbridge`，保留旧数据和 MCP 技术标识，不要同时启用新旧插件。
 - [在 DSH“发现”中搜索和安装](docs/plugin-market.md)：添加本项目的自定义索引，安装源固定到本项目的 Git 提交。
 - [Claude Code 手动 MCP 接入](docs/claude-code.md)；Codex 继续使用设置页的安装/修复按钮。Claude Code 的一键安装按钮和真实客户端验收尚未完成。
-- [1.3.2 更新说明](docs/releases/1.3.2.zh.md)：Codex 智能体更名、任务工作区命名和旧安装路径修复；[1.3.1 发布报告](docs/releases/1.3.1.zh.md)保留历史分发核验结果。
+- [1.4.0 更新说明](docs/releases/1.4.0.zh.md)：长等待规则、重复失败提醒和宿主审查结果写回；[等待阶段 token 测量](docs/releases/1.4.0-token-benchmark.zh.md)说明短时样本的 66.58% 降幅及适用边界。历史 [1.3.2 更新说明](docs/releases/1.3.2.zh.md)保留。
 
 DeepSeek Harness（DSH）的委托插件：让 MCP 宿主在你开启本机总开关后，调用 DSH
 已配置的接口执行任务，执行结果回到宿主（例如 Codex）自行验收。
@@ -16,7 +16,7 @@ DeepSeek Harness（DSH）的委托插件：让 MCP 宿主在你开启本机总�
 新安装时本机调用总开关默认关闭。开关状态会保存在插件设置中，重启后恢复保存值；
 关闭时拒绝新的委派任务，并请求停止正在运行的任务。
 
-> **发布版本：`1.3.2`（智能体更名与任务工作区命名）。** 源码仓库和可下载的 Release
+> **发布版本：`1.4.0`（静默等待、重复失败提醒与审查状态闭环）。** 源码仓库和可下载的 Release
 > 位于 [GitHub](https://github.com/ranranyya/dsh-taskbridge)。npm 安装标识为 **`dsh-taskbridge`**，
 > GitHub Release 同时提供 `.tgz`。`1.1.0` 的静默等待说明见
 > [`docs/silent-wait.md`](./docs/silent-wait.md)；`1.2.0` 修正了其中三处真实问题（等待中断的
@@ -47,13 +47,13 @@ profile 是**应用保留的**：npm / `dsh plugin` CLI 对该 profile 的操作
 Desktop 侧的包操作只能交给应用完成——不要在 Desktop 的正式 profile 里执行 npm/pnpm
 命令，也不要直接编辑其中的文件。
 
-1. 打开 Desktop 的 **Plugins manager → 添加插件**，输入 **`dsh-taskbridge@1.3.2`**。
+1. 打开 Desktop 的 **Plugins manager → 添加插件**，输入 **`dsh-taskbridge@1.4.0`**。
    若中国大陆镜像尚未同步，先选择 npm 官方源再重试。安装后的显示名为 **DSH TaskBridge**。
    也可以从本项目 Release 下载 `.tgz`，或在仓库根目录打包：
 
    ```bash
    npm pack
-   #    → dsh-taskbridge-1.3.2.tgz
+   #    → dsh-taskbridge-1.4.0.tgz
    ```
 
 2. 使用本地包时，通过 **添加插件**入口选择下载或生成的 `.tgz`（或本仓库目录）完成安装。
@@ -67,7 +67,7 @@ Desktop 侧的包操作只能交给应用完成——不要在 Desktop 的正式
 
 ```bash
 # 装进一个 profile（例：web）
-dsh plugin --profile web add ./dsh-taskbridge-1.3.2.tgz && dsh plugin --profile web why dsh-taskbridge
+dsh plugin --profile web add ./dsh-taskbridge-1.4.0.tgz && dsh plugin --profile web why dsh-taskbridge
 
 # 启动（首次启动会自动把插件 bundle 追加到 dsh.profile.bundles）
 dsh --profile web
@@ -80,7 +80,7 @@ dsh --profile web
 ### 说明与注意
 
 - **不要装进你正在用的正式 profile 做试验。** 建议先用一次性 profile：
-  `dsh plugin --profile dsh-delegate-try add ./dsh-taskbridge-1.3.2.tgz`，再把
+  `dsh plugin --profile dsh-delegate-try add ./dsh-taskbridge-1.4.0.tgz`，再把
   `DSH_HOME` 指向临时目录做隔离验证。该命令同样只用于 CLI profile。
 - 该包声明了 `@deepseek-ai/dsh-*` 的 peer，若你的包管理器默认自动安装 peer，
   安装过程会尝试解析这些版本。可显式关闭：`npm_config_auto_install_peers=false`
@@ -146,13 +146,17 @@ dsh --profile web
 
 ## 6. MCP（stdio）接入
 
-包内可执行文件 `bin/dsh-delegate-mcp.js`（bin 名 `dsh-delegate-mcp`）实现了七个工具：
+包内可执行文件 `bin/dsh-delegate-mcp.js`（bin 名 `dsh-delegate-mcp`）实现了八个工具：
 `delegate_status` / `delegate_preflight` / `delegate_submit` / `delegate_wait` / `delegate_result` / `delegate_cancel` /
-`delegate_permission_decide`。
+`delegate_permission_decide` / `delegate_review`。
 它**不提供**授权、配置写入或凭据读写工具。`delegate_permission_decide` 是唯一一条窄例外：
 它只能回答一个**已经挂起**的「单次调用授权请求」，给 `allow-once`（仅这一次调用可继续）或
 `reject`。它不能创建或扩大任何**长期有效**的授权，不能修改设置、凭据、本机开关、提供方/模型或隔离方式，
 也不能预先批准后续调用。
+
+`delegate_review` 只记录已交付任务的宿主审查结论。指挥端检查结果和验证证据后，传入
+`decision: "accepted"` 或 `"changes-requested"` 与简短 `note`；任务页显示“审查通过”或“需要修正”。
+它不会授予工具权限或自动合并文件。旧记录缺少结论时仍保留待审，不把执行完成自动标成通过。
 
 在需要调用委派工具的 MCP 宿主中添加 stdio server（以下为通用配置示意；Codex 用见 6.1，
 插件会替你写这条并给出正确路径）：
@@ -173,8 +177,8 @@ dsh --profile web
   每次工具调用前都会重新读取，因此 DSH 重启并更换端口后无需改 Codex 配置。
 - 默认发现路径使用 `DSH_HOME`，未设置时为 `~/.dsh`。若 DSH 和 MCP 宿主使用不同的 DSH_HOME，
   可通过 `DSH_DELEGATE_DISCOVERY_FILE` 指向该发现文件。`DSH_DELEGATE_BASE_URL` 仅作为手动固定地址覆盖。
-- 工具为 `delegate_status`、`delegate_preflight`、`delegate_submit`、`delegate_result`、
-  `delegate_cancel` 和 `delegate_permission_decide`。
+- 工具为 `delegate_status`、`delegate_preflight`、`delegate_submit`、`delegate_wait`、`delegate_result`、
+  `delegate_cancel`、`delegate_permission_decide` 和 `delegate_review`。
 - 开关关闭时，`delegate_submit` 与 `delegate_permission_decide` 返回 `DELEGATION_DISABLED`；状态、
   预检、结果和取消工具仍可使用。`delegate_preflight` 只读取工作区事实，不创建任何东西，因此不受
   开关和并发上限限制。
@@ -511,7 +515,7 @@ Codex 子智能体现在按「提交 → `delegate_wait` 同一任务」运作�
 # 不要在 Desktop 的正式 profile 下执行下面的 CLI 命令。
 
 # CLI web profile 的升级：换成本地新包或（将来）新版本
-dsh plugin --profile web add ./dsh-taskbridge-1.3.2.tgz
+dsh plugin --profile web add ./dsh-taskbridge-1.4.0.tgz
 
 # 导出：界面里"导出非敏感配置"按钮，或用只读 API
 #   GET /api/dsh-delegate/settings
@@ -571,8 +575,8 @@ dsh plugin --profile web remove dsh-taskbridge
   第二个模型审查、也不依赖人工点击。
 - **工作树隔离需要 git**：默认 `worktree` 隔离要求源目录是已提交的 git 仓库；
   否则显式拒绝。`shared` 模式不是隔离，界面会如实标注。
-- **审查不是批准**：附加审查只产出发现，不代表宿主验收；任务完成状态是
-  "等待宿主审查"，不是"已通过"。
+- **交付与验收分开**：附加模型审查只产出发现；执行交付时等待宿主审查，由指挥端明确写回结论，
+  任务页才显示“审查通过”或“需要修正”。
 - **Codex 集成的限制**：
   - 一键安装按钮只支持 Codex；Claude Code 可按接入说明手动配置标准 MCP，尚无一键安装按钮或真实客户端验收。
   - **不宣称**当前 Codex 桌面版/CLI 支持用 `@dsh-taskbridge` 在输入框直接选中该子智能体：

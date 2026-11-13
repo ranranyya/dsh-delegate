@@ -154,6 +154,10 @@ function statusForCode(code) {
   // An archived task is not a request error: the task exists, but only as a
   // durable record, so the action conflicts with the task's real state.
   if (code === 'JOB_ARCHIVED_TASK') return 409;
+  // A malformed review request is the caller's mistake; an unpersisted one is an
+  // upstream failure; "this task cannot be reviewed (now)" conflicts with its state.
+  if (code === 'JOB_REVIEW_INVALID') return 400;
+  if (code === 'JOB_REVIEW_NOT_PERSISTED') return 502;
   if (code.startsWith('JOB_')) return 409;
   // The credential seam is a separate service. "It is not installed here" is a
   // capability gap (503), "the backend refused the write" is an upstream failure

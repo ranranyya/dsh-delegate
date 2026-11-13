@@ -93,6 +93,7 @@ function monitorFixture(options = {}) {
     wait: clock.wait,
     selfCheckSeconds: options.selfCheckSeconds ?? 300,
     attentionSeconds: options.attentionSeconds ?? 600,
+    ...(options.repeatFailureThreshold === undefined ? {} : { repeatFailureThreshold: options.repeatFailureThreshold }),
     waitSliceMs: options.waitSliceMs ?? 1000,
   });
   task.monitor = monitor;
@@ -121,6 +122,43 @@ function toolResult(callId = 'call-1', body = 'SECRET TOOL OUTPUT') {
     seq: 4,
     time: 0,
     data: { turn: 1, step: 1, message: { role: 'tool', toolCallId: callId, content: [{ type: 'text', text: body }] } },
+  };
+}
+
+/**
+ * A native `tool/result` that the harness marks as FAILED.
+ *
+ * The shapes are the durable contract, not invented: `message.isError` is the
+ * `ToolResultMessage.isError` marker and `error: { name, code, reason }` is the
+ * event's own failure identity (`SessionEventMap['tool/result']`).
+ * @param {string} callId - the call this answers.
+ * @param {object} [options] - `code`, `name`, `reason`, `body`, `error` (null to omit the block).
+ * @returns {object} failed result event.
+ */
+function failedToolResult(callId = 'call-1', options = {}) {
+  const code = options.code ?? 'ENOENT';
+  const body = options.body ?? `SECRET FAILURE BODY for ${code}`;
+  return {
+    type: 'tool/result',
+    seq: 4,
+    time: 0,
+    data: {
+      turn: 1,
+      step: 1,
+      message: {
+        role: 'tool',
+        toolCallId: callId,
+        isError: true,
+        content: [{ type: 'text', text: body }],
+      },
+      ...(options.error === null ? {} : {
+        error: {
+          name: options.name ?? 'ToolError',
+          code,
+          reason: options.reason ?? `the tool said ${code}`,
+        },
+      }),
+    },
   };
 }
 
@@ -831,4 +869,362 @@ test('heartbeat, result polling and an empty delta never reset the idle clock', 
   clock.advance(540_000);
   const outcome = await monitor.observe({ waitMs: 1 });
   assert.equal(outcome.reason, OBSERVE_REASONS.attention);
+});
+
+// ---------------------------------------------------------------------------
+// Repeated-failure reminder: independent of the silence clock
+// ---------------------------------------------------------------------------
+
+/**
+ * Drive one failing call/result pair through a monitor.
+ * @param {object} monitor - the monitor under test.
+ * @param {number} at - observation time.
+ * @param {object} [options] - `name`, `callId`, `args`, `code`, `reason`, `body`.
+ * @returns {void}
+ */
+function repeatFailure(monitor, at, options = {}) {
+  monitor.onEvent(toolCall(options.name ?? 'bash', options.callId ?? 'call-x', options.args ?? '{"command":"npm test"}'), at);
+  monitor.onEvent(
+    failedToolResult(options.callId ?? 'call-x', {
+      code: options.code ?? 'ENOENT',
+      ...(options.reason === undefined ? {} : { reason: options.reason }),
+      ...(options.body === undefined ? {} : { body: options.body }),
+    }),
+    at,
+  );
+}
+
+test('the same tool, operation and failure three times reports once and leaves the task running', async () => {
+  const { monitor, task, clock } = monitorFixture({ repeatFailureThreshold: 3 });
+  for (const id of ['c1', 'c2', 'c3']) repeatFailure(monitor, clock.clockMs, { callId: id });
+
+  const outcome = await monitor.observe({ waitMs: 1 });
+  assert.equal(outcome.reason, OBSERVE_REASONS.attention, 'the reminder rides the existing attention reason');
+  assert.equal(outcome.failure.kind, 'repeated-tool-failure');
+  assert.equal(outcome.failure.toolName, 'bash');
+  assert.equal(outcome.failure.failureCode, 'ENOENT');
+  assert.equal(outcome.failure.consecutive, 3);
+  assert.equal(task.state, 'running', 'a reminder never changes the task state');
+
+  // Delivered once: the next observation sees nothing, even with more identical failures.
+  repeatFailure(monitor, clock.clockMs, { callId: 'c4' });
+  const again = await monitor.observe({ waitMs: 1 });
+  assert.equal(again.failure, null, 'an already reported episode is not re-reported');
+  assert.equal(monitor.pendingFailure, null);
+});
+
+test('fewer than the threshold, a different operation, a different failure or a success all reset the count', async () => {
+  const { monitor, clock } = monitorFixture({ repeatFailureThreshold: 3 });
+  const BUILD = '{"command":"npm run build"}';
+  // Two identical failures are not enough.
+  repeatFailure(monitor, clock.clockMs, { callId: 'a1' });
+  repeatFailure(monitor, clock.clockMs, { callId: 'a2' });
+  assert.equal(monitor.failures.episode.count, 2);
+  assert.equal(monitor.pendingFailure, null);
+
+  // A DIFFERENT operation starts a new episode rather than continuing this one.
+  repeatFailure(monitor, clock.clockMs, { callId: 'a3', args: BUILD });
+  assert.equal(monitor.failures.episode.count, 1);
+  assert.equal(monitor.pendingFailure, null);
+
+  // Same operation again, but a DIFFERENT failure code: also its own episode.
+  repeatFailure(monitor, clock.clockMs, { callId: 'a4', args: BUILD });
+  assert.equal(monitor.failures.episode.count, 2, 'the same operation and code continues its episode');
+  repeatFailure(monitor, clock.clockMs, { callId: 'a5', args: BUILD, code: 'EACCES' });
+  assert.equal(monitor.failures.episode.count, 1, 'a new failure code restarts the count');
+  assert.equal(monitor.pendingFailure, null);
+
+  // A SUCCESS ends the episode entirely.
+  monitor.onEvent(toolCall('bash', 'a6', BUILD), clock.clockMs);
+  monitor.onEvent(toolResult('a6'), clock.clockMs);
+  assert.equal(monitor.failures.episode, null, 'success clears the failure episode');
+  assert.equal(monitor.pendingFailure, null);
+});
+
+test('a duplicate result for the same callId is counted once', async () => {
+  const { monitor, clock } = monitorFixture({ repeatFailureThreshold: 2 });
+  repeatFailure(monitor, clock.clockMs, { callId: 'dup-1' });
+  // The harness/runner can replay the same settled result; it must not count twice.
+  monitor.onEvent(failedToolResult('dup-1', { code: 'ENOENT' }), clock.clockMs);
+  monitor.onEvent(failedToolResult('dup-1', { code: 'ENOENT' }), clock.clockMs);
+  assert.equal(monitor.failures.episode.count, 1);
+  assert.equal(monitor.pendingFailure, null, 'one failure of a two-failure threshold is not a reminder');
+});
+
+test('a run whose failures persisted past the threshold reminds once, and a new episode may remind again', async () => {
+  const { monitor, clock } = monitorFixture({ repeatFailureThreshold: 3 });
+  for (const id of ['e1', 'e2', 'e3', 'e4', 'e5']) repeatFailure(monitor, clock.clockMs, { callId: id });
+  const first = await monitor.observe({ waitMs: 1 });
+  assert.equal(first.failure.consecutive, 3, 'the reminder names the count it first reached');
+  assert.equal((await monitor.observe({ waitMs: 1 })).failure, null, 'continuous failures do not re-wake the host');
+
+  // The run recovers and then fails identically again: that is a NEW episode, and it
+  // is reported again — once, not per failure.
+  monitor.onEvent(toolCall('bash', 'e6', '{"command":"npm test"}'), clock.clockMs);
+  monitor.onEvent(toolResult('e6'), clock.clockMs);
+  for (const id of ['e7', 'e8', 'e9', 'e10']) repeatFailure(monitor, clock.clockMs, { callId: id });
+  const second = await monitor.observe({ waitMs: 1 });
+  assert.equal(second.reason, OBSERVE_REASONS.attention);
+  assert.equal(second.failure.consecutive, 3, 'the new episode reports its own count');
+  assert.equal((await monitor.observe({ waitMs: 1 })).failure, null);
+  assert.equal(monitor.failures.reported.length, 2, 'a later episode can report again');
+});
+
+test('threshold 0 disables the reminder entirely', async () => {
+  const { monitor, clock } = monitorFixture({ repeatFailureThreshold: 0 });
+  for (const id of ['z1', 'z2', 'z3', 'z4']) repeatFailure(monitor, clock.clockMs, { callId: id });
+  assert.equal(monitor.pendingFailure, null);
+  assert.equal(monitor.failures.threshold, 0);
+  assert.equal(monitor.snapshot({ at: clock.clockMs }).repeatFailure.reported.length, 0);
+});
+
+test('ordinary output with the word error, thinking, long tests and no file change are not failures', async () => {
+  const { monitor, clock } = monitorFixture({ repeatFailureThreshold: 3 });
+  for (let index = 0; index < 5; index += 1) {
+    // A SUCCESSFUL result whose body is full of the word "error".
+    monitor.onEvent(toolCall('bash', `ok-${index}`, '{"command":"npm test"}'), clock.clockMs);
+    monitor.onEvent(toolResult(`ok-${index}`, 'error: 0, 0 errors, no failures'), clock.clockMs);
+  }
+  // Reasoning only, and a long-running call with no result at all.
+  monitor.onEvent(reasoningDelta('thinking about the error handling'), clock.clockMs);
+  monitor.onEvent(toolCall('bash', 'long-1', '{"command":"npm test"}'), clock.clockMs);
+  assert.equal(monitor.pendingFailure, null, 'none of these is a structured tool failure');
+  assert.equal(monitor.failures.episode, null);
+});
+
+test('permission and terminal states outrank a failure reminder', async () => {
+  const pendingTask = taskRecord({ permission: { pending: { requestId: 'permission-1', state: 'pending' } } });
+  const pending = monitorFixture({ task: pendingTask, repeatFailureThreshold: 3 });
+  for (const id of ['p1', 'p2', 'p3']) repeatFailure(pending.monitor, pending.clock.clockMs, { callId: id });
+  const permissionOutcome = await pending.monitor.observe({ waitMs: 1 });
+  assert.equal(permissionOutcome.reason, OBSERVE_REASONS.permission, 'a decision outranks the reminder');
+  assert.equal(permissionOutcome.failure, null);
+
+  const settledTask = taskRecord({ state: 'awaiting-host-review', endedAt: 2_000_000 });
+  const settled = monitorFixture({ task: settledTask, repeatFailureThreshold: 3 });
+  for (const id of ['t1', 't2', 't3']) repeatFailure(settled.monitor, settled.clock.clockMs, { callId: id });
+  const terminal = await settled.monitor.observe({ waitMs: 1 });
+  assert.equal(terminal.reason, OBSERVE_REASONS.ready);
+  assert.equal(terminal.failure, null, 'a finished run is reported as finished, not as a failure reminder');
+});
+
+test('the failure reminder never carries arguments, results, reasoning or error prose', async () => {
+  const { monitor, clock } = monitorFixture({ repeatFailureThreshold: 2 });
+  for (const id of ['s1', 's2']) {
+    repeatFailure(monitor, clock.clockMs, { callId: id, body: 'TOPSECRET-OUTPUT sk-abc123' });
+  }
+  monitor.onEvent(reasoningDelta('TOPSECRET-REASONING'), clock.clockMs);
+  const outcome = await monitor.observe({ waitMs: 1 });
+  const serialized = JSON.stringify(outcome.failure);
+  for (const secret of ['TOPSECRET', 'sk-abc123', 'npm test', 'SECRET']) {
+    assert.equal(serialized.includes(secret), false, `the reminder must not carry ${secret}`);
+  }
+  // And nothing of it is in the published activity summary either.
+  const snapshot = JSON.stringify(monitor.snapshot({ at: clock.clockMs }));
+  for (const secret of ['TOPSECRET', 'sk-abc123', 'npm test']) {
+    assert.equal(snapshot.includes(secret), false, `the summary must not carry ${secret}`);
+  }
+  assert.match(outcome.failure.operationDigest, /^[0-9a-f]{16}$/u, 'only a bounded digest of the operation travels');
+});
+
+test('repeated failures do not disturb the silence clock, and silence still reports on its own', async () => {
+  const { monitor, clock } = monitorFixture({ repeatFailureThreshold: 3 });
+  monitor.onEvent(toolCall('bash', 'm1', '{"command":"npm test"}'), clock.clockMs);
+  monitor.onEvent(failedToolResult('m1', { code: 'ENOENT' }), clock.clockMs);
+  const lastActivity = monitor.activity.lastActivityAt;
+  // A failed result IS still activity: the tool ran.
+  assert.equal(lastActivity, clock.clockMs);
+
+  // Counted failures alone never manufacture a silence report before the threshold.
+  clock.advance(590_000);
+  const quiet = await monitor.observe({ waitMs: 1 });
+  assert.equal(quiet.reason, OBSERVE_REASONS.heartbeat, '10 minutes of silence is not reached yet');
+  assert.equal(quiet.failure, null);
+});
+
+test('a cancelled observation releases only the reader and keeps the failure count', async () => {
+  const { monitor, clock } = monitorFixture({ repeatFailureThreshold: 3 });
+  repeatFailure(monitor, clock.clockMs, { callId: 'k1' });
+  const controller = new AbortController();
+  const waiting = monitor.observe({ waitMs: 5_000, signal: controller.signal });
+  controller.abort();
+  const outcome = await waiting;
+  assert.equal(outcome.reason, OBSERVE_REASONS.interrupted);
+  assert.equal(monitor.failures.episode.count, 1, 'an interrupted observer does not reset the count');
+});
+
+test('the same code with a genuinely different reason is a different episode', async () => {
+  // The code is only the CLASS of failure. Two ENOENTs for different files are different
+  // problems, so counting them together would report a "repeat" that never happened.
+  const { monitor, clock } = monitorFixture({ repeatFailureThreshold: 3 });
+  repeatFailure(monitor, clock.clockMs, { callId: 'r1', reason: 'no such file: a.txt' });
+  repeatFailure(monitor, clock.clockMs, { callId: 'r2', reason: 'no such file: b.txt' });
+  repeatFailure(monitor, clock.clockMs, { callId: 'r3', reason: 'no such file: c.txt' });
+  assert.equal(monitor.pendingFailure, null, 'three different reasons are not one repeated failure');
+  assert.equal(monitor.failures.episode.count, 1);
+
+  // The SAME reason repeated does reach the threshold.
+  for (const id of ['r4', 'r5']) repeatFailure(monitor, clock.clockMs, { callId: id, reason: 'no such file: c.txt' });
+  assert.equal(monitor.failures.episode.count, 3);
+  const outcome = await monitor.observe({ waitMs: 1 });
+  assert.equal(outcome.failure.consecutive, 3);
+  // The reason itself is never published.
+  assert.equal(JSON.stringify(outcome.failure).includes('no such file'), false);
+});
+
+test('firstSeenAt is the FIRST failure of the episode, not the one that reached the threshold', async () => {
+  const { monitor, clock } = monitorFixture({ repeatFailureThreshold: 3 });
+  repeatFailure(monitor, clock.clockMs, { callId: 'f1' });
+  const firstAt = clock.clockMs;
+  clock.advance(60_000);
+  repeatFailure(monitor, clock.clockMs, { callId: 'f2' });
+  clock.advance(60_000);
+  repeatFailure(monitor, clock.clockMs, { callId: 'f3' });
+  const thirdAt = clock.clockMs;
+
+  const outcome = await monitor.observe({ waitMs: 1 });
+  assert.equal(outcome.failure.firstSeenAt, firstAt, 'the episode starts at the first failure');
+  assert.equal(outcome.failure.lastSeenAt, thirdAt, 'and the last failure is reported separately');
+  assert.notEqual(outcome.failure.firstSeenAt, thirdAt);
+});
+
+test('a reminder parked before the host observed it is dropped when the episode ends or changes', async () => {
+  const { monitor, clock } = monitorFixture({ repeatFailureThreshold: 3 });
+  // Reach the threshold, so a reminder is parked but NOT yet delivered.
+  for (const id of ['s1', 's2', 's3']) repeatFailure(monitor, clock.clockMs, { callId: id });
+  assert.ok(monitor.pendingFailure !== null, 'the reminder is parked');
+
+  // The run then SUCCEEDS before anyone observed: the parked reminder is stale.
+  monitor.onEvent(toolCall('bash', 's4', '{"command":"npm test"}'), clock.clockMs);
+  monitor.onEvent(toolResult('s4'), clock.clockMs);
+  assert.equal(monitor.pendingFailure, null, 'a success clears the parked reminder');
+  const afterSuccess = await monitor.observe({ waitMs: 1 });
+  assert.equal(afterSuccess.failure, null, 'and a stale reminder is never delivered');
+  // The historical evidence survives: it happened, it is just not news.
+  assert.equal(monitor.failures.reported.length, 1);
+});
+
+test('a parked reminder is dropped when the run switches to a different failure', async () => {
+  const { monitor, clock } = monitorFixture({ repeatFailureThreshold: 3 });
+  for (const id of ['w1', 'w2', 'w3']) repeatFailure(monitor, clock.clockMs, { callId: id });
+  assert.ok(monitor.pendingFailure !== null);
+
+  // A different operation now fails once: the counted episode changed.
+  repeatFailure(monitor, clock.clockMs, { callId: 'w4', args: '{"command":"npm run build"}' });
+  assert.equal(monitor.pendingFailure, null, 'the parked reminder no longer describes the episode');
+  const outcome = await monitor.observe({ waitMs: 1 });
+  assert.equal(outcome.failure, null);
+  assert.equal(monitor.failures.reported.length, 1, 'the reported history is kept');
+});
+
+test('a reminder parked in the same millisecond as a new episode is still dropped', async () => {
+  // The exact collision the host reproduced: the clock does NOT advance, so the old
+  // `firstSeenAt` comparison saw the same value for both episodes and the stale reminder
+  // survived `claimFailureReport()`. Identity is now the episode's own sequence.
+  const { monitor, clock } = monitorFixture({ repeatFailureThreshold: 3 });
+  const at = clock.clockMs;
+
+  // Episode A reaches the threshold at this instant and parks a reminder.
+  for (const id of ['c1', 'c2', 'c3']) repeatFailure(monitor, at, { callId: id, reason: 'reason A' });
+  assert.ok(monitor.pendingFailure !== null, 'episode A parked a reminder');
+  assert.equal(monitor.pendingFailure.firstSeenAt, at);
+  const parkedA = monitor.pendingFailure;
+  assert.equal(monitor.failures.isCurrent(parkedA), true, 'while A is the live episode it is current');
+
+  // Episode B starts at the SAME timestamp: same tool, same operation, same code, but a
+  // different reason. Under the timestamp comparison its `firstSeenAt` would equal A's.
+  repeatFailure(monitor, at, { callId: 'c4', reason: 'reason B' });
+  assert.notEqual(monitor.failures.episode.sequence, undefined);
+  assert.equal(monitor.failures.episode.firstSeenAt, at, 'the timestamps really do collide');
+
+  // The parked A reminder must no longer be considered current.
+  assert.equal(monitor.failures.isCurrent(parkedA), false, 'the sequence tells the two apart');
+  assert.equal(monitor.pendingFailure, null, 'the switch cleared it outright');
+  assert.equal(monitor.claimFailureReport(), null, 'and claiming it returns nothing stale');
+
+  // Two more B failures complete B's threshold: only B is reported, once.
+  for (const id of ['c5', 'c6']) repeatFailure(monitor, at, { callId: id, reason: 'reason B' });
+  const outcome = await monitor.observe({ waitMs: 1 });
+  assert.equal(outcome.failure.consecutive, 3);
+  // The internal episode sequence never reaches a published diagnostic.
+  assert.equal('episodeSequence' in outcome.failure, false);
+  assert.equal(JSON.stringify(monitor.snapshot({ at })).includes('episodeSequence'), false);
+  assert.equal(monitor.failures.reported.length, 2, 'both episodes are kept as history');
+});
+
+test('claimFailureReport returns null once the episode has changed, even if still parked', async () => {
+  // Defends the guard itself, independent of the eager clearing in `observeFailure`:
+  // a reminder from a previous episode must never be handed out as current news.
+  const { monitor, clock } = monitorFixture({ repeatFailureThreshold: 2 });
+  for (const id of ['g1', 'g2']) repeatFailure(monitor, clock.clockMs, { callId: id, reason: 'A' });
+  assert.ok(monitor.pendingFailure !== null, 'a reminder is parked');
+
+  // Simulate a different failure becoming the live episode while the old one is still
+  // parked: only the episode identity changes, nothing else about the object does.
+  monitor.failures.episode.sequence = monitor.failures.nextEpisode();
+  assert.equal(monitor.claimFailureReport(), null, 'a stale episode is never delivered');
+  assert.equal(monitor.pendingFailure, null, 'and it is dropped');
+});
+
+test('an arbitrary error code or name is never published, even when it is identifier-shaped', async () => {
+  // The previous rule replaced punctuation with `_`, which is NOT redaction: these values
+  // are already valid identifiers, so they would have travelled through untouched. Only an
+  // allowlisted code may be published; everything recognizable-as-anything-else becomes
+  // `TOOL_ERROR`.
+  for (const secretCode of [
+    'ENOENT /home/alice/.ssh/id_rsa sk-live-abc123',
+    // Host-reported case: purely identifier-shaped, no punctuation to "clean".
+    'sk-TASKBRIDGE-MOCK-SECRET-987654321',
+    'alice-token-abcdef123456',
+  ]) {
+    const { monitor, clock } = monitorFixture({ repeatFailureThreshold: 2 });
+    for (const id of ['x1', 'x2']) {
+      repeatFailure(monitor, clock.clockMs, { callId: id, code: secretCode, reason: 'boom' });
+    }
+    const outcome = await monitor.observe({ waitMs: 1 });
+    const serialized = JSON.stringify(outcome.failure);
+    assert.equal(outcome.failure.failureCode, 'TOOL_ERROR', `a non-allowlisted code must be generic: ${secretCode}`);
+    for (const fragment of ['id_rsa', 'sk-live-abc123', 'sk-TASKBRIDGE', 'SECRET', '987654321',
+      '/home/alice', 'alice-token', 'abcdef123456']) {
+      assert.equal(serialized.includes(fragment), false, `the reminder must not carry ${fragment}`);
+    }
+    // And the same value is absent from the published activity summary too.
+    const snapshot = JSON.stringify(monitor.snapshot({ at: clock.clockMs }));
+    for (const fragment of ['sk-TASKBRIDGE', 'id_rsa', 'sk-live-abc123']) {
+      assert.equal(snapshot.includes(fragment), false, `the summary must not carry ${fragment}`);
+    }
+    // It was still USED as identity input, so episodes remain distinguishable.
+    assert.match(outcome.failure.operationDigest, /^[0-9a-f]{16}$/u);
+  }
+});
+
+test('an allowlisted code is published as itself, and unknown codes still separate episodes', async () => {
+  // A recognized code is genuinely useful to an operator and carries no content of its own.
+  const known = monitorFixture({ repeatFailureThreshold: 2 });
+  for (const id of ['k1', 'k2']) repeatFailure(known.monitor, known.clock.clockMs, { callId: id, code: 'ENOENT' });
+  const published = await known.monitor.observe({ waitMs: 1 });
+  assert.equal(published.failure.failureCode, 'ENOENT');
+
+  // Two DIFFERENT unknown codes both publish TOOL_ERROR, but they are not one episode:
+  // the full identity is hashed, so the count does not merge across them.
+  const split = monitorFixture({ repeatFailureThreshold: 2 });
+  repeatFailure(split.monitor, split.clock.clockMs, { callId: 'u1', code: 'sk-aaaa-1111' });
+  repeatFailure(split.monitor, split.clock.clockMs, { callId: 'u2', code: 'sk-bbbb-2222' });
+  assert.equal(split.monitor.pendingFailure, null, 'different real codes are different episodes');
+  assert.equal(split.monitor.failures.episode.count, 1);
+});
+
+test('an isError result with no structured error block still separates by content digest only', async () => {
+  // The native contract allows `isError: true` with no `error` block. The identity then
+  // comes from a digest of the result content, which is never retained or published.
+  const { monitor, clock } = monitorFixture({ repeatFailureThreshold: 2 });
+  const body = 'Command failed: SECRET-CONTENT-xyz';
+  for (const id of ['n1', 'n2']) {
+    monitor.onEvent(toolCall('bash', id, '{"command":"npm test"}'), clock.clockMs);
+    monitor.onEvent(failedToolResult(id, { error: null, body }), clock.clockMs);
+  }
+  const outcome = await monitor.observe({ waitMs: 1 });
+  assert.equal(outcome.failure.failureCode, 'TOOL_ERROR');
+  assert.equal(outcome.failure.consecutive, 2);
+  assert.equal(JSON.stringify(outcome.failure).includes('SECRET-CONTENT'), false);
 });

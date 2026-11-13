@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { CODEX_ACTIONS, ROUTES, createStore, defaultDraft, documentFromDraft, draftFromSettings, exportDocument, formatDuration, hasLiveTasks, isLiveTask, minutesToSeconds, precheckDraft, precheckMonitoring, previewEffective, secondsToMinutes, taskActivity, taskProgress } from '../src/client/api.js';
+import { CODEX_ACTIONS, ROUTES, createStore, defaultDraft, documentFromDraft, draftFromSettings, exportDocument, formatDuration, hasLiveTasks, isLiveTask, minutesToSeconds, monitoringDraftOf, monitoringOf, precheckDraft, precheckMonitoring, previewEffective, secondsToMinutes, taskActivity, taskProgress } from '../src/client/api.js';
 import {
   CONVERSATION_LABELS,
   CONVERSATION_MODES,
@@ -138,9 +138,11 @@ test('the built page no longer offers a conversation-mode control, and states th
 test('a document without monitoring opens with the 5/10-minute defaults', () => {
   // An old stored file (and an old host) has no `monitoring` key at all.
   const draft = draftFromSettings({ schemaVersion: 1, providers: [] });
-  assert.deepEqual(draft.monitoring, { selfCheckSeconds: 300, attentionSeconds: 600 });
+  assert.deepEqual(draft.monitoring, { selfCheckSeconds: 300, attentionSeconds: 600, repeatFailureThreshold: 3 });
   assert.equal(defaultDraft().monitoring.selfCheckSeconds, 300);
   assert.equal(defaultDraft().monitoring.attentionSeconds, 600);
+  // The failure reminder defaults too, so an old draft opens with a usable value.
+  assert.equal(defaultDraft().monitoring.repeatFailureThreshold, 3);
 });
 
 test('monitoring survives draft, document and preview round trips as whole seconds', () => {
@@ -149,11 +151,44 @@ test('monitoring survives draft, document and preview round trips as whole secon
     providers: [],
     monitoring: { selfCheckSeconds: 90, attentionSeconds: 240 },
   });
-  assert.deepEqual(draft.monitoring, { selfCheckSeconds: 90, attentionSeconds: 240 });
-  assert.deepEqual(documentFromDraft(draft).monitoring, { selfCheckSeconds: 90, attentionSeconds: 240 });
-  assert.deepEqual(previewEffective(draft, null).monitoring, { selfCheckSeconds: 90, attentionSeconds: 240 });
+  assert.deepEqual(draft.monitoring, { selfCheckSeconds: 90, attentionSeconds: 240, repeatFailureThreshold: 3 });
+  assert.deepEqual(documentFromDraft(draft).monitoring, { selfCheckSeconds: 90, attentionSeconds: 240, repeatFailureThreshold: 3 });
+  assert.deepEqual(previewEffective(draft, null).monitoring, { selfCheckSeconds: 90, attentionSeconds: 240, repeatFailureThreshold: 3 });
   // The export text is the same non-secret document, so it carries the block too.
   assert.match(exportDocument(draft), /"selfCheckSeconds": 90/u);
+  assert.match(exportDocument(draft), /"repeatFailureThreshold": 3/u);
+});
+
+test('the repeated-failure count round-trips, and 0 stays 0 rather than becoming a default', () => {
+  const off = draftFromSettings({ schemaVersion: 1, providers: [], monitoring: { repeatFailureThreshold: 0 } });
+  assert.equal(off.monitoring.repeatFailureThreshold, 0, 'off is a real stored value');
+  assert.deepEqual(precheckMonitoring(off.monitoring), [], '0 is legal, not a problem');
+  assert.equal(documentFromDraft(off).monitoring.repeatFailureThreshold, 0);
+  // A missing value keeps the documented default, for an older served document.
+  assert.equal(draftFromSettings({ monitoring: {} }).monitoring.repeatFailureThreshold, 3);
+  assert.equal(precheckMonitoring({ selfCheckSeconds: 300, attentionSeconds: 600 }).length, 0);
+  for (const bad of [-1, 21, 2.5]) {
+    assert.equal(precheckMonitoring({ selfCheckSeconds: 300, attentionSeconds: 600, repeatFailureThreshold: bad }).length, 1);
+  }
+});
+
+test('a cleared field is refused by the raw-block precheck instead of becoming the default', () => {
+  // This is the defect the raw helper exists for: `monitoringOf` turns `''` into the
+  // documented default so the input still renders, which would make a CLEARED field look
+  // valid and leave the save button enabled.
+  const typed = { monitoring: { selfCheckSeconds: '', attentionSeconds: 600, repeatFailureThreshold: 3 } };
+  assert.equal(monitoringOf(typed).selfCheckSeconds, 300, 'the display normalizer falls back');
+  assert.equal(monitoringDraftOf(typed).selfCheckSeconds, '', 'the raw block keeps what was typed');
+  assert.equal(precheckMonitoring(monitoringDraftOf(typed)).length, 1, 'and the precheck refuses it');
+
+  const blankCount = { monitoring: { selfCheckSeconds: 300, attentionSeconds: 600, repeatFailureThreshold: '' } };
+  assert.equal(monitoringOf(blankCount).repeatFailureThreshold, 3);
+  assert.equal(monitoringDraftOf(blankCount).repeatFailureThreshold, '');
+  assert.equal(precheckMonitoring(monitoringDraftOf(blankCount)).length, 1, 'a blank count is a real error');
+
+  // The whole-draft precheck (the panel's save gate) must refuse it too.
+  const draft = { ...defaultDraft(), monitoring: { selfCheckSeconds: 300, attentionSeconds: 600, repeatFailureThreshold: '' } };
+  assert.ok(precheckDraft(draft).some((problem) => problem.includes('重复失败')));
 });
 
 test('a fractional or non-numeric stored value is coerced to whole seconds', () => {
@@ -205,14 +240,15 @@ test('saving monitoring does not disturb an unsaved provider edit and keeps the 
   });
   assert.equal(store.getSnapshot().dirty, true);
 
-  const result = await store.saveMonitoring({ selfCheckSeconds: 120, attentionSeconds: 300 });
+  const result = await store.saveMonitoring({ selfCheckSeconds: 120, attentionSeconds: 300, repeatFailureThreshold: 5 });
   assert.equal(result.ok, true);
-  assert.deepEqual(calls, [{ selfCheckSeconds: 120, attentionSeconds: 300 }]);
+  // The wire body is the NORMALIZED block the host validates, including the count.
+  assert.deepEqual(calls, [{ selfCheckSeconds: 120, attentionSeconds: 300, repeatFailureThreshold: 5 }]);
   const after = store.getSnapshot();
   // The narrow save adopts the committed document for `settings`…
-  assert.deepEqual(after.settings.monitoring, { selfCheckSeconds: 120, attentionSeconds: 300 });
+  assert.deepEqual(after.settings.monitoring, { selfCheckSeconds: 120, attentionSeconds: 300, repeatFailureThreshold: 5 });
   // …updates the draft's monitoring block…
-  assert.deepEqual(after.draft.monitoring, { selfCheckSeconds: 120, attentionSeconds: 300 });
+  assert.deepEqual(after.draft.monitoring, { selfCheckSeconds: 120, attentionSeconds: 300, repeatFailureThreshold: 5 });
   // …and leaves the unsaved provider edit exactly where it was.
   assert.equal(after.draft.providers.length, 1);
   assert.equal(after.draft.providers[0].id, 'relay');
@@ -231,6 +267,92 @@ test('an invalid monitoring save is refused locally and writes nothing', async (
   const result = await store.saveMonitoring({ selfCheckSeconds: 600, attentionSeconds: 300 });
   assert.equal(result.ok, false);
   assert.equal(wrote, false, 'the host is never called with a pair the precheck rejects');
+});
+
+test('a bad repeated-failure count is refused by saveMonitoring before it is normalized', async () => {
+  // Every one of these would have been silently repaired to the default if the save
+  // normalized the block first and validated afterwards.
+  //
+  // `undefined` is deliberately NOT in this list: an absent key is the documented
+  // "document written before this setting existed" case, which takes the default (see the
+  // compatibility tests above). An explicit `null` IS a supplied-but-invalid value, so it
+  // is refused — that is the distinction being pinned here.
+  for (const bad of ['', null, 2.5, -1, 21]) {
+    let wrote = false;
+    const store = createStore({
+      api: {
+        async getSettings() { return { ok: true, settings: { schemaVersion: 1, providers: [] } }; },
+        async putMonitoring() { wrote = true; return { ok: true }; },
+      },
+    });
+    await store.loadSettings();
+    const result = await store.saveMonitoring({
+      selfCheckSeconds: 300,
+      attentionSeconds: 600,
+      repeatFailureThreshold: bad,
+    });
+    assert.equal(result.ok, false, `${JSON.stringify(bad)} must be refused`);
+    assert.equal(wrote, false, `${JSON.stringify(bad)} must never reach the host`);
+    assert.ok(result.problems.some((problem) => problem.includes('重复失败')), 'and the reason is stated');
+  }
+});
+
+test('saving an old configuration that omits the count writes the documented default', async () => {
+  // The compatibility contract: a document (or an older host) that has only the two
+  // timers is NOT an error. The save succeeds and the wire block carries the default
+  // count, which is exactly what the host's own validator would fill in.
+  const calls = [];
+  const api = {
+    async getSettings() { return { ok: true, settings: { schemaVersion: 1, providers: [] } }; },
+    async putMonitoring(monitoring) {
+      calls.push(monitoring);
+      return { ok: true, monitoring, settings: { schemaVersion: 1, providers: [], monitoring } };
+    },
+  };
+  const store = createStore({ api });
+  await store.loadSettings();
+  // A draft the operator has not touched beyond the timers.
+  store.editDraft((draft) => {
+    draft.providers.push({ id: 'relay', name: 'Relay', protocol: 'openai-chat', baseUrl: 'http://127.0.0.1:1/v1', models: [] });
+  });
+
+  const result = await store.saveMonitoring({ selfCheckSeconds: 120, attentionSeconds: 300 });
+  assert.equal(result.ok, true, 'an omitted count is legal, not a refusal');
+  assert.deepEqual(calls, [{ selfCheckSeconds: 120, attentionSeconds: 300, repeatFailureThreshold: 3 }],
+    'the host receives the documented default, not an absent key');
+
+  // The other draft work is still there, and still unsaved.
+  const after = store.getSnapshot();
+  assert.equal(after.draft.providers.length, 1);
+  assert.equal(after.draft.providers[0].id, 'relay');
+  assert.equal(after.dirty, true);
+});
+
+test('saving with an explicit 0 keeps 0 rather than falling back to the default', async () => {
+  // `0` means "off" and is the one value that must survive the round trip untouched; a
+  // fallback anywhere in the chain would silently re-enable the reminder.
+  const calls = [];
+  const api = {
+    async getSettings() { return { ok: true, settings: { schemaVersion: 1, providers: [] } }; },
+    async putMonitoring(monitoring) {
+      calls.push(monitoring);
+      return { ok: true, monitoring, settings: { schemaVersion: 1, providers: [], monitoring } };
+    },
+  };
+  const store = createStore({ api });
+  await store.loadSettings();
+  store.editDraft((draft) => {
+    draft.providers.push({ id: 'relay', name: 'Relay', protocol: 'openai-chat', baseUrl: 'http://127.0.0.1:1/v1', models: [] });
+  });
+
+  const result = await store.saveMonitoring({ selfCheckSeconds: 120, attentionSeconds: 300, repeatFailureThreshold: 0 });
+  assert.equal(result.ok, true);
+  assert.deepEqual(calls, [{ selfCheckSeconds: 120, attentionSeconds: 300, repeatFailureThreshold: 0 }],
+    'off stays off on the wire');
+  const after = store.getSnapshot();
+  assert.equal(after.draft.monitoring.repeatFailureThreshold, 0, 'and stays off in the draft');
+  assert.equal(after.draft.providers.length, 1, 'other draft work is untouched');
+  assert.equal(after.dirty, true);
 });
 
 // ---------------------------------------------------------------------------

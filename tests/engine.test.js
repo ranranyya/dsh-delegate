@@ -1031,6 +1031,11 @@ test('a failing execution is reported as failed, not as awaiting review', async 
     assert.equal(settled.error.code, 'JOB_EXECUTION_FAILED');
     // Evidence is still captured so the host can see partial work.
     assert.ok(settled.diff !== null);
+    // The phase states the same ending: it must not still describe a creation or an
+    // execution for a run that failed. (`provider exploded` above is the
+    // agent-reported error path; the timeout and empty-output paths have their own
+    // regression below.)
+    assert.equal(settled.phase, 'failed');
   } finally {
     await h.close();
   }
@@ -1419,15 +1424,16 @@ test('a silent run reports heartbeat, then attention after the frozen threshold'
       prompt: 'long job',
     });
     const task = await waitForExecute(h.engine, started.taskId);
-    // Anchor the episode on one real event, as the runner would.
-    task.monitor.onEvent({ type: 'text-delta', data: { text: 'working' } }, clock.clockMs);
+    // Anchor the episode on one real event, through the engine hook the runner uses.
+    h.engine.onExecutionEvent(task, { type: 'step/start', data: {} });
 
     // Well under the threshold: the observation is silent.
     clock.advance(120_000);
     const quiet = await h.engine.observeTask(started.taskId, { connectionId, waitMs: 1_000 });
     assert.equal(quiet.reason, OBSERVE_TASK_REASONS.heartbeat);
     assert.equal(quiet.task.state, 'running');
-    // The phase is whatever the driven executor is doing; what matters is that it\n    // is a live, executing task rather than a finished one.\n    assert.equal(typeof quiet.task.phase, 'string');
+    // That event was real evidence, so the published phase says the run is executing.
+    assert.equal(quiet.task.phase, 'execute', 'a run the engine has seen working reports execute');
 
     // Past the threshold: attention, once.
     clock.advance(600_000);
@@ -1729,6 +1735,333 @@ test('a settled task reports a frozen idle span', async () => {
     await new Promise((resolvePromise) => { setTimeout(resolvePromise, 30); });
     const second = h.engine.get(started.taskId).activity;
     assert.deepEqual(second, first, 'terminal metadata does not drift');
+  } finally {
+    await h.close();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Truthful execution phases: the phase follows the executor, not a promise
+// ---------------------------------------------------------------------------
+//
+// These tests drive the engine's OWN event hook (`engine.onExecutionEvent`, exactly
+// what the runner's `onEvent` calls) against a task record the engine just made
+// live. They deliberately do not reach into a resolved Agent's listener list: the
+// listeners belong to a native service whose setup order is not this contract, and a
+// test that raced that setup would fail for a reason the phase rule does not have.
+
+/**
+ * Start a real task through the engine and hand back its live record.
+ * @param {object} h - harness.
+ * @param {string} [prompt] - task prompt.
+ * @returns {Promise<object>} the live task record.
+ */
+async function startedTask(h, prompt = 'go') {
+  const { connectionId, grant } = h.authorize();
+  const started = await h.engine.start({
+    connectionId,
+    grantId: grant.grantId,
+    workspacePath: h.workspace,
+    prompt,
+  });
+  return h.engine.tasks.get(started.taskId);
+}
+
+/**
+ * Start a task whose executor never settles, so it stays live for the assertions.
+ * @param {object} h - harness built over {@link busySessionController}.
+ * @returns {Promise<object>} the live task record.
+ */
+async function startedLongTask(h) {
+  const task = await startedTask(h, 'long job');
+  await waitForExecute(h.engine, task.taskId);
+  return task;
+}
+
+test('recognised executor activity advances a live task from before-create to execute', async () => {
+  const h = await harness({ sessionController: busySessionController() });
+  try {
+    const task = await startedLongTask(h);
+
+    // Nothing has been emitted, so the executor's work is not yet visible: the task
+    // is live, past admission, and does NOT claim execution.
+    assert.equal(task.state, TASK_STATES.running);
+    assert.equal(task.phase, 'before-create',
+      'a pending native create is not execution, so the phase must not claim it');
+
+    // The native loop opens a turn: that is the executor working.
+    h.engine.onExecutionEvent(task, { type: 'turn/start', data: {} });
+    assert.equal(task.phase, 'execute', 'recognised executor activity publishes execute');
+    assert.equal(h.engine.get(task.taskId).phase, 'execute', 'the published view agrees');
+
+    await h.engine.cancel(task.taskId, 'test-end');
+  } finally {
+    await h.close();
+  }
+});
+
+test('a later tool step keeps a running task in execute and never rewinds the phase', async () => {
+  const h = await harness({ sessionController: busySessionController() });
+  try {
+    const task = await startedLongTask(h);
+
+    h.engine.onExecutionEvent(task, { type: 'step/start', data: {} });
+    assert.equal(task.phase, 'execute');
+
+    // Streaming output and a settled tool result are ordinary running activity: the
+    // phase is already past `before-create`, so nothing here moves it back.
+    h.engine.onExecutionEvent(task, { type: 'text-delta', index: 0, text: 'partial answer' });
+    h.engine.onExecutionEvent(task, { type: 'tool/call', data: { name: 'read', callId: 'c-1' } });
+    h.engine.onExecutionEvent(task, { type: 'tool/result', data: { message: { toolCallId: 'c-1' } } });
+    assert.equal(task.phase, 'execute');
+    assert.equal(task.state, TASK_STATES.running);
+
+    await h.engine.cancel(task.taskId, 'test-end');
+  } finally {
+    await h.close();
+  }
+});
+
+test('events that carry no execution evidence do not assert execution', async () => {
+  // The phase is a claim about the executor. A bookkeeping event or an
+  // unrecognised type is not evidence anything ran, so a run whose model has not
+  // started is not described as executing yet.
+  const h = await harness({ sessionController: busySessionController() });
+  try {
+    const task = await startedLongTask(h);
+
+    h.engine.onExecutionEvent(task, { type: 'usage', data: {} });
+    h.engine.onExecutionEvent(task, { type: 'some/unknown-event', data: {} });
+    assert.equal(task.phase, 'before-create', 'a non-evidence event must not assert execution');
+
+    // A streaming chunk alone is not proof either: it can arrive empty while a
+    // provider is still connecting.
+    h.engine.onExecutionEvent(task, { type: 'text-delta', index: 0, text: 'hi' });
+    assert.equal(task.phase, 'before-create');
+
+    await h.engine.cancel(task.taskId, 'test-end');
+  } finally {
+    await h.close();
+  }
+});
+
+test('a pending permission wait is never overwritten by a late event', async () => {
+  const h = await harness({ sessionController: busySessionController() });
+  try {
+    const task = await startedLongTask(h);
+    h.engine.onExecutionEvent(task, { type: 'turn/start', data: {} });
+    assert.equal(task.phase, 'execute');
+
+    // The worker pauses on a per-call decision: the phase now states the WAIT.
+    h.engine.onPermissionPending(task, {
+      requestId: 'permission-phase', taskId: task.taskId, callId: 'c-1', toolName: 'write', state: 'pending',
+    });
+    assert.equal(task.phase, 'awaiting-permission');
+
+    // A late event belongs to the paused call, not to a resumption.
+    h.engine.onExecutionEvent(task, { type: 'tool/result', data: { message: { toolCallId: 'c-1' } } });
+    h.engine.onExecutionEvent(task, { type: 'step/start', data: {} });
+    assert.equal(task.phase, 'awaiting-permission', 'a late event never overwrites the permission wait');
+    assert.equal(task.state, TASK_STATES.running, 'waiting is not a new state');
+
+    // Settling returns the task to execution.
+    h.engine.onPermissionSettled(task, {
+      requestId: 'permission-phase', outcome: 'allowed-once', state: 'decided', decidedBy: 'commander',
+    });
+    assert.equal(task.phase, 'execute');
+    // The internal record has no `waiting` field (that is a projection concern), so the
+    // internal assertion is on the pending slot itself; `waiting` is checked on the
+    // public view, which is where the engine actually derives it.
+    assert.equal(task.permission.pending, null);
+    assert.equal(h.engine.get(task.taskId).permission.waiting, false);
+
+    await h.engine.cancel(task.taskId, 'test-end');
+  } finally {
+    await h.close();
+  }
+});
+
+test('a failed execution publishes the failed phase while keeping its own error', async () => {
+  const agents = fakeAgents({ respond: { error: new Error('provider exploded') } });
+  const h = await harness({ agents });
+  try {
+    const task = await startedTask(h);
+    const settled = await settle(h.engine, task.taskId);
+    assert.equal(settled.state, TASK_STATES.failed);
+    assert.equal(settled.error.code, JOB_CODES.executionFailed, JSON.stringify(settled.error));
+    assert.equal(settled.phase, 'failed', 'the phase states the same ending as the state');
+    // The separate diagnostic is preserved, not folded into the phase.
+    assert.match(settled.error.message, /provider exploded/);
+  } finally {
+    await h.close();
+  }
+});
+
+test('a run that produced no output ends failed with the failed phase', async () => {
+  const agents = fakeAgents({ respond: { reason: 'completed' } });
+  const h = await harness({ agents });
+  try {
+    const task = await startedTask(h);
+    const settled = await settle(h.engine, task.taskId);
+    assert.equal(settled.state, TASK_STATES.failed);
+    assert.equal(settled.phase, 'failed');
+    assert.equal(settled.error.code, JOB_CODES.executionFailed);
+  } finally {
+    await h.close();
+  }
+});
+
+test('a timed-out run ends failed with the failed phase instead of a pre-creation one', async () => {
+  // The execution budget is a real `setTimeout` inside the runner and its smallest legal
+  // value is 30 s. Mocking the timer was tried and is NOT reliable here: the deadline is
+  // armed only after the native placement resolves, so a tick that lands before that
+  // point expires nothing and the run hangs. This test therefore spends the real 30 s,
+  // which is the honest way to exercise the production path without adding a test-only
+  // seam to the runner. It is the only slow test in the suite.
+  const h = await harness({
+    sessionController: busySessionController(),
+    settings: validSettings({ worker: { ...validSettings().worker, timeoutSeconds: 30 } }),
+  });
+  try {
+    const task = await startedLongTask(h);
+    // The executor was seen working, so the phase is execution, not creation.
+    h.engine.onExecutionEvent(task, { type: 'turn/start', data: {} });
+    assert.equal(task.phase, 'execute');
+
+    // The never-idle agent stays busy, so ONLY the execution budget can end this run.
+    const settled = await settle(h.engine, task.taskId, 8_000);
+    assert.equal(settled.state, TASK_STATES.failed, JSON.stringify(settled.error));
+    assert.equal(settled.error.code, JOB_CODES.timeout, JSON.stringify(settled.error));
+    assert.equal(settled.phase, 'failed', 'a timed-out task must not still describe creation or execution');
+  } finally {
+    await h.close();
+  }
+});
+
+test('a cancelled run keeps the cancelled phase and a late event cannot revive it', async () => {
+  const h = await harness({ sessionController: busySessionController() });
+  try {
+    const task = await startedLongTask(h);
+    h.engine.onExecutionEvent(task, { type: 'turn/start', data: {} });
+    assert.equal(task.phase, 'execute');
+
+    const cancelled = await h.engine.cancel(task.taskId, 'operator');
+    assert.equal(cancelled.state, TASK_STATES.cancelled);
+    assert.equal(cancelled.phase, 'cancelled');
+    assert.equal(cancelled.cancelledBy, 'operator');
+
+    // An event that settles after the cancellation reaches this class through the
+    // same hook. It is evidence about a run that already ended, not a revival.
+    h.engine.onExecutionEvent(task, { type: 'turn/start', data: {} });
+    h.engine.onExecutionEvent(task, { type: 'tool/call', data: { name: 'read', callId: 'c-late' } });
+    assert.equal(task.state, TASK_STATES.cancelled);
+    assert.equal(task.phase, 'cancelled', 'a late event never overwrites a terminal phase');
+  } finally {
+    await h.close();
+  }
+});
+
+test('a completed run ends awaiting host review with its own phase, not execute', async () => {
+  const h = await harness();
+  try {
+    const task = await startedTask(h);
+    // A late event arriving while the task is still running is real evidence, so it
+    // publishes execute — then the run finishes and the phase must say so.
+    h.engine.onExecutionEvent(task, { type: 'turn/start', data: {} });
+    const settled = await settle(h.engine, task.taskId);
+    assert.equal(settled.state, TASK_STATES.awaitingHostReview);
+    assert.equal(settled.phase, 'awaiting-host-review', 'review phase, never a running one');
+    assert.equal(settled.selfApproved, false);
+    assert.equal(settled.hostAcceptance, null);
+
+    // A late event after review ended describes nothing the task still does.
+    h.engine.onExecutionEvent(h.engine.tasks.get(task.taskId), { type: 'turn/start', data: {} });
+    assert.equal(h.engine.get(task.taskId).phase, 'awaiting-host-review');
+  } finally {
+    await h.close();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Repeated-failure reminder through the engine's own wait chain
+// ---------------------------------------------------------------------------
+
+test('repeated identical tool failures reach the host once as a typed failure diagnostic', async () => {
+  const h = await harness({ sessionController: busySessionController() });
+  try {
+    const task = await startedLongTask(h);
+    const args = '{"command":"npm test"}';
+    const code = 'ENOENT';
+    // Three identical structured failures, fed through the engine's own event hook —
+    // the same path the runner uses, so the reminder is produced by production code.
+    for (const id of ['f1', 'f2', 'f3']) {
+      h.engine.onExecutionEvent(task, {
+        type: 'tool/call',
+        data: { turn: 1, step: 1, callId: id, name: 'bash', arguments: args },
+      });
+      h.engine.onExecutionEvent(task, {
+        type: 'tool/result',
+        data: {
+          turn: 1,
+          step: 1,
+          message: { role: 'tool', toolCallId: id, isError: true, content: [{ type: 'text', text: 'SECRET BODY' }] },
+          error: { name: 'ToolError', code, reason: 'the tool said so' },
+        },
+      });
+    }
+
+    const observation = await h.engine.observeTask(task.taskId, { connectionId: task.connectionId, waitMs: 1 });
+    assert.equal(observation.reason, OBSERVE_TASK_REASONS.attention);
+    assert.equal(observation.failure.kind, 'repeated-tool-failure');
+    assert.equal(observation.failure.toolName, 'bash');
+    assert.equal(observation.failure.failureCode, code);
+    assert.equal(observation.failure.consecutive, 3);
+    // The task is still running: a reminder is not a verdict.
+    assert.equal(h.engine.get(task.taskId).state, TASK_STATES.running);
+
+    // Nothing secret reaches the answer, and the next observation is quiet again.
+    const serialized = JSON.stringify(observation);
+    for (const secret of ['SECRET BODY', 'npm test', 'the tool said so']) {
+      assert.equal(serialized.includes(secret), false, `the observation must not carry ${secret}`);
+    }
+    const again = await h.engine.observeTask(task.taskId, { connectionId: task.connectionId, waitMs: 1 });
+    assert.equal(again.failure, null, 'reported once, then quiet');
+
+    // The task page reads the same bounded evidence from the public view.
+    const view = h.engine.get(task.taskId);
+    assert.equal(view.activity.repeatFailure.threshold, 3);
+    assert.equal(view.activity.repeatFailure.reported.length, 1);
+    assert.equal(view.effective.monitoring.repeatFailureThreshold, 3, 'the frozen value is published');
+
+    await h.engine.cancel(task.taskId, 'test-end');
+  } finally {
+    await h.close();
+  }
+});
+
+test('the reminder is frozen per task, and threshold 0 disables it', async () => {
+  const h = await harness({
+    sessionController: busySessionController(),
+    settings: validSettings({
+      monitoring: { selfCheckSeconds: 300, attentionSeconds: 600, repeatFailureThreshold: 0 },
+    }),
+  });
+  try {
+    const task = await startedLongTask(h);
+    for (const id of ['d1', 'd2', 'd3', 'd4']) {
+      h.engine.onExecutionEvent(task, { type: 'tool/call', data: { callId: id, name: 'bash', arguments: '{"command":"npm test"}' } });
+      h.engine.onExecutionEvent(task, {
+        type: 'tool/result',
+        data: { message: { role: 'tool', toolCallId: id, isError: true, content: [] }, error: { name: 'ToolError', code: 'ENOENT' } },
+      });
+    }
+    assert.equal(task.monitor.failures.threshold, 0, 'the frozen value is what the monitor uses');
+    // The task snapshot itself says 0 — proving the fixture's override really reached
+    // the settings document instead of the test silently running on the default.
+    assert.equal(task.effective.monitoring.repeatFailureThreshold, 0, 'the frozen snapshot is 0');
+    const observation = await h.engine.observeTask(task.taskId, { connectionId: task.connectionId, waitMs: 1 });
+    assert.equal(observation.failure, null, 'disabled means no reminder at all');
+    await h.engine.cancel(task.taskId, 'test-end');
   } finally {
     await h.close();
   }

@@ -53,10 +53,10 @@ const SUPPORTED_DSH_RANGE = SUPPORTED_DSH_VERSIONS.join(' || ');
  * The package version this build must declare everywhere a human writes it.
  *
  * Pinned rather than derived: `MANIFEST.version` is one of the places checked below,
- * so asserting itself would pass for any value. `1.3.1` adopts TaskBridge and npm
- * distribution after the GitHub-only `1.3.0`, preserving the runtime contracts.
+ * so asserting itself would pass for any value. `1.4.0` is the silent-wait reliability
+ * release: truthful phases, the repeated-failure reminder and the outer-wait contract.
  */
-const DELIVERABLE_VERSION = '1.3.2';
+const DELIVERABLE_VERSION = '1.4.0';
 
 /**
  * The published build this release upgrades *from*.
@@ -608,7 +608,7 @@ test('the release metadata is one version everywhere it is written by hand', () 
   }
 });
 
-test(`the release is ${DELIVERABLE_VERSION}, the correction release after ${PREVIOUS_VERSION}`, () => {
+test(`the release is ${DELIVERABLE_VERSION}, newer than ${PREVIOUS_VERSION}`, () => {
   // Pinned, not derived: the worker permission build is a new release, and a
   // manifest that still advertised the previous version would label that build as
   // current. `package.json`, the lockfile (both fields), the agent template and the
@@ -619,9 +619,13 @@ test(`the release is ${DELIVERABLE_VERSION}, the correction release after ${PREV
 
   const previous = semverParts(PREVIOUS_VERSION);
   const current = semverParts(MANIFEST.version);
-  assert.equal(current.major, previous.major, `a correction release keeps the major version after ${PREVIOUS_VERSION}`);
-  assert.equal(current.minor, previous.minor, 'the correction release keeps the minor version');
-  assert.equal(current.patch, previous.patch + 1, 'the correction release advances the patch version');
+  // 1.3.x were patch-only corrections; 1.4.0 is a MINOR release (new behaviours, no
+  // breaking change), so the rule is the semantic-versioning one rather than "same minor,
+  // patch + 1": the major version is kept, and the release is strictly newer.
+  assert.equal(current.major, previous.major, `a release keeps the major version after ${PREVIOUS_VERSION}`);
+  const newer = current.minor > previous.minor
+    || (current.minor === previous.minor && current.patch > previous.patch);
+  assert.ok(newer, `the release must be newer than ${PREVIOUS_VERSION}`);
 
   const lock = JSON.parse(readFileSync(join(ROOT, 'package-lock.json'), 'utf8'));
   assert.equal(lock.version, DELIVERABLE_VERSION, 'package-lock.json#version must match package.json');

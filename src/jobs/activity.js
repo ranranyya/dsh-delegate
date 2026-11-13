@@ -10,6 +10,11 @@
 //     non-empty*; nothing derived from them is stored, so no buffer here can grow
 //     with model output and nothing here can leak a transcript into a view,
 //     a history row or a diagnostic.
+//   * **A published failure label is allowlisted, never echoed.** A tool's own
+//     `error.code`/`error.name` is free text that can carry a path or a token, so it
+//     travels only when it matches a small set of well-known codes; otherwise the
+//     generic `TOOL_ERROR` is published. The complete native identity is hashed for
+//     episode distinction only, and no free text (reason, result content) is retained.
 //   * **The vocabulary is the harness's own.** The classified names are the
 //     durable `SessionEventMap` types of `@deepseek-ai/dsh-session` (`step/start`,
 //     `assistant/message`, `tool/call`, `tool/result`, plus the turn/step/usage
@@ -35,6 +40,9 @@
 //
 // The clock is injected (`now`) so tests can simulate twenty minutes of real
 // progress deterministically instead of sleeping.
+
+import { createHash } from 'node:crypto';
+import { REPEATED_FAILURE_KIND } from './diagnostics.js';
 
 /**
  * How one event kind is classified for idleness.
@@ -471,6 +479,263 @@ function assertObservation(observation) {
   }
 }
 
+/** The kind carried in an `attention` diagnostic that reports repeated failures. */
+export { REPEATED_FAILURE_KIND };
+
+/** Bound on tracked calls and on retained failure episodes. */
+const MAX_TRACKED_FAILURES = 32;
+
+/**
+ * Detects the same tool failing the same way over and over, and says so ONCE.
+ *
+ * Independent of the silence clock: a run can be busy and still be retrying the same
+ * broken operation, which is exactly what neither existing timer catches.
+ *
+ * What is a failure: ONLY the native structured marker on a settled call —
+ * `tool/result.message.isError === true` (the durable `ToolResultMessage` contract).
+ * Text containing "error", a quiet run, reasoning-only output, a long test or a run
+ * that changed no files are never treated as failures.
+ *
+ * What is retained: a tool name, a sanitized failure code, a 16-hex digest of
+ * (tool + operation + code + the error's own reason text), counts and two timestamps.
+ * Arguments, result content, the reason text itself and model output are read only to
+ * compute that digest and are never stored, published or forwarded.
+ *
+ * Identity: tool + operation + code + reason digest. Two failures with the same code but
+ * a different REAL reason ("file not found: a.txt" vs "file not found: b.txt") are
+ * different episodes, because the operation arguments are equal and the code is only the
+ * class of failure.
+ *
+ * When it fires: the same identity failing `threshold` times CONSECUTIVELY. A different
+ * identity starts a new episode; a success ends the current one; further failures in an
+ * already-reported episode do not report again. A later episode can report again.
+ */
+export class RepeatedFailureTracker {
+  /**
+   * @param {object} [options] - `threshold` (0 disables), `digest` seam (tests only).
+   */
+  constructor(options = {}) {
+    const threshold = Number(options.threshold);
+    this.threshold = Number.isSafeInteger(threshold) && threshold > 0 ? threshold : 0;
+    this.digest = typeof options.digest === 'function' ? options.digest : sha256Hex;
+    /** callId -> { name, operationDigest } for calls whose result has not arrived yet. */
+    this.openCalls = new Map();
+    /**
+     * The episode being counted, or null:
+     * `{ identity, count, reported, code, tool, operationDigest, firstSeenAt, lastSeenAt }`.
+     */
+    this.episode = null;
+    /** Bounded evidence of reported episodes: hash and counts only. */
+    this.reported = [];
+  }
+
+  /**
+   * Record one `tool/call`. Arguments are hashed now and immediately dropped.
+   * @param {object} event - native `tool/call` event.
+   * @returns {void}
+   */
+  onCall(event) {
+    if (this.threshold === 0) return;
+    const payload = payloadOf(event);
+    const callId = identifier(payload.callId ?? payload.id);
+    const name = identifier(payload.name);
+    if (callId === null || name === null) return;
+    // The raw arguments string exists only as hash input; it is never retained.
+    const operation = typeof payload.arguments === 'string' ? payload.arguments : '';
+    this.openCalls.set(callId, { name, operationDigest: this.digest(operation).slice(0, 16) });
+    while (this.openCalls.size > MAX_TRACKED_FAILURES) {
+      const oldest = this.openCalls.keys().next();
+      if (oldest.done === true) break;
+      this.openCalls.delete(oldest.value);
+    }
+  }
+
+  /**
+   * Record one `tool/result`.
+   *
+   * Answers whether this result is the threshold-th consecutive identical failure, in
+   * which case the caller reports it exactly once.
+   * @param {object} event - native `tool/result` event.
+   * @param {number} at - observation time.
+   * @returns {object | null} the diagnostic to report, or null.
+   */
+  onResult(event, at) {
+    if (this.threshold === 0) return null;
+    const payload = payloadOf(event);
+    const message = payload.message ?? null;
+    const callId = identifier(message?.toolCallId ?? payload.callId);
+    // A result with no matching call cannot be attributed. A DUPLICATE result for the
+    // same call is dropped here, because the call was consumed by the first one.
+    const call = callId === null ? undefined : this.openCalls.get(callId);
+    if (callId === null || call === undefined) return null;
+    this.openCalls.delete(callId);
+
+    if (message?.isError !== true) {
+      // A completed call ends the episode: whatever was failing is not failing now.
+      this.episode = null;
+      return null;
+    }
+    // The PUBLISHED label is an allowlisted code or the generic one; the COMPLETE native
+    // identity (code/name/reason, or the result content when the block is absent) is hashed
+    // so two failures that both publish `TOOL_ERROR` still separate into their own episodes.
+    // No free text is retained: only this 16-hex digest.
+    const code = failureCode(payload.error);
+    const identityHash = this.digest(failureIdentity(payload.error, message)).slice(0, 16);
+    const identity = `${call.name}\u0000${call.operationDigest}\u0000${code}\u0000${identityHash}`;
+    if (this.episode === null || this.episode.identity !== identity) {
+      this.episode = {
+        identity,
+        count: 0,
+        reported: false,
+        code,
+        tool: call.name,
+        operationDigest: call.operationDigest,
+        // A monotonically increasing internal sequence identifies the episode itself, so a
+        // parked reminder can be matched to it EXACTLY. A timestamp cannot do that: several
+        // episodes can start in the same millisecond, which is precisely how a stale
+        // reminder used to survive a switch to a different failure.
+        sequence: this.nextEpisode(),
+        // The FIRST failure of this episode, not the one that reached the threshold.
+        firstSeenAt: at,
+        lastSeenAt: at,
+      };
+    }
+    this.episode.count += 1;
+    this.episode.lastSeenAt = at;
+    if (this.episode.reported || this.episode.count < this.threshold) return null;
+    this.episode.reported = true;
+    const entry = {
+      kind: REPEATED_FAILURE_KIND,
+      toolName: call.name,
+      failureCode: code,
+      operationDigest: call.operationDigest,
+      consecutive: this.episode.count,
+      threshold: this.threshold,
+      firstSeenAt: this.episode.firstSeenAt,
+      lastSeenAt: this.episode.lastSeenAt,
+      // Internal only: matched against the parked reminder, never published.
+      episodeSequence: this.episode.sequence,
+    };
+    this.reported.push(entry);
+    while (this.reported.length > MAX_TRACKED_FAILURES) this.reported.shift();
+    // The internal `episodeSequence` stays on this object (the parked reminder is matched
+    // against the live episode through it) and is stripped at every PUBLICATION boundary:
+    // `claimFailureReport` and the snapshot projection below both drop it.
+    return { ...entry };
+  }
+
+  /** @returns {number} the next internal episode identifier. */
+  nextEpisode() {
+    this.episodeSequence = (this.episodeSequence ?? 0) + 1;
+    return this.episodeSequence;
+  }
+
+  /**
+   * Whether the currently parked reminder still describes the CURRENT episode.
+   *
+   * Matched by the episode's internal SEQUENCE, not by its fields or its start time. The
+   * fields can collide (two episodes can share a tool, a code, an operation digest and even
+   * a start millisecond), so any comparison built from them would let a stale reminder
+   * survive a switch to a genuinely different failure. A reminder is valid only while the
+   * sequence it was produced for is still the live one; `reported` stays as evidence.
+   * @param {object | null} report - a parked diagnostic.
+   * @returns {boolean} true when it still belongs to the live episode.
+   */
+  isCurrent(report) {
+    if (report === null || report === undefined) return false;
+    const episode = this.episode;
+    if (episode === null) return false;
+    return report.episodeSequence === episode.sequence;
+  }
+
+  /** Release the open-call map. The reported trail survives as bounded evidence. */
+  dispose() {
+    this.openCalls.clear();
+  }
+}
+
+/**
+ * Common tool failure codes that are safe to publish as-is.
+ *
+ * A closed allowlist, not a character filter. Substituting the punctuation of an arbitrary
+ * string does not redact it: `sk-TASKBRIDGE-MOCK-SECRET-987654321` and
+ * `/home/alice/.ssh/id_rsa` are already identifier-shaped, so a `[A-Za-z0-9._-]` cleanup
+ * would publish both unchanged. Only a value this list recognizes travels; everything else
+ * becomes {@link GENERIC_FAILURE_CODE}, and the FULL error identity is hashed internally so
+ * different failures still form different episodes.
+ * @type {ReadonlySet<string>}
+ */
+const KNOWN_FAILURE_CODES = Object.freeze(new Set([
+  'ABORT_ERR', 'ABORTED', 'ALREADY_EXISTS', 'AUTH', 'BUGBUG', 'CANCELLED', 'CONFLICT',
+  'DENIED', 'EACCES', 'EAGAIN', 'EBADF', 'EBADMSG', 'EBUSY', 'ECANCELED', 'ECONNREFUSED',
+  'ECONNRESET', 'EEXIST', 'EFBIG', 'EINTR', 'EINVAL', 'EIO', 'EISDIR', 'ELOOP', 'EMFILE',
+  'ENAMETOOLONG', 'ENENT', 'ENFILE', 'ENOENT', 'ENOEXEC', 'ENOMEM', 'ENOSPC', 'ENOSYS',
+  'ENOTDIR', 'ENOTEMPTY', 'ENOTFOUND', 'ENOTSUP', 'EPERM', 'EPIPE', 'ERANGE', 'EROFS',
+  'ESRCH', 'ETIMEDOUT', 'ETXTBSY', 'EXDEV', 'FAILED', 'FORBIDDEN', 'INTERNAL', 'INVALID',
+  'LIMIT', 'MISSING', 'NETWORK', 'NOTFOUND', 'NOT_FOUND', 'PERMISSION_DENIED', 'RATE_LIMIT',
+  'REFUSED', 'SERVICE_UNAVAILABLE', 'TIMEOUT', 'UNAUTHORIZED', 'UNAVAILABLE', 'UNKNOWN',
+  'UNSUPPORTED', 'VALIDATION',
+]));
+
+/** The published code for any failure this build does not positively recognize. */
+const GENERIC_FAILURE_CODE = 'TOOL_ERROR';
+
+/**
+ * The stable, PUBLISHABLE failure code carried by a settled tool result.
+ *
+ * Both native fields (`error.code`, then `error.name`) are free-form strings a tool can fill
+ * with anything — including a path or a token that happens to be identifier-shaped. So the
+ * value is published only when it matches the closed allowlist above; otherwise the generic
+ * label is used. Nothing about the original string travels when it is not recognized, and
+ * the complete identity is still hashed internally for episode distinction.
+ * @param {unknown} error - the event's `error` block.
+ * @returns {string} an allowlisted code or {@link GENERIC_FAILURE_CODE}.
+ */
+function failureCode(error) {
+  if (error !== null && typeof error === 'object') {
+    for (const key of ['code', 'name']) {
+      const value = error[key];
+      if (typeof value !== 'string') continue;
+      if (KNOWN_FAILURE_CODES.has(value.toUpperCase())) return value.toUpperCase();
+    }
+  }
+  return GENERIC_FAILURE_CODE;
+}
+
+/**
+ * The COMPLETE failure identity, used only as hash input for episode distinction.
+ *
+ * This is where an unrecognized code, a name and the free-text reason are allowed to
+ * appear — as input to a one-way digest that is never published. So two failures that both
+ * publish `TOOL_ERROR` still separate into different episodes when their real identity
+ * differs.
+ * @param {unknown} error - the event's `error` block.
+ * @param {unknown} message - the settled `ToolResultMessage` (the fallback identity).
+ * @returns {string} hash input; never published.
+ */
+function failureIdentity(error, message) {
+  if (error !== null && typeof error === 'object') {
+    const code = typeof error.code === 'string' ? error.code : '';
+    const name = typeof error.name === 'string' ? error.name : '';
+    const reason = typeof error.reason === 'string' ? error.reason : '';
+    if (code !== '' || name !== '' || reason !== '') return `${code}\u0000${name}\u0000${reason}`;
+  }
+  // A native `isError` result whose structured `error` block is absent still has content;
+  // its digest is what distinguishes one such failure from another. Only the SHA is kept.
+  const content = Array.isArray(message?.content) ? message.content : [];
+  const parts = [];
+  for (const block of content) {
+    if (block === null || typeof block !== 'object') continue;
+    if (typeof block.text === 'string' && block.text !== '') parts.push(block.text);
+  }
+  return parts.length === 0 ? '' : `content\u0000${parts.join('\u0000')}`;
+}
+
+/** @param {string} value - text @returns {string} lowercase hex sha256. */
+function sha256Hex(value) {
+  return createHash('sha256').update(value, 'utf8').digest('hex');
+}
+
 /** Why one observation wait ended. */
 export const OBSERVE_REASONS = Object.freeze({
   heartbeat: 'heartbeat',
@@ -535,6 +800,8 @@ export class TaskMonitor {
    * @param {(ms: number) => Promise<void>} [options.wait] - bounded sleep.
    * @param {number} [options.selfCheckSeconds] - idle span for the self-check.
    * @param {number} [options.attentionSeconds] - idle span for `attention`.
+   * @param {number} [options.repeatFailureThreshold] - consecutive identical tool
+   *   failures reported once, or 0 to disable that reminder.
    * @param {number} [options.waitSliceMs] - internal polling slice.
    * @param {(message: string, detail?: unknown) => void} [options.log] - diagnostic sink.
    */
@@ -549,6 +816,19 @@ export class TaskMonitor {
       : 1000;
     this.log = typeof options.log === 'function' ? options.log : null;
     this.activity = new TaskActivity({ now: this.now });
+    /**
+     * The repeated-failure detector. It is a SEPARATE clock from the two silence
+     * thresholds on purpose: it counts distinct failed operations, not quiet time.
+     */
+    this.failures = new RepeatedFailureTracker({ threshold: options.repeatFailureThreshold });
+    /**
+     * The one failure reminder waiting to be delivered, or null.
+     *
+     * A single slot, not a queue: the reminder is about the CURRENT episode, and an
+     * undelivered older one is superseded rather than replayed.
+     * @type {object | null}
+     */
+    this.pendingFailure = null;
     /** Episode identity: bumped whenever genuine activity ends the idle episode. */
     this.episode = 0;
     /** The episode the self-check already ran for, or null. */
@@ -594,6 +874,13 @@ export class TaskMonitor {
       // A malformed event is not a reason to disturb the run that produced it.
       return false;
     }
+    // The failure detector reads the same events but keeps its own, separate state.
+    // It never feeds the silence clock, and a modelled output delta never clears it.
+    try {
+      this.observeFailure(event, at);
+    } catch {
+      // Same rule as above: bookkeeping must never disturb the run.
+    }
     try {
       const active = this.activity.record(observation, at);
       // Real activity ends the current idle episode. The episode identity is what
@@ -605,6 +892,48 @@ export class TaskMonitor {
     } catch {
       return false;
     }
+  }
+
+  /**
+   * Feed one event to the repeated-failure detector.
+   *
+   * Only the two native tool events matter; everything else is ignored. When the
+   * detector decides the threshold was reached it parks the diagnostic here, and the
+   * next observation delivers it — so the reminder rides the existing wait loop
+   * instead of starting a poller of its own.
+   * @param {object} event - native event.
+   * @param {number} at - observation time.
+   * @returns {void}
+   */
+  observeFailure(event, at) {
+    if (event === null || typeof event !== 'object') return;
+    if (event.type === 'tool/call') this.failures.onCall(event);
+    else if (event.type === 'tool/result') {
+      const diagnostic = this.failures.onResult(event, at);
+      if (diagnostic !== null) this.pendingFailure = diagnostic;
+      // A completed or differently-failing result ends the episode that a parked
+      // reminder belonged to, so that reminder is no longer news.
+      else if (!this.failures.isCurrent(this.pendingFailure)) this.pendingFailure = null;
+    }
+  }
+
+  /**
+   * Take the failure reminder that is waiting to be delivered, if any.
+   *
+   * Claimed once, like the attention latch: the diagnostic reaches exactly one
+   * observation, so a run is not woken on every subsequent identical failure. A reminder
+   * whose episode has ended or changed since it was parked is DROPPED rather than
+   * delivered: the run already recovered or moved on, so it is history, not news.
+   * @returns {object | null} the diagnostic, or null.
+   */
+  claimFailureReport() {
+    const report = this.pendingFailure;
+    this.pendingFailure = null;
+    if (!this.failures.isCurrent(report)) return null;
+    // Published form: the internal episode sequence does not leave this module.
+    const { episodeSequence, ...published } = report;
+    void episodeSequence;
+    return published;
   }
 
   /**
@@ -774,6 +1103,23 @@ export class TaskMonitor {
         checkedAt: this.selfCheck.checkedAt,
         verdict: this.selfCheck.verdict,
       },
+      // The repeated-failure reminder, as bounded evidence: one small object per
+      // reported episode, never arguments, output or error prose.
+      repeatFailure: {
+        threshold: this.failures.threshold,
+        // Projected field by field, so the internal episode sequence cannot reach a view,
+        // a stored record or a client.
+        reported: this.failures.reported.map((entry) => ({
+          kind: entry.kind,
+          toolName: entry.toolName,
+          failureCode: entry.failureCode,
+          operationDigest: entry.operationDigest,
+          consecutive: entry.consecutive,
+          threshold: entry.threshold,
+          firstSeenAt: entry.firstSeenAt,
+          lastSeenAt: entry.lastSeenAt,
+        })),
+      },
     };
   }
 
@@ -865,6 +1211,14 @@ export class TaskMonitor {
         if (this.task?.permission?.pending !== null && this.task?.permission?.pending !== undefined) {
           return this.outcome(OBSERVE_REASONS.permission, activitySinceWait, at - startedAt, selfCheck);
         }
+        // (3b) Repeated failures. Same reason as the silence report — it needs the
+        // commander — but it carries its own typed diagnostic and is NOT gated on
+        // silence: a busy run that keeps failing the same operation must still reach
+        // the host. Permission and a terminal state above outrank it.
+        const failure = this.claimFailureReport();
+        if (failure !== null) {
+          return this.outcome(OBSERVE_REASONS.attention, activitySinceWait, at - startedAt, selfCheck, failure);
+        }
         // (4) `claimAttention` is false while genuine progress has reset the clock,
         // because the origin moved into the future relative to `nextAttentionAt()`.
         if (this.claimAttention(at)) {
@@ -896,11 +1250,14 @@ export class TaskMonitor {
    * @param {boolean} activitySinceWait - whether progress arrived during the wait.
    * @param {number} waitedMs - observed duration.
    * @param {object | null} selfCheck - the last self-check diagnostic.
+   * @param {object | null} [failure] - the repeated-failure diagnostic, when that is
+   *   what ended the wait.
    * @returns {object} outcome.
    */
-  outcome(reason, activitySinceWait, waitedMs, selfCheck) {
+  outcome(reason, activitySinceWait, waitedMs, selfCheck, failure = null) {
     return {
       reason,
+      failure,
       activitySinceWait: activitySinceWait === true,
       waitedMs: Math.max(0, Math.trunc(waitedMs)),
       selfCheck,
@@ -919,6 +1276,10 @@ export class TaskMonitor {
     if (typeof endedAt === 'number') this.activity.finalize(endedAt);
     if (this.disposed) return;
     this.disposed = true;
+    // Open calls can never produce a result for a run that has ended; the reported
+    // trail stays as bounded evidence. The undelivered reminder is dropped with it.
+    this.failures.dispose();
+    this.pendingFailure = null;
     this.releaseWaiters();
   }
 }

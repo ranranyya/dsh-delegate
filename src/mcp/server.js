@@ -2,7 +2,7 @@
 //
 // Design rule taken from SPEC §10–11: an external MCP client may *exercise* an
 // authorization the operator already created, and may do nothing else. So this
-// server exposes seven tools and maps each one onto one execution-plane route:
+// server exposes eight tools and maps each one onto one execution-plane route:
 //
 //   delegate_status            → GET  /dsh-delegate/x/status
 //   delegate_submit            → POST /dsh-delegate/x/tasks
@@ -10,6 +10,7 @@
 //   delegate_wait              → POST /dsh-delegate/x/tasks/observe  (repeated)
 //   delegate_cancel            → POST /dsh-delegate/x/tasks/cancel
 //   delegate_permission_decide → POST /dsh-delegate/x/tasks/permission
+//   delegate_review            → POST /dsh-delegate/x/tasks/review
 //   delegate_preflight         → POST /dsh-delegate/x/workspace/preflight
 //
 // `delegate_wait` is a read like `delegate_result`, and it is the one tool whose
@@ -32,6 +33,14 @@
 // native worker's declared tool catalog, so the worker's own model is never handed it —
 // a real tool-surface restriction, but NOT a claim that a process running as the same OS
 // user could not reach the shared local-MCP endpoint directly. See `runtime/permissions.js`.
+//
+// `delegate_review` is the second narrow write, and it is the ONLY thing that records a
+// task's `hostAcceptance`: the commander's own delivery conclusion (`accepted` or
+// `changes-requested`). A finished run stays `awaiting-host-review` — that underlying
+// state is what keeps older clients and `continueFromTaskId` compatible — and the review
+// lives in its own field. It cannot approve a permission, change the switch, a provider,
+// a model, the isolation or a credential, merge a diff, or create work; it also cannot
+// be reached by the worker's own catalog, for the same reason as above.
 //
 // `delegate_preflight` is the one addition that is not an authorization at all: it
 // is a read-only measurement of a workspace, and it exists so a dispatcher can
@@ -76,7 +85,7 @@ export const SUPPORTED_PROTOCOL_VERSIONS = Object.freeze([
 export const LATEST_PROTOCOL_VERSION = SUPPORTED_PROTOCOL_VERSIONS[0];
 
 /** Identifies this server in the handshake. */
-export const SERVER_INFO = Object.freeze({ name: 'dsh-delegate', version: '1.3.2' });
+export const SERVER_INFO = Object.freeze({ name: 'dsh-delegate', version: '1.4.0' });
 
 /** Bound on a tool result's text. A task view can be large; a model's context cannot. */
 export const MAX_TOOL_TEXT_CHARS = 20_000;
@@ -101,6 +110,14 @@ export const MAX_WAIT_SECONDS = 3_600;
 
 /** Shortest deadline one `delegate_wait` call may ask for, in seconds. */
 export const MIN_WAIT_SECONDS = 1;
+
+/**
+ * Longest `delegate_review` note, in characters.
+ *
+ * The same bound the execution plane and the engine enforce, declared here so the
+ * advertised schema and the refusals cannot drift apart.
+ */
+export const MAX_REVIEW_NOTE_CHARS = 1_000;
 
 /**
  * How many requests may be in flight at once on the stdio transport.
@@ -282,11 +299,23 @@ export const TOOLS = Object.freeze([
     title: 'Wait for a task to need you',
     description: 'Follow ONE task this connection submitted and return as soon as it needs the host. '
       + 'A single call blocks for up to waitSeconds (default 3600) and returns a COMPACT answer: '
-      + '`reason` is `permission` (a per-call request is pending), `attention` (no activity for about ten '
-      + 'minutes, so the run may be stuck), `ready` (the run ended and is awaiting host review), `failed`, '
-      + '`cancelled` or `interrupted`. '
-      + '`reason: "wait-limit"` means the deadline was reached and NOTHING changed: call delegate_wait again '
-      + 'with the same taskId — do not review, resubmit or restart the task. '
+      + '`reason` is `permission` (a per-call request is pending), `attention` (the run has been silent for '
+      + 'the configured inactivity threshold, ten minutes by default, so it may be stuck), `ready` (the run '
+      + 'ended and is awaiting host review), `failed`, `cancelled` or `interrupted`. '
+      + 'An `attention` answer may instead carry a `failure` block (kind `repeated-tool-failure`, with '
+      + 'toolName/failureCode/consecutive): the worker repeated the SAME operation and failed the same way '
+      + 'several times in a row. It is a question for the host, reported once; nothing is cancelled, retimed '
+      + 'or reconfigured automatically. '
+      + '`reason: "wait-limit"` means only that this call\u2019s own budget ran out with nothing changed: it is '
+      + 'reported with `actionable: false` and `terminal: false`. Call delegate_wait again with the same '
+      + 'taskId and omit waitSeconds — do not review, resubmit, restart or cancel the task. '
+      + 'Normal use is delegate_wait({ taskId }) with no second argument: the default already covers a full '
+      + 'hour and the call re-issues its own internal observations, so there is no reason to shorten it or to '
+      + 'poll delegate_result or delegate_status while a task runs. A shorter waitSeconds is accepted for a '
+      + 'one-off diagnostic you were explicitly asked for. '
+      + 'The internal observation cadence (about one bounded request every 25 seconds) belongs to THIS '
+      + 'program; it is not a polling rate for the agent, and nothing about it requires action while nothing '
+      + 'has changed. '
       + 'Heartbeats are internal to this call and are never returned. '
       + 'This tool reads; it never submits, cancels or decides anything, and it does not fetch the task\u2019s '
       + 'diff or full result (use delegate_result for that, after an actionable reason). '
@@ -299,7 +328,21 @@ export const TOOLS = Object.freeze([
       + '`terminal: true` with `state: "interrupted"` means the task record itself is a restart history '
       + 'and will not resume. If the reason carried a settled state it is reported as that outcome '
       + '(`ready`/`failed`/`cancelled`). A missing or unrecognized state is reported as '
-      + '`terminal: false` with nothing asserted: check before deciding.',
+      + '`terminal: false` with nothing asserted: check before deciding. '
+      + 'This call ending, or your own client tool timeout firing, says NOTHING about the execution: the task '
+      + 'may still be running. Keep its taskId, and if you need to know more read one compact fact with '
+      + 'delegate_result rather than assuming either way; never submit a duplicate, restart or cancel it '
+      + 'because a wait or a client timeout ended. '
+      + 'A host may hand a wait back early on its own tool/exec time limit even though this call asked for an '
+      + 'hour. That outer event is not `wait-limit` and is not a result: the MCP observation did not end and the '
+      + 'worker did not stop. Continue the SAME exec cell (do not open a second wait, read delegate_result, poll '
+      + 'delegate_status or submit a duplicate) and ask for the longest yield the host supports — when a yield or '
+      + 'pragmas parameter exists, an ordinary wait should request roughly 1200000 ms (20 minutes), not a minute, '
+      + 'and re-issuing every second is polling rather than waiting. A one-minute return is a caller choice, not a '
+      + 'documented hard limit, so do not present it as the client maximum and do not claim every client offers '
+      + 'the same yield. This plugin cannot create a background waiter or wake the agent: if the available yield '
+      + 'is genuinely short with no automatic continuation, a long wait costs one resumed turn per yield window, '
+      + 'and that limit must be reported honestly rather than worked around.',
     // A LONG read, and that is the point: `readOnlyHint` is what tells a
     // concurrency-aware client this call may be held for an hour without being a
     // mutating operation. A serialising host still ignores it; the independent
@@ -319,8 +362,10 @@ export const TOOLS = Object.freeze([
           type: 'integer',
           minimum: MIN_WAIT_SECONDS,
           maximum: MAX_WAIT_SECONDS,
-          description: 'How long this one call may wait, in seconds (default 3600). '
-            + 'A returned `wait-limit` means this deadline was reached, not that the task stalled.',
+          description: 'OPTIONAL. Omit it for normal waiting: the default is 3600 seconds (one hour). '
+            + 'Set it only for a shorter, one-off diagnostic you were explicitly asked to make. It cannot '
+            + 'extend a wait beyond 3600. A returned `wait-limit` with `actionable: false` means this '
+            + 'deadline was reached, not that the task stalled or ended.',
         },
       },
       required: ['taskId'],
@@ -400,6 +445,55 @@ export const TOOLS = Object.freeze([
     }),
   }),
   Object.freeze({
+    name: 'delegate_review',
+    title: 'Record the host review of a delivered task',
+    description: 'Record YOUR OWN delivery review of one task this connection submitted. A finished run stays '
+      + '\u0060awaiting-host-review\u0060 until you say what you concluded: this tool records that conclusion, and it '
+      + 'is the only thing that does. '
+      + '\u0060decision: "accepted"\u0060 means you reviewed the evidence with \u0060delegate_result\u0060 and it is right; '
+      + '\u0060decision: "changes-requested"\u0060 means it needs correction. Either way \u0060note\u0060 is required and '
+      + 'bounded (at most 1000 characters) — it is the recorded conclusion, not a place for secrets. '
+      + 'This cannot approve a permission request, change the switch, a provider, a model, the isolation or a '
+      + 'credential, merge or apply the diff, or create another task. Execution completion is never accepted '
+      + 'automatically: until this is called the task stays unreviewed. '
+      + 'Only a task awaiting host review (execution finished) can be reviewed; a running, failed, cancelled or '
+      + 'interrupted task, or another connection\u2019s task, is refused. '
+      + 'The first decision is final for this task: repeating the SAME decision with the SAME note is an '
+      + 'idempotent no-op, and a DIFFERENT conclusion is refused \u2014 send a follow-up task with '
+      + '\u0060continueFromTaskId\u0060 instead, so the original conclusion is preserved.',
+    // It records a conclusion on an existing task. It can neither read a workspace nor
+    // start, stop or re-configure anything, and a replayed identical decision changes
+    // nothing — but a DIFFERENT second decision is a refusal, so it is not fully
+    // idempotent either.
+    annotations: Object.freeze({
+      title: 'Record the host review of a delivered task',
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
+      openWorldHint: false,
+    }),
+    inputSchema: Object.freeze({
+      type: 'object',
+      properties: {
+        taskId: { type: 'string', description: 'Task identity returned by delegate_submit.' },
+        decision: {
+          type: 'string',
+          enum: ['accepted', 'changes-requested'],
+          description: 'accepted records that you reviewed the result and accept it; changes-requested records '
+            + 'that it needs correction.',
+        },
+        note: {
+          type: 'string',
+          maxLength: MAX_REVIEW_NOTE_CHARS,
+          description: 'Required non-empty bounded conclusion (at most 1000 characters), stored redacted. '
+            + 'It is evidence of your review, never a grant and never a place for credentials.',
+        },
+      },
+      required: ['taskId', 'decision', 'note'],
+      additionalProperties: false,
+    }),
+  }),
+  Object.freeze({
     name: 'delegate_preflight',
     title: 'Inspect workspace before dispatch',
     description: 'Read-only preflight of one absolute workspace path: whether it is a git repository with a commit, '
@@ -439,6 +533,7 @@ const TOOL_ROUTES = Object.freeze({
   delegate_wait: 'observe',
   delegate_cancel: 'cancel',
   delegate_permission_decide: 'permission',
+  delegate_review: 'review',
   delegate_preflight: 'preflight',
 });
 
@@ -479,6 +574,11 @@ function validateArgs(tool, args) {
     const field = value[key];
     if (declared.type === 'string') {
       if (typeof field !== 'string') throw new McpError('MCP_ARGUMENT_TYPE', `${tool.name}.${key} must be a string`);
+      // A declared bound is enforced, not merely advertised: a note over the limit is
+      // refused with the field named instead of reaching the plane and being cut there.
+      if (typeof declared.maxLength === 'number' && field.length > declared.maxLength) {
+        throw new McpError('MCP_ARGUMENT_RANGE', `${tool.name}.${key} must be at most ${declared.maxLength} characters`);
+      }
       out[key] = field;
     } else if (declared.type === 'boolean') {
       // Strict: a model that sends the string "true" gets a refusal naming the
@@ -1554,16 +1654,42 @@ export function createMcpServer(options) {
               + 'task stays `running` with phase `awaiting-permission`. Answer exactly one such request with '
               + 'delegate_permission_decide (`allow-once` or `reject`). That decision covers only that call, is '
               + 'never a standing grant, and cannot approve anything else. To follow a task without polling, use '
-              + 'delegate_wait: one call blocks until the task needs you (permission, ready, failed, cancelled, '
-              + 'interrupted) or until its deadline, in which case it answers reason "wait-limit" and you call '
-              + 'it again with the same taskId instead of reviewing or resubmitting anything. '
+              + 'delegate_wait({ taskId }): one call blocks until the task needs you (permission, ready, failed, '
+              + 'cancelled, interrupted) or until its own one-hour deadline, in which case it answers reason '
+              + '`wait-limit` with `actionable: false` and you call it again with the same taskId instead of '
+              + 'reviewing or resubmitting anything. Omit waitSeconds for normal waiting: the default already '
+              + 'covers an hour, it cannot be raised above 3600, and a shorter value is only for a one-off '
+              + 'diagnostic you were explicitly asked for. The approximately 25-second observation cadence '
+              + 'inside delegate_wait is internal to this program, not a polling rate: while nothing has '
+              + 'changed, do not read intermediate code or diff, do not research or implement in parallel, and '
+              + 'do not narrate unchanged snapshots — wait, and review once on delivery. A wait ending, or your '
+              + 'own client tool timeout firing, does not prove the execution stopped or that it is alive: keep '
+              + 'the taskId and check one compact fact if you need to, and never duplicate, restart or cancel a '
+              + 'task merely because a wait or a client timeout ended. '
               + '`interrupted` never means the execution stopped by itself: this call returns it at once '
               + 'with `terminal: false` while the task is still pending or running (wait again on the same '
               + 'taskId); only a task record that is itself interrupted (a restart history) is `terminal: true`. '
+              + 'A host that hands the wait back on its own tool/exec time limit is reporting an OUTER limit, '
+              + 'not a result: the MCP observation did not end and the worker did not stop. Continue the SAME '
+              + 'exec cell on the taskId you hold, ask for the longest yield the host supports (roughly 1200000 '
+              + 'ms when a yield/pragmas parameter exists, not a minute) rather than re-issuing every second, and '
+              + 'do not open a second wait, read delegate_result or submit a duplicate. A one-minute return is a '
+              + 'caller choice, not a documented hard limit, and not every client offers the same yield. This '
+              + 'plugin cannot create a background waiter or wake the agent, so a client with only a short yield '
+              + 'and no automatic continuation costs one resumed turn per yield window — state that plainly '
+              + 'instead of inventing a wake-up. An `attention` answer that carries a `failure` '
+              + 'block means the worker repeated the same failed operation several times while still running: '
+              + 'it is a question for the host, sent once, and nothing is cancelled or reconfigured for it. '
               + 'If a host serialises tool calls so that this '
               + 'connection is blocked by a long wait, the independently installed `dsh-delegate-control` '
               + 'binary can report or cancel one task from a separate process; it cannot submit, configure or '
-              + 'change the switch.',
+              + 'change the switch. '
+              + 'When a task reaches `ready`/`awaiting-host-review`, finish YOUR review and record it with '
+              + 'delegate_review ({ taskId, decision: "accepted" | "changes-requested", note }): that call is the '
+              + 'only thing that records host acceptance, and until it is made the task stays unreviewed. '
+              + 'Completion is never acceptance on its own, and a review cannot approve permissions, change '
+              + 'settings or models, merge the diff or create work. The first decision is final for that task; '
+              + 'to request a correction, send a follow-up with `continueFromTaskId`.',
           });
         }
         case 'notifications/initialized':

@@ -1,6 +1,6 @@
 # Codex integration contract
 
-Status: implemented in 1.3.2 (1.1.0 shipped the wait rules; 1.2.0 adds the installed-integration upgrade). This automatic installer covers Codex. Claude Code uses the separate manual MCP guide.
+Status: implemented in 1.4.0 (1.1.0 introduced wait rules, 1.2.0 added installed-integration upgrades, 1.4.0 clarifies outer long waits and explicit host-review recording). This automatic installer covers Codex. Claude Code uses the separate manual MCP guide.
 
 This document is the contract between the plugin's settings page (browser half),
 the host-side installer (`src/codex/installer.js`) and the two files it manages.
@@ -16,6 +16,12 @@ managed file after the new managed template is present. Edited files and an
 operator-owned destination remain untouched; startup does not perform a first
 installation when no previous managed companion exists. The MCP table remains
 `mcp_servers.dsh-delegate`, and `delegate_*` tool names remain compatible.
+
+1.4.0 recognizes the exact published 1.3.2 companion and refreshes its waiting rules
+on plugin startup. After examining a delivered result, the companion records its own
+accepted or changes-requested conclusion with `delegate_review`; the plugin never
+derives acceptance from completion. A client may need reloading to see the refreshed
+agent and tool catalog. Edited companion files remain operator-owned.
 
 Explicit install/repair can also adopt a marked standard legacy MCP path after
 the old `dsh-delegate` or `dsh-taskdispatch` package has been uninstalled from the
@@ -106,11 +112,17 @@ tool_timeout_sec = 3660
 * `tool_timeout_sec = 3660` (1.1.0) is an **owned scalar on this entry only**. The
   `delegate_wait` tool defaults to a 3600-second wait and caps it there, so a client that
   honours this field is allowed to let one call run that long. The plugin cannot prove that
-  every client honours it: a client that applies its own default tool timeout may still end
-  the wait earlier (Codex's historical default is one minute). The managed entry therefore
-  *requests* 3660 s — the 3600-second wait plus one minute of slack, never a second wait
-  window — while a client-side cap that ignores the field remains a client limit the plugin
-  cannot lift. This is not a Codex-wide setting and the plugin writes it nowhere else.
+  every client honours it: a client that applies its own tool timeout may still end the
+  wait earlier. That is an OUTER limit and is not a `wait-limit` answer. The managed entry
+  therefore *requests* 3660 s — the 3600-second wait plus one minute of slack, never a
+  second wait window — while a client-side cap that ignores the field remains a client
+  limit the plugin cannot lift. This is not a Codex-wide setting and the plugin writes it
+  nowhere else.
+  * When a client exposes a yield/pragmas parameter, an ordinary wait should request
+    roughly `1200000` ms (20 minutes), not one minute. A one-minute return is a caller
+    choice, not a documented hard maximum, and not every client supports the same long
+    yield — the agent is told to state what its client actually offers rather than
+    describe one minute as inherent.
   * A managed entry written by an earlier release has no such field. It is classified
     `outdated` and repaired **in place** (the line is inserted inside our table), so an
     existing installation updates through the settings page instead of being reported as
@@ -503,7 +515,7 @@ successful diagnosis.
 ```jsonc
 {
   "codexHome": "…",
-  "packageVersion": "1.3.2",
+  "packageVersion": "1.4.0",
   "boundary": { "blocked": false, "link": null, "unknown": false, "home": "directory", "agents": "directory" },
   "agent": {
     "path": "…", "state": "installed", "installed": true, "managed": true,
@@ -746,20 +758,32 @@ one fails the build:
    on preflight records the decision but does not change the submitted job's
    isolation by itself.
 9. **One task, WAITED — not polled (1.1.0).** Keep the returned `taskId` and call
-   `delegate_wait` on that same task, repeating it until it returns an actionable
-   reason. `delegate_result` is **not** a polling loop: one `delegate_wait` blocks
-   internally for up to about 25 seconds and re-issues itself, which is the polling
-   loop. Never submit a duplicate because a task is still running; `delegate_cancel`
-   stops it. The wait defaults to 3600 seconds and the tool caps it there.
+   `delegate_wait({ taskId })` — with no `waitSeconds` argument — repeating it until it
+   returns a reason that needs the host. `delegate_result` is **not** a polling loop: one
+   `delegate_wait` blocks internally and re-issues its own bounded observation requests,
+   which is the waiting loop. Never submit a duplicate because a task is still running;
+   `delegate_cancel` stops it. The wait defaults to 3600 seconds and the tool caps it
+   there, so there is nothing to raise: when a wait ends, call it again on the same task.
+   A shorter explicit `waitSeconds` stays legal but is only for a one-off diagnostic the
+   operator explicitly asked for.
+   While the wait runs, stay silent: do not read intermediate code or diffs, do not run
+   parallel implementation or research, and do not narrate unchanged snapshots. The only
+   exceptions are work explicitly assigned as independent of the task, an inspection the
+   operator explicitly asked for, a decision or diagnosis that genuinely needs a fact the
+   wait did not return, and an explicit user-authorized takeover. Review happens once, on
+   delivery.
    `heartbeat` means "nothing to report" and is internal: the tool re-waits rather than
    handing it to the model, so normal progress never wakes Codex.
+   The roughly 25-second internal observation cadence belongs to the program, not to the
+   agent: it is not a polling rate the model should imitate.
 10. **Each wait reason has a stated policy (1.1.0).**
     - `attention` — the run has been completely silent past the configured attention
-      interval. It is a QUESTION, not a verdict: read the compact diagnostic (phase,
-      last activity, current tool and its elapsed time, self-check verdict) and
-      **default to waiting again** on the same task. Never cancel, never mark failed,
-      and never resubmit merely because a task is quiet or one tool or test is slow.
-      Only a concrete, stated error justifies anything else, and then it is reported
+      interval (ten minutes by default). It does **not** mean an ordinary wait ended: a
+      wait ending is `wait-limit`. It is a QUESTION, not a verdict: read the compact
+      diagnostic (phase, last activity, current tool and its elapsed time, self-check
+      verdict) and **default to waiting again** on the same task. Never cancel, never mark
+      failed, and never resubmit merely because a task is quiet or one tool or test is
+      slow. Only a concrete, stated error justifies anything else, and then it is reported
       rather than silently restarted.
     - `permission` — a per-call decision is outstanding; see item 12. After deciding,
       wait the SAME task again.
@@ -768,9 +792,16 @@ one fails the build:
       Codex. A large diff is inspected file by relevant file, once each, not re-read.
     - `failed` / `cancelled` — read `delegate_result` once for the recorded reason and
       report it; do not resubmit identical work hoping for a different outcome.
-    - `wait-limit` (the client's own wait budget ran out) — the task is still running:
-      immediately `delegate_wait` the same task. It is not a failure, a stall, or a reason
-      to submit anything new or to check the implementation locally.
+    - `wait-limit` — this call's own wait budget ran out with nothing changed. The answer
+      carries `actionable: false` and `terminal: false`: it is not a result, requires no
+      business decision, and ends nothing. Immediately `delegate_wait` the same task
+      again (no `waitSeconds`). It is not a failure, a stall, or a reason to submit
+      anything new or to check the implementation locally.
+      A **client-side tool timeout** is a different event and is *not* `wait-limit`: the
+      host's own limit ending the call does not prove the execution stopped, and does not
+      prove it is alive. Keep the `taskId` and wait again; if a compact fact is genuinely
+      needed, read it with `delegate_result`. Never duplicate, restart or cancel a task
+      because a wait or a client timeout ended.
     - `interrupted` — **the wait was cut off; that is not by itself a finished
       execution.** One call answers it at once (it does not loop), so the answer's own
       fields decide the response (1.2.0):

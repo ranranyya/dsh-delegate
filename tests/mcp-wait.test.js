@@ -33,7 +33,13 @@ import {
   createMcpServer,
   serveStdio,
 } from '../src/mcp/server.js';
-import { INTERRUPTION_KINDS, classifyInterruption, compactTask, resolveInterruption } from '../src/mcp/wait.js';
+import {
+  INTERRUPTION_KINDS,
+  REPEATED_FAILURE_KIND,
+  classifyInterruption,
+  compactTask,
+  resolveInterruption,
+} from '../src/mcp/wait.js';
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -207,6 +213,20 @@ test('delegate_wait is declared with a closed schema and an optional bounded wai
   assert.match(tool.description, /wait-limit/u, 'the deadline outcome must be named');
   assert.match(tool.description, /again/iu, 'the copy must say to wait again');
   assert.match(tool.description, /heartbeat/iu, 'the copy must say heartbeats are not returned');
+  // The normal call is delegate_wait({ taskId }): the parameter is optional, and the
+  // copy must not invite a caller to raise a wait that is already at its ceiling.
+  assert.match(tool.description, /delegate_wait\(\{ ?taskId ?\}\)/u, 'the normal call shape must be stated');
+  assert.match(field.description, /OPTIONAL/u, 'waitSeconds must be described as optional');
+  assert.match(field.description, /omit it/iu, 'the copy must say to omit it for normal waiting');
+  assert.match(field.description, /cannot.*extend|beyond 3600/u, 'the copy must say it cannot lengthen a wait');
+  // `actionable` is what distinguishes a business answer from this call's own deadline.
+  assert.match(tool.description, /actionable: false/u, 'the copy must name the non-actionable deadline answer');
+  // A wait ending — or the CLIENT's own tool timeout — proves nothing about the run.
+  assert.match(tool.description, /client tool timeout/iu, 'the copy must separate a client timeout from a task fact');
+  assert.match(tool.description, /never submit a duplicate/iu, 'the copy must forbid duplicating on a timeout');
+  // The internal cadence is the tool's, not the model's polling rate.
+  assert.match(tool.description, /25 seconds/u, 'the internal observation cadence must be explained');
+  assert.match(tool.description, /not a polling rate/iu, 'and it must be stated as program-internal');
 });
 
 test('delegate_wait refuses a bad taskId or waitSeconds before any observation', async () => {
@@ -407,6 +427,78 @@ test('each actionable reason returns at once, compactly, with no evidence text',
     }
     assert.ok(serialized.length < 2_000, 'a wait answer stays small');
   }
+});
+
+test('only a real task event is actionable; a spent deadline is not', async () => {
+  // The flag describes the ANSWER, so a host can tell "something happened" from "my own
+  // budget ran out". It is pinned per reason rather than by a single example because the
+  // whole point is that `wait-limit` is the one exception.
+  for (const reason of ACTIONABLE_REASONS) {
+    const state = reason === 'ready'
+      ? 'awaiting-host-review'
+      : (reason === 'failed' || reason === 'cancelled' ? reason
+        : (reason === 'interrupted' ? 'interrupted' : 'running'));
+    const { server } = waitFixture([observation(reason, { task: summary({ state }) })]);
+    const { body } = await callWait(server, { taskId: 'task-wait-1', waitSeconds: 60 });
+    assert.equal(body.reason, reason);
+    assert.equal(body.actionable, true, `${reason} is a real event, so it is actionable`);
+  }
+
+  const deadline = waitFixture([() => observation('heartbeat')]);
+  const limited = await callWait(deadline.server, { taskId: 'task-wait-1', waitSeconds: 1 });
+  assert.equal(limited.body.reason, WAIT_LIMIT_REASON);
+  assert.equal(limited.body.actionable, false, 'a spent deadline is never actionable');
+  assert.equal(limited.body.terminal, false, 'and it never ends the task');
+  // The permission payload a decision needs is unaffected by the flag above.
+  const pendingRequest = pending();
+  const pendingWait = waitFixture([observation('permission', {
+    task: summary({ state: 'running', phase: 'awaiting-permission' }),
+    permission: pendingRequest,
+  })]);
+  const decided = await callWait(pendingWait.server, { taskId: 'task-wait-1', waitSeconds: 60 });
+  assert.equal(decided.body.actionable, true);
+  assert.equal(decided.body.permission.requestId, pendingRequest.requestId, 'the full operation is still delivered');
+  assert.equal(decided.body.permission.fingerprint, pendingRequest.fingerprint);
+  assert.equal(decided.body.permissionDecidable, true);
+});
+
+test('a repeated-failure reminder rides attention and is distinguishable from silence', async () => {
+  const failure = {
+    kind: 'repeated-tool-failure',
+    toolName: 'bash',
+    failureCode: 'ENOENT',
+    operationDigest: 'a'.repeat(16),
+    consecutive: 3,
+    threshold: 3,
+    firstSeenAt: 1_760_000_000_000,
+  };
+  const { server } = waitFixture([observation('attention', { task: summary({ state: 'running' }), failure })]);
+
+  const { body, text } = await callWait(server, { taskId: 'task-wait-1', waitSeconds: 60 });
+  assert.equal(body.reason, 'attention');
+  assert.equal(body.actionable, true, 'a real task event is actionable');
+  assert.equal(body.terminal, false);
+  assert.deepEqual(body.failure, failure, 'the typed diagnostic is delivered whole');
+  assert.match(body.instruction, /SAME tool operation/iu);
+  assert.match(body.instruction, /still running/iu);
+  // The instruction must not describe it as silence: that would send the host to the
+  // wrong diagnosis.
+  assert.doesNotMatch(body.instruction, /No activity has been observed/iu);
+  // The discriminator is one shared constant, not a bare literal: an attention answer
+  // must not even be constructible while that constant is missing or renamed.
+  assert.equal(failure.kind, REPEATED_FAILURE_KIND);
+  // Compact: no result bodies, arguments or error prose.
+  for (const secret of ['SECRET', 'npm test', 'the tool said']) {
+    assert.equal(text.includes(secret), false, `the answer must not carry ${secret}`);
+  }
+});
+
+test('an ordinary silence report carries no failure block, so a client can tell them apart', async () => {
+  const { server } = waitFixture([observation('attention', { task: summary({ state: 'running' }) })]);
+  const { body } = await callWait(server, { taskId: 'task-wait-1', waitSeconds: 60 });
+  assert.equal(body.reason, 'attention');
+  assert.equal(body.failure, undefined, 'silence is not a failure reminder');
+  assert.match(body.instruction, /No activity has been observed/iu);
 });
 
 test('attention, failure and cancellation are reported as they are, with the task state deciding terminality', async () => {
@@ -714,6 +806,8 @@ test('a wait that reaches its deadline answers wait-limit with the same identity
   assert.equal(body.reason, WAIT_LIMIT_REASON);
   assert.equal(body.taskId, 'task-wait-1', 'the task identity must survive the deadline');
   assert.equal(body.terminal, false);
+  // A deadline is not a business answer: it asks only for the same wait again.
+  assert.equal(body.actionable, false, 'wait-limit is nonterminal and needs no business decision');
   assert.match(body.instruction, /delegate_wait/u);
   assert.match(body.instruction, /same taskId/iu);
   assert.match(body.instruction, /do not review, resubmit, restart/iu);
@@ -1167,7 +1261,7 @@ test('delegate_result keeps its own schema and behaviour beside the new tool', a
   const names = listed.result.tools.map((tool) => tool.name).sort();
   assert.deepEqual(names, [
     'delegate_cancel', 'delegate_permission_decide', 'delegate_preflight',
-    'delegate_result', 'delegate_status', 'delegate_submit', 'delegate_wait',
+    'delegate_result', 'delegate_review', 'delegate_status', 'delegate_submit', 'delegate_wait',
   ]);
   const result = listed.result.tools.find((tool) => tool.name === 'delegate_result');
   assert.deepEqual(Object.keys(result.inputSchema.properties), ['taskId']);
