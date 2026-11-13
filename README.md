@@ -8,6 +8,7 @@
 - [从 DSH Delegate／TaskDispatch 迁移到 1.3.1](docs/taskbridge-upgrade.md)：新包名为 `dsh-taskbridge`，保留旧数据和 MCP 技术标识，不要同时启用新旧插件。
 - [在 DSH“发现”中搜索和安装](docs/plugin-market.md)：添加本项目的自定义索引，安装源固定到本项目的 Git 提交。
 - [Claude Code 手动 MCP 接入](docs/claude-code.md)；Codex 继续使用设置页的安装/修复按钮。Claude Code 的一键安装按钮和真实客户端验收尚未完成。
+- [1.3.1 发布报告](docs/releases/1.3.1.zh.md)：npm、国内镜像、GitHub 安装包及公开插件索引的实际核验结果。
 
 DeepSeek Harness（DSH）的委托插件：让 MCP 宿主在你开启本机总开关后，调用 DSH
 已配置的接口执行任务，执行结果回到宿主（例如 Codex）自行验收。
@@ -348,10 +349,10 @@ node bin/dsh-delegate-codex-agent.js remove    # 只删除插件托管项
   运行时走旧路径；读回失败在任何路径上都是投递提示词之前的严格失败，不会以“未声明的路线”运行。
   细节与逐版本对照见 [`docs/runtime-compatibility.md`](./docs/runtime-compatibility.md)。
 - 续接的会话身份规则见第 6 节（同一已验证 `connectionId`、重启后与持久 history 互证）。这条
-  能力在本轮候选构建里实现，验收由 Codex 另行出报告；本文件**不声称** DSH Desktop 真实安装
+  能力已包含在插件中；本文件**不声称** DSH Desktop 真实安装
   已通过，也不声称做过真实攻击复现。
-- 其余未完成项：DSH Desktop 正式版本上的真实安装验收尚未完成；`0.2.2-rc.1` 上的插件全量加载
-  与真实模型执行也尚未完成。不要把它们当作已验证。
+- DSH Desktop 正式版本上的真实安装与真实模型执行验收尚未完成；`0.2.2-rc.1` 的原生全量加载
+  已在隔离夹具通过，具体范围见运行时兼容文档，不能等同于生产环境端到端验收。
 
 详见 `docs/worker-permissions.md`。
 
@@ -500,17 +501,18 @@ Codex 子智能体现在按「提交 → `delegate_wait` 同一任务」运作�
   agent 能安全升级；`1.1.0` 之前、正文已变的历史版本按各自已发布的精确摘要识别。
 - 设置页保留显式「安装 / 更新 Codex 集成」按钮，并显示 `outdated` 的**具体漂移项**与说明。
 
-### 本版本没有做什么
+### 1.2.0 当时未覆盖的验收
 
 - 没有再次执行 DSH Desktop 正式 profile 上的端到端真实模型运行，也没有实测宿主串行时控制通道的
   现场行为（自动测试用的是本机 mock 执行面与真实 stdio 夹具，不依赖真实模型）。
-- 不提交、不推送、不发布；npm 仍未作为安装渠道。
+- 上述是 1.2.0 的历史验收边界。当前 1.3.1 已发布到 GitHub 和 npm；分发核验结果见
+  [发布报告](docs/releases/1.3.1.zh.md)，不代表额外完成了真实模型或 Desktop 客户端验收。
 
 ## 8. 升级 / 导出 / 卸载 / 回滚
 
 ```bash
 # Desktop：在 Plugins manager 里对已安装的 dsh-taskbridge 执行更新 / 卸载
-# （先 npm pack 出新 .tgz，再用 add-plugin 添加新版本）。
+# （可从 npm 安装新版本，或下载 Release 的 .tgz 后添加）。
 # 不要在 Desktop 的正式 profile 下执行下面的 CLI 命令。
 
 # CLI web profile 的升级：换成本地新包或（将来）新版本
@@ -537,7 +539,8 @@ dsh plugin --profile web remove dsh-taskbridge
 
 ## 9. 限制（请如实理解）
 
-- **发布渠道**：当前通过 GitHub Release 分发；尚未发布到 npm，也没有签名产物或自动更新。
+- **发布渠道**：1.3.1 已通过 npm、GitHub Release 和本项目自定义插件索引分发。索引不是官方默认
+  市场收录；更新能力取决于 DSH 客户端，插件没有独立的自动更新程序，也未提供作者签名或构建来源证明。
 - **DSH 版本锁定**：`peerDependencies` 与 `engines.dsh` 精确声明四个版本（`0.2.0-rc.2`、
   `0.2.1-rc.2`、`0.2.1-rc.3`、`0.2.2-rc.1`），其余版本会被 peer 门禁拒绝。其中
   `0.2.0-rc.2` 是开发与自动测试版本，`0.2.1-rc.2` 的验收在**隔离 profile** 中完成，
@@ -576,7 +579,7 @@ dsh plugin --profile web remove dsh-taskbridge
 - **审查不是批准**：附加审查只产出发现，不代表宿主验收；任务完成状态是
   "等待宿主审查"，不是"已通过"。
 - **Codex 集成的限制**：
-  - 只支持 Codex；不提供 Claude Code 等其它宿主的集成。
+  - 一键安装按钮只支持 Codex；Claude Code 可按接入说明手动配置标准 MCP，尚无一键安装按钮或真实客户端验收。
   - **不宣称**当前 Codex 桌面版/CLI 支持用 `@dsh-delegate` 在输入框直接选中该子智能体：
     这取决于 Codex 版本自身是否提供提及选择，仓库内没有官方文档或运行时证据支持该说法。
     插件只保证子智能体文件与 MCP 条目存在；安装后必须让 Codex 重新载入。

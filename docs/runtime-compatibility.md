@@ -3,7 +3,8 @@
 This document states which DSH runtimes this plugin build (`1.3.1`, package
 `dsh-taskbridge-1.3.1.tgz`) may be loaded into, what changed in the newest one, and what
 has and has not been verified on it. It is a compatibility note, not an acceptance
-report; the package is distributed through the GitHub Release.
+report; the package is distributed through npm and the GitHub Release. See the
+[1.3.1 release report](releases/1.3.1.zh.md) for verified distribution details.
 
 `1.1.0` added silent waiting: the global `monitoring` thresholds (self-check and attention
 intervals), bounded activity metadata on every task view, the authenticated monitoring
@@ -20,12 +21,13 @@ and the execution implementation are carried over unchanged from `1.0.0`; the DS
 compatibility described here was introduced by `0.1.12` and is historical fact for this
 build.
 
-**Not verified in a full Desktop upgrade:** the operator's formally installed Desktop
-profile is still on `1.1.0`, and `1.2.0` has not been installed into it. The complete
+**Historical 1.2.0 acceptance boundary, not a live installation inventory:** during
+that release's checks, the operator's Desktop profile was on `1.1.0` and `1.2.0` had
+not been installed into it. The complete
 Desktop upgrade/restart acceptance and the actual token-saving ratio have not been
-measured. The candidate MCP/CLI channel is exercised against the currently running plane
-before release; that acceptance evidence belongs in the Release notes and is not
-pre-filled here. The production profile must still be upgraded to this build, and the
+measured in the current 1.3.1 publication either. MCP/CLI acceptance evidence belongs
+in the Release notes and is not pre-filled here. An older production profile must
+be upgraded to this build, and the
 Codex companion refreshed from the settings page (or by the startup check, which now also
 upgrades the installed MCP entry) and Codex reloaded before the new wait rules and the
 managed `tool_timeout_sec` take effect. No unit-test count and no mock constitutes an
