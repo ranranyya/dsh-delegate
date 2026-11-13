@@ -1,10 +1,11 @@
 # Runtime compatibility
 
-This document states which DSH runtimes this plugin build (`1.3.1`, package
-`dsh-taskbridge-1.3.1.tgz`) may be loaded into, what changed in the newest one, and what
+This document states which DSH runtimes this plugin build (`1.3.2`, package
+`dsh-taskbridge-1.3.2.tgz`) may be loaded into, what changed in the newest one, and what
 has and has not been verified on it. It is a compatibility note, not an acceptance
 report; the package is distributed through npm and the GitHub Release. See the
-[1.3.1 release report](releases/1.3.1.zh.md) for verified distribution details.
+[1.3.2 release notes](releases/1.3.2.zh.md) for upgrade details and the
+[1.3.1 release report](releases/1.3.1.zh.md) for historical distribution verification.
 
 `1.1.0` added silent waiting: the global `monitoring` thresholds (self-check and attention
 intervals), bounded activity metadata on every task view, the authenticated monitoring
@@ -25,7 +26,7 @@ build.
 that release's checks, the operator's Desktop profile was on `1.1.0` and `1.2.0` had
 not been installed into it. The complete
 Desktop upgrade/restart acceptance and the actual token-saving ratio have not been
-measured in the current 1.3.1 publication either. MCP/CLI acceptance evidence belongs
+measured in the current 1.3.2 publication either. MCP/CLI acceptance evidence belongs
 in the Release notes and is not pre-filled here. An older production profile must
 be upgraded to this build, and the
 Codex companion refreshed from the settings page (or by the startup check, which now also
@@ -196,10 +197,10 @@ What remains genuinely unverified:
 
 ## 5. Upgrading from an older plugin build
 
-1. Download `dsh-taskbridge-1.3.1.tgz` from the GitHub Release, or build the package locally (`npm pack`).
+1. Download `dsh-taskbridge-1.3.2.tgz` from the GitHub Release, or build the package locally (`npm pack`).
 2. Install it the way your surface requires: the Desktop **Plugins manager** for a
    Desktop profile (npm/CLI operations on that profile are refused), or
-   `dsh plugin --profile <name> add ./dsh-taskbridge-1.3.1.tgz` for a CLI profile you
+   `dsh plugin --profile <name> add ./dsh-taskbridge-1.3.2.tgz` for a CLI profile you
    start yourself.
 3. The settings, the switch value and the task history are preserved
    (`$DSH_HOME/data/dsh-delegate`); nothing is migrated destructively.

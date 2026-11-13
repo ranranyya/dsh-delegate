@@ -76,7 +76,7 @@ test('install is exclusive and idempotent, and does not disturb an existing conf
     assert.equal(installed.mcpState, 'configured');
     assert.equal((await manageCodexAgent('install', { codexHome, env })).state, 'installed');
     assert.equal((await manageCodexAgent('status', { codexHome, env })).state, 'installed');
-    assert.ok(readFileSync(installed.path, 'utf8').includes('name = "dsh-delegate"'));
+    assert.ok(readFileSync(installed.path, 'utf8').includes('name = "dsh-taskbridge"'));
     assert.ok(readFileSync(installed.mcpPath, 'utf8').startsWith(`model = "keep-me"`) || readFileSync(installed.mcpPath, 'utf8').includes(original));
   } finally {
     rmSync(codexHome, { recursive: true, force: true });
@@ -85,7 +85,7 @@ test('install is exclusive and idempotent, and does not disturb an existing conf
 
 test('an existing custom agent is not overwritten or removed', async () => {
   const codexHome = temporaryCodexHome();
-  const agentPath = join(codexHome, 'agents', 'dsh-delegate.toml');
+  const agentPath = join(codexHome, 'agents', 'dsh-taskbridge.toml');
   const custom = 'name = "my-dsh-delegate"\n';
   try {
     mkdirSync(dirname(agentPath), { recursive: true });
@@ -128,7 +128,7 @@ test('remove deletes only the exact bundled template', async () => {
 // the wrong thread). These assertions pin the sentence, not only the field.
 
 test('the shipped dispatcher tells the host when to pass continueFromTaskId', () => {
-  const template = readFileSync(join(ROOT, 'codex', 'dsh-delegate.toml'), 'utf8');
+  const template = readFileSync(join(ROOT, 'codex', 'dsh-taskbridge.toml'), 'utf8');
   const raw = /developer_instructions = """([\s\S]*?)"""/u.exec(template)?.[1] ?? '';
   // The instruction block is TOML prose: its line wrapping is not part of the rule,
   // so the assertions run on unwrapped text.
@@ -158,7 +158,7 @@ test('the shipped dispatcher rules are what install actually writes', async () =
     const installed = await manageCodexAgent('install', { codexHome, env });
     const written = readFileSync(installed.path, 'utf8');
     const version = /^version = "(.*)"$/mu.exec(written)?.[1] ?? '';
-    const shipped = readFileSync(join(ROOT, 'codex', 'dsh-delegate.toml'), 'utf8');
+    const shipped = readFileSync(join(ROOT, 'codex', 'dsh-taskbridge.toml'), 'utf8');
     assert.match(written, /continueFromTaskId/u, 'the installed file must carry the continuation rule');
     // The only difference between the shipped template and the installed copy is
     // the version line the installer renders, so the rules a host reads are the
@@ -174,7 +174,7 @@ test('the shipped dispatcher rules are what install actually writes', async () =
 // ---------------------------------------------------------------------------
 
 test('the shipped companion drives delegate_wait and never polls delegate_result in a loop', () => {
-  const template = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'codex', 'dsh-delegate.toml'), 'utf8');
+  const template = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'codex', 'dsh-taskbridge.toml'), 'utf8');
   // The wait tool is the loop; the old "poll delegate_result until terminal" rule is gone.
   assert.match(template, /delegate_wait/u);
   assert.doesNotMatch(template, /poll `delegate_result` for that\s+same task until terminal/u);
@@ -197,7 +197,7 @@ test('the shipped companion drives delegate_wait and never polls delegate_result
 test('the shipped companion distinguishes an interrupted WAIT from an interrupted RUN, and names the control channel', () => {
   // 1.2.0: the real acceptance defect was a host told that a healthy run had ended,
   // and an operator who could not stop a task while the host blocked the connection.
-  const template = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'codex', 'dsh-delegate.toml'), 'utf8');
+  const template = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'codex', 'dsh-taskbridge.toml'), 'utf8');
   // The live case keeps waiting on the SAME task and forbids the other three reactions.
   assert.match(template, /`interrupted`: the wait itself was cut off/u);
   assert.match(template, /It does NOT mean the execution stopped/u);
@@ -212,7 +212,7 @@ test('the shipped companion distinguishes an interrupted WAIT from an interrupte
   assert.match(template, /do not\s+keep calling `delegate_wait` on it/u);
   // The control channel: derived from this plugin's own MCP configuration, two verbs only.
   assert.match(template, /WHEN THE HOST CANNOT SEND A SECOND CALL/u);
-  assert.match(template, /`dsh-delegate-control`/u);
+  assert.match(template, /`dsh-taskbridge-control`/u);
   assert.match(template, /status <taskId>/u);
   assert.match(template, /cancel <taskId>/u);
   assert.match(template, /NEXT TO this plugin's MCP\s+script/u);
@@ -224,7 +224,7 @@ test('the shipped companion distinguishes an interrupted WAIT from an interrupte
 });
 
 test('the shipped companion forbids local implementation while a worker runs', () => {
-  const template = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'codex', 'dsh-delegate.toml'), 'utf8');
+  const template = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'codex', 'dsh-taskbridge.toml'), 'utf8');
   assert.match(template, /DO NOT IMPLEMENT LOCALLY WHILE A DELEGATED WORKER RUNS/u);
   assert.match(template, /single-writer/u);
   // The one exception is an explicit user-authorized takeover, and nothing weaker.
@@ -235,7 +235,7 @@ test('the shipped companion forbids local implementation while a worker runs', (
 });
 
 test('the shipped companion keeps its activation and safety rules unchanged', () => {
-  const template = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'codex', 'dsh-delegate.toml'), 'utf8');
+  const template = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'codex', 'dsh-taskbridge.toml'), 'utf8');
   for (const anchor of [
     'ACTIVATION (check this before anything else)',
     'delegate_preflight',

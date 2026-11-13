@@ -82,7 +82,7 @@ function printHelp() {
   process.stdout.write([
     'Usage: dsh-delegate-codex-agent <install|status|repair|remove>',
     'Uses CODEX_HOME when set; otherwise uses ~/.codex.',
-    'install/repair write agents/dsh-delegate.toml and register mcp_servers.dsh-delegate in config.toml.',
+    'install/repair write agents/dsh-taskbridge.toml and register mcp_servers.dsh-delegate in config.toml.',
     'remove deletes only files this plugin still owns; a modified file is left untouched.',
     'Never enables the DSH local-call switch and never edits unrelated Codex settings.',
   ].join('\n') + '\n');

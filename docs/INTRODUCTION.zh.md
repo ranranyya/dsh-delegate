@@ -18,14 +18,16 @@
 
 需要更大权限的工具调用会暂停，指挥端根据准确操作和指纹决定单次允许或拒绝，不是默认全部放行。交付后集中审查，修正通过 `continueFromTaskId` 续接原对话与执行工作区。
 
+1.3.2 起，新建的 DSH 工作区按实际工作内容命名，例如“制作潘德 G 版装备表”，不再只显示工作树的任务编号。指挥端随派工提交标题，旧客户端则从任务目标提取；续接同一任务时保留原名称与对话。
+
 ## 连接 Claude Code 与 Codex
 
-- **Codex**：设置页提供智能体及 MCP 的安装/修复按钮。历史技术标识 `dsh-delegate` 保留兼容，改名后不要求你重新解释派工规则。客户端是否提供输入框 `@` 选择由客户端版本决定。
+- **Codex**：设置页提供智能体及 MCP 的安装/修复按钮。智能体名为 `dsh-taskbridge`，更新会迁移未修改的旧智能体，派工规则随安装写入。客户端是否提供输入框 `@` 选择由客户端版本决定。
 - **Claude Code**：通过标准 stdio MCP 连接，参见 [接入说明](claude-code.md)。目前没有一键安装 Claude Code 的按钮，也未进行真实 Claude Code 客户端验收。
 
 ## 安装、升级和边界
 
-项目原名 DSH Delegate，1.3.0 曾使用 DSH TaskDispatch。1.3.1 起统一为 **DSH TaskBridge**，包名为 `dsh-taskbridge`。从旧包升级请先阅读 [更名升级说明](taskbridge-upgrade.md)。在 DSH“添加插件”中输入 `dsh-taskbridge@1.3.1`；中国大陆镜像若尚未同步，改选 npm 官方源。GitHub Release 同时提供安装包。
+项目原名 DSH Delegate，1.3.0 曾使用 DSH TaskDispatch。1.3.1 起统一为 **DSH TaskBridge**，包名为 `dsh-taskbridge`。从旧包升级请先阅读 [更名升级说明](taskbridge-upgrade.md)。在 DSH“添加插件”中输入 `dsh-taskbridge@1.3.2`；中国大陆镜像若尚未同步，改选 npm 官方源。GitHub Release 同时提供安装包。
 
 [插件索引与更新说明](plugin-market.md)介绍如何添加索引，在 DSH 的“发现”中搜索本插件。发布自定义索引不代表已进入官方内置市场；DSH 当前需要用户自行添加可信索引。
 

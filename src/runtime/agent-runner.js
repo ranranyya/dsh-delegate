@@ -521,6 +521,7 @@ async function resolvePlacement(deps, request) {
   if (request?.sessionId !== undefined && request?.sessionId !== null) return null;
   const placement = await placeSession(deps, {
     path: request?.cwd,
+    title: request?.title,
     // The only thing that can continue an existing conversation, and it is the
     // caller's explicit statement that this submission is a follow-up to THAT task.
     // Omitted means a new conversation, always.
@@ -1237,6 +1238,7 @@ export async function driveAgent(deps, request) {
         reused: placement.reused === true,
         workspaceId: placement.workspaceId ?? null,
         workspacePath: placement.workspacePath ?? null,
+        workspaceTitle: placement.workspaceTitle ?? null,
         sessionId: target.sessionId ?? placement.sessionId ?? null,
       },
       cancelCause: target.abortCause,

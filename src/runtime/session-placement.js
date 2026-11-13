@@ -287,7 +287,7 @@ export function continuationOf(value) {
  * @returns {Promise<{ workspaceId: string, path: string, created: boolean }>} the Workspace fact.
  * @throws {SessionPlacementError} when the controller refuses or reports nothing usable.
  */
-export async function ensureWorkspace(workspaces, path) {
+export async function ensureWorkspace(workspaces, path, title = null, taskId = '') {
   let value;
   try {
     value = await workspaces.create({ path });
@@ -309,8 +309,23 @@ export async function ensureWorkspace(workspaces, path) {
       { returned: value === null || typeof value !== 'object' ? typeof value : 'object without workspace.workspaceId' },
     );
   }
+  let workspaceTitle = workspace.title ?? null;
+  let namingError = null;
+  if (value.created === true && typeof title === 'string' && title.trim() !== '' && typeof workspaces.rename === 'function') {
+    try {
+      let renamed;
+      try { renamed = await workspaces.rename({ workspaceId, title }); }
+      catch (error) {
+        if (error?.code !== 'workspace/name-conflict') throw error;
+        renamed = await workspaces.rename({ workspaceId, title: `${title} · ${taskId.slice(-6) || workspaceId.slice(-6)}` });
+      }
+      workspaceTitle = renamed?.workspace?.title ?? title;
+    } catch (error) { namingError = diagnostic(error?.message ?? error, 200); }
+  }
   return {
     workspaceId,
+    workspaceTitle,
+    namingError,
     path: typeof workspace.path === 'string' && workspace.path !== '' ? workspace.path : path,
     created: value?.created === true,
   };
@@ -369,7 +384,8 @@ export async function placeSession(deps, request) {
   const execPath = request.path;
   const continueFromTaskId = continuationOf(request?.continueFromTaskId);
 
-  const workspace = await ensureWorkspace(workspaces, execPath);
+  const workspace = await ensureWorkspace(workspaces, execPath, continueFromTaskId === null ? request?.title : null, request?.taskId ?? deps.taskId ?? '');
+  if (workspace.namingError) deps.logger?.warn?.(`TaskBridge workspace title: ${workspace.namingError}`);
 
   if (continueFromTaskId !== null) {
     const parent = await loadContinuation(deps, continueFromTaskId);
@@ -386,6 +402,7 @@ export async function placeSession(deps, request) {
       continuedFromTaskId: continueFromTaskId,
       reused: true,
       workspaceId: workspace.workspaceId,
+      workspaceTitle: workspace.workspaceTitle,
       workspacePath: workspace.path,
       workspaceCreated: workspace.created,
       sessionId: resumed.sessionId,
@@ -405,6 +422,7 @@ export async function placeSession(deps, request) {
     continuedFromTaskId: null,
     reused: false,
     workspaceId: workspace.workspaceId,
+    workspaceTitle: workspace.workspaceTitle,
     workspacePath: workspace.path,
     workspaceCreated: workspace.created,
     sessionId: created.sessionId,

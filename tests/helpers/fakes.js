@@ -719,9 +719,21 @@ export function fakeToolRegistry(options = {}) {
 export function fakeWorkspaceController(options = {}) {
   const workspaces = new Map();
   const creates = [];
+  const renames = [];
   return {
     workspaces,
     creates,
+    renames,
+    async rename({ workspaceId, title }) {
+      renames.push({ workspaceId, title });
+      if (options.failRename) throw options.failRename;
+      if ([...workspaces.values()].some(row => row.workspaceId !== workspaceId && row.title === title)) {
+        throw Object.assign(new Error('workspace/name-conflict'), { code: 'workspace/name-conflict' });
+      }
+      const workspace = workspaces.get(workspaceId);
+      workspace.title = title;
+      return { workspace: { ...workspace } };
+    },
     async create(request) {
       creates.push(request);
       if (options.fail !== undefined) throw options.fail;

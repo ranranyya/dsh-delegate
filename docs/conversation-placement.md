@@ -19,6 +19,17 @@ Workspace for the run's execution path, and supplying it continues the DSH
 Workspace and Session that *that* task drove. Supplying it is the only way any
 conversation is ever continued.
 
+## Workspace display names (1.3.2)
+
+`delegate_submit.title` is an optional, short description of the actual work in
+the operator's language. The engine derives a title from the prompt's goal when
+older callers omit it. Only newly created Workspace groups are renamed through
+`workspaceController.rename({ workspaceId, title })`; an existing Workspace or
+an explicit follow-up retains its current name. Conflicting names receive a short
+task-id suffix. Naming needs no model call and does not change the execution
+directory, Git branch or task identity. Historical Workspaces are not renamed in
+bulk.
+
 ## The two questions, and the two services that answer them
 
 | Question | Native service | Dependency key |

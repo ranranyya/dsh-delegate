@@ -203,7 +203,7 @@ test('an outcome is rendered from what changed and what was refused, not from op
 
 test('the built page carries the Codex panel, one explicit button per action', () => {
   assert.match(BUNDLE, /Codex 集成（子智能体 \+ MCP）/u);
-  assert.match(BUNDLE, /安装 \/ 更新 Codex 集成/u);
+  assert.match(BUNDLE, /安装 \/ 更新 TaskBridge 智能体/u);
   assert.match(BUNDLE, /仅修复 MCP 配置/u);
   assert.match(BUNDLE, /移除插件托管项/u);
   assert.match(BUNDLE, /刷新状态/u);
@@ -223,9 +223,9 @@ test('the page states the reload requirement, the limits, and that it never enab
   assert.match(PAGE_SOURCE, /新开会话或重启 Codex/u);
   // The `@` claim is stated as *not* made: the page must say the Codex surface
   // decides whether a mention selects the agent, and must not promise it.
-  assert.match(PAGE_SOURCE, /不宣称当前 Codex 桌面版\/CLI 能在输入框用 @dsh-delegate 直接选中/u);
+  assert.match(PAGE_SOURCE, /不宣称当前 Codex 桌面版\/CLI 能在输入框用 @dsh-taskbridge 直接选中/u);
   assert.match(PAGE_SOURCE, /取决于 Codex 版本自身是否提供提及选择/u);
-  assert.doesNotMatch(PAGE_SOURCE, /支持在输入框直接输入 @dsh-delegate/u, 'the old claim must be gone');
+  assert.doesNotMatch(PAGE_SOURCE, /支持在输入框直接输入 @dsh-taskbridge/u, 'the old claim must be gone');
   assert.match(PAGE_SOURCE, /不会替你打开该开关/u);
   // The page states the truth about writes: the FIRST installation is only ever a click,
   // and an already-installed managed entry is upgraded in place at the next startup. The

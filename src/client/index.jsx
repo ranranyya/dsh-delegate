@@ -1759,7 +1759,7 @@ function TaskDetail({ store, task }) {
   return (
     <div className="dshdg-item">
       <div className="dshdg-item-head">
-        <strong className="dshdg-mono">{task.taskId}</strong>
+        <strong>{task.title || task.taskId}</strong>
         <Badge tone={badgeTone}>
           {taskStateLabel(task.state)}
         </Badge>
@@ -2022,7 +2022,7 @@ function TasksPanel({ store, snapshot }) {
             return (
               <div className="dshdg-item" key={task.taskId}>
                 <div className="dshdg-item-head">
-                  <span className="dshdg-mono">{task.taskId}</span>
+                  <span>{task.title || task.taskId}</span>
                   <Badge tone={isAwaitingPermission(task)
                     ? 'warn'
                     : (task.state === 'awaiting-host-review' ? 'warn' : (task.state === 'failed' ? 'warn' : 'off'))}>
@@ -2131,7 +2131,7 @@ function CodexPanel({ store, snapshot }) {
       </div>
       <p className="dshdg-muted">
         {'点下面的按钮，把 '}
-        <span className="dshdg-mono">agents/dsh-delegate.toml</span>
+        <span className="dshdg-mono">agents/dsh-taskbridge.toml</span>
         {' 装进 Codex 目录，并在 Codex 的 '}
         <span className="dshdg-mono">config.toml</span>
         {' 里登记本插件的 stdio MCP 服务（delegate_status / delegate_submit / delegate_result / delegate_wait / delegate_cancel）。'
@@ -2158,7 +2158,7 @@ function CodexPanel({ store, snapshot }) {
             <p className="dshdg-hint" data-dshdg-codex-drift="">
               {'这个托管 MCP 条目已经过期：'}
               {codexMcpDriftText(codex.mcp)}
-              {'。插件下次启动会自动在原地更新；也可以点上面的「安装 / 更新 Codex 集成」。'}
+              {'。插件下次启动会自动在原地更新；也可以点上面的「安装 / 更新 TaskBridge 智能体」。'}
             </p>
           ) : null}
           {notes.length === 0 ? null : (
@@ -2171,7 +2171,7 @@ function CodexPanel({ store, snapshot }) {
               {refreshing ? '读取中…' : '刷新状态'}
             </button>
             <button type="button" className="dshdg-primary" disabled={disabled} onClick={() => { void store.runCodexAction('install'); }}>
-              {busy ? '处理中…' : '安装 / 更新 Codex 集成'}
+              {busy ? '处理中…' : '安装 / 更新 TaskBridge 智能体'}
             </button>
             <button type="button" disabled={disabled} onClick={() => { void store.runCodexAction('repair'); }}>
               仅修复 MCP 配置
@@ -2187,7 +2187,7 @@ function CodexPanel({ store, snapshot }) {
       )}
       <p className="dshdg-hint">
         {'安装后需要让 Codex 重新载入：新开会话或重启 Codex，才会读到新的子智能体和 MCP 条目。'
-          + '本插件不宣称当前 Codex 桌面版/CLI 能在输入框用 @dsh-delegate 直接选中该子智能体——这取决于 Codex 版本自身是否提供提及选择；'
+          + '本插件不宣称当前 Codex 桌面版/CLI 能在输入框用 @dsh-taskbridge 直接选中该子智能体——这取决于 Codex 版本自身是否提供提及选择；'
           + '这里只保证子智能体文件与 MCP 工具存在，并由你在 Codex 提供的选择方式中指派它。'
           + '子智能体只在明确指派时派发任务，并在提交前先检查上面的本机调用开关；本页不会替你打开该开关。'
           + '同名的自定义 agent 会被保留并报告为冲突；没有本插件托管标记注释的同名 MCP 条目也视为你自己写的，不会被覆盖或删除。'}

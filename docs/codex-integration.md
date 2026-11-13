@@ -1,12 +1,27 @@
 # Codex integration contract
 
-Status: implemented in 1.3.1 (1.1.0 shipped the wait rules; 1.2.0 adds the installed-integration upgrade). Scope: Codex only. Claude Code and other hosts are
-out of scope and no surface for them is provided.
+Status: implemented in 1.3.2 (1.1.0 shipped the wait rules; 1.2.0 adds the installed-integration upgrade). This automatic installer covers Codex. Claude Code uses the separate manual MCP guide.
 
 This document is the contract between the plugin's settings page (browser half),
 the host-side installer (`src/codex/installer.js`) and the two files it manages.
 It is written so a reviewer can check the code against it without reading the
 README.
+
+## TaskBridge companion migration (1.3.2)
+
+The public companion is now `dsh-taskbridge`, installed as
+`agents/dsh-taskbridge.toml`. An explicit install or the startup refresh migrates
+an unchanged, recognized published `agents/dsh-delegate.toml` and removes the old
+managed file after the new managed template is present. Edited files and an
+operator-owned destination remain untouched; startup does not perform a first
+installation when no previous managed companion exists. The MCP table remains
+`mcp_servers.dsh-delegate`, and `delegate_*` tool names remain compatible.
+
+Explicit install/repair can also adopt a marked standard legacy MCP path after
+the old `dsh-delegate` or `dsh-taskdispatch` package has been uninstalled from the
+same `node_modules` as the current `dsh-taskbridge`. This narrow exception does
+not apply to custom wrappers, other directories, or automatic startup refresh.
+`repair` remains MCP-only. TaskBridge CLI aliases point at the existing bin files.
 
 ---
 
@@ -14,7 +29,7 @@ README.
 
 | Path | Owner | The plugin may | The plugin may never |
 | --- | --- | --- | --- |
-| `$CODEX_HOME/agents/dsh-delegate.toml` | managed copy of `codex/dsh-delegate.toml` | create it **exclusively** on explicit install when absent; refresh a byte-exact known build during plugin startup or explicit install; delete it on `remove` only after re-reading it and finding the same bytes it classified | overwrite or delete a file that is not that exact build — including a file with an old version line whose body was edited, and including a file that changed in the window between the status read and the write/removal |
+| `$CODEX_HOME/agents/dsh-taskbridge.toml` | managed copy of `codex/dsh-taskbridge.toml` | create it **exclusively** on explicit install when absent; refresh a byte-exact known build during plugin startup or explicit install; delete it on `remove` only after re-reading it and finding the same bytes it classified | overwrite or delete a file that is not that exact build — including a file with an old version line whose body was edited, and including a file that changed in the window between the status read and the write/removal |
 | `$CODEX_HOME/config.toml`, table `mcp_servers.dsh-delegate` | operator, with one managed entry | add the entry when absent; update `command`/`args`/its own `env.DSH_DELEGATE_DISCOVERY_FILE` when the entry carries **the plugin marker** *and* is the exact shape this plugin writes; on an explicit `install`/`repair` only, adopt a recorded `args[0]` that is a PROVED real installation of this package (manifest `name` + `bin["dsh-delegate-mcp"]` mapping) | touch any other key, table, comment or ordering; adopt, update or delete an unmarked same-name entry, even one whose values coincide; adopt a differing script path from the automatic startup check |
 | `$CODEX_HOME` and `$CODEX_HOME/agents` | Codex | read them (lstat **and** the Windows file attributes); create `agents` (`0700`) when both are real directories | create them relative to the process working directory; **follow a link at either level** (POSIX symlink, Windows junction/reparse point) for any read-through, write or delete |
 | DSH local-call switch | operator | report it | change it |
@@ -28,7 +43,7 @@ nobody named.
 
 `lstat` on the final file is not enough: if `$CODEX_HOME/agents` is a junction,
 `mkdir -p` and the file create walk *through* it and write
-`agents/dsh-delegate.toml` outside the Codex home entirely. Both directories are
+`agents/dsh-taskbridge.toml` outside the Codex home entirely. Both directories are
 therefore inspected as *boundaries*:
 
 | `$CODEX_HOME` | `$CODEX_HOME/agents` | result |
@@ -406,7 +421,7 @@ falling back, and so does `refreshManagedIntegration` when the caller passes a
 `startupTarget` whose `home` is `null` — the plugin never walks a junction and never
 substitutes a tree nobody named.
 
-The explicit 安装 / 更新 Codex 集成 button (action `install`) is unchanged and remains
+The explicit 安装 / 更新 TaskBridge 智能体 button (action `install`) is unchanged and remains
 the way to *create* the two managed targets. `status` reports the drift (`mcp.drift`)
 and, when an entry is `outdated`, a note naming exactly which owned facts are stale.
 
@@ -454,10 +469,10 @@ The page's `init()` issues a `GET`; the three buttons are the only callers of th
 
 **The single write at plugin load is the integration refresh.** `apply()` calls the
 seam's `refreshManagedIntegration()` once — only when a Codex home directory exists — which
-refreshes `agents/dsh-delegate.toml` when its complete bytes equal one of the enumerated
+refreshes `agents/dsh-taskbridge.toml` when its complete bytes equal one of the enumerated
 `KNOWN_AGENT_TEMPLATES` digests (section 5) **and** upgrades an already installed
 `mcp_servers.dsh-delegate` entry that is provably this plugin's and merely stale
-(section 2.4). It never creates a missing agent, never creates `agents/`, never creates
+(section 2.4). Apart from migrating an existing recognized legacy companion to its new name in 1.3.2, it never creates a missing agent, never creates `agents/`, never creates
 the MCP entry, and never touches a `modified`/`conflict` file: everything else stays an
 explicit `install`. A refusal or failure is logged and startup continues, so a Codex
 problem cannot stop the plugin from loading.
@@ -488,7 +503,7 @@ successful diagnosis.
 ```jsonc
 {
   "codexHome": "…",
-  "packageVersion": "1.3.1",
+  "packageVersion": "1.3.2",
   "boundary": { "blocked": false, "link": null, "unknown": false, "home": "directory", "agents": "directory" },
   "agent": {
     "path": "…", "state": "installed", "installed": true, "managed": true,
@@ -686,7 +701,7 @@ The instructions must state all of the following. They are asserted in
 one fails the build:
 
 1. **Explicit assignment only.** Dispatch only when the parent request explicitly
-   selects this agent (the exact mention `@dsh-delegate`, the agent picker, or an
+   selects this agent (the exact mention `@dsh-taskbridge`, the agent picker, or an
    explicit instruction to delegate this implementation task to DSH).
 2. **Mention is not dispatch.** Text that merely mentions DSH, DeepSeek,
    dsh-delegate, delegation or the agent while asking something else is not a
@@ -856,7 +871,7 @@ one fails the build:
 ### 5.2 What the file cannot guarantee: `@` selection
 
 **This plugin does not claim that any Codex surface supports selecting the agent by
-typing `@dsh-delegate`.** Only verified facts are stated:
+typing `@dsh-taskbridge`.** Only verified facts are stated:
 
 * A custom-agent file at `$CODEX_HOME/agents/<name>.toml` is a Codex-recognised
   definition, and the parent session's MCP tools are inherited by it — this is what
@@ -867,7 +882,7 @@ typing `@dsh-delegate`.** Only verified facts are stated:
   versions under test, so the wording here (and in the settings page) says the
   mention *may* select the agent, and claims no more.
 
-Consequently the agent's own instructions treat `@dsh-delegate` as **one example**
+Consequently the agent's own instructions treat `@dsh-taskbridge` as **one example**
 of an explicit selection, alongside the agent picker and an explicit instruction to
 delegate. If a Codex build does not offer `@` selection, the agent still works when
 chosen through whatever selection mechanism that build does provide. A new Codex
@@ -887,7 +902,7 @@ session (or a restart) is required to load the new file and the new MCP entry.
 | `repair` with the agent file missing or `outdated` | `changed: ["mcp"]` or `[]`; the agent file is not created and not refreshed, and `agents/` is not created |
 | the boundary cannot be verified (no spawnable shell / no PowerShell) | `conflict` (`boundary-unverified`); everything refused, nothing assumed safe |
 | agents dir missing | created on install (`0700`) when the boundary is clean |
-| `agents/dsh-delegate.toml` is a symlink or a directory | `conflict`; untouched |
+| `agents/dsh-taskbridge.toml` is a symlink or a directory | `conflict`; untouched |
 | a different agent file appears between status and install | `modified`; untouched (first install is exclusive) |
 | an agent file is rewritten between the status read and `remove` | `AGENT_USER_MODIFIED` (`modified-before-removal`); the new bytes are kept |
 | the agent path is replaced by a directory / a link before `remove` | `AGENT_PATH_CONFLICT`; the entry is left in place |

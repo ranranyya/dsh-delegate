@@ -5,8 +5,8 @@
 // -------------------------------------
 // This module owns exactly two things in a Codex home:
 //
-//   1. `$CODEX_HOME/agents/dsh-delegate.toml` — a *managed copy* of the shipped
-//      template `codex/dsh-delegate.toml`. Ownership is proved by content, never by
+//   1. `$CODEX_HOME/agents/dsh-taskbridge.toml` — a *managed copy* of the shipped
+//      template `codex/dsh-taskbridge.toml`. Ownership is proved by content, never by
 //      the file name or a version line alone:
 //        * a file that is byte-identical to the template this build would write is
 //          `installed` (and removable);
@@ -94,7 +94,8 @@ import {
 } from './toml.js';
 
 /** Agent file name inside `$CODEX_HOME/agents`. */
-export const AGENT_FILENAME = 'dsh-delegate.toml';
+export const AGENT_FILENAME = 'dsh-taskbridge.toml';
+export const LEGACY_AGENT_FILENAME = 'dsh-delegate.toml';
 
 /** MCP server entry name inside Codex's `mcp_servers` table. */
 export const MCP_SERVER_NAME = 'dsh-delegate';
@@ -127,6 +128,8 @@ export const CODEX_ACTIONS = Object.freeze(['status', 'install', 'repair', 'remo
  * @type {Array<{ version: string, sha256: string }>}
  */
 export const KNOWN_AGENT_TEMPLATES = [
+  { version: '1.3.1', sha256: '2793b656be4a1906e16edfdd0103540bfad05681a413c166b578b02333ea2618' },
+  { version: '1.3.1', sha256: 'b48558d6d6acca58b94a01029d6c884c4789488c7926cdaca40cb6cd15eea2ae' },
   {
     version: '0.1.6',
     sha256: '6a9d0da5b32d62a2a1f61d1fba37d54789cde0774afb3abccb5dc12b400c82be',
@@ -1448,6 +1451,19 @@ export async function isOwnedEntryScript(candidate, installed, options = {}) {
   return await isOtherInstallationOfThisPackage(recorded, options.rootPackageName ?? PACKAGE_NAME);
 }
 
+/** Explicit repair also accepts an uninstalled legacy sibling in the same node_modules. */
+export async function isExplicitlyMigratableScript(candidate, installed) {
+  if (await isOwnedEntryScript(candidate, installed)) return true;
+  const oldRoot = packageEntryRoot(candidate);
+  const newRoot = packageEntryRoot(installed);
+  if (oldRoot === null || newRoot === null) return false;
+  if (!['dsh-delegate', 'dsh-taskdispatch'].includes(basename(oldRoot))) return false;
+  if (basename(newRoot) !== 'dsh-taskbridge' || basename(dirname(newRoot)) !== 'node_modules') return false;
+  if (!samePlatformPath(dirname(oldRoot), dirname(newRoot))) return false;
+  try { await lstat(oldRoot); return false; }
+  catch (error) { return error?.code === 'ENOENT'; }
+}
+
 /**
  * The SYNCHRONOUS proof the classifier may use: the recorded script is this
  * installation's own file.
@@ -2233,7 +2249,7 @@ function buildNotes({ agent, mcp, script, configError, nodeError = null }) {
   if (agent.state === AGENT_STATES.modified) {
     notes.push({
       code: 'AGENT_USER_MODIFIED',
-      text: '已存在内容不同的 agents/dsh-delegate.toml，本插件不会覆盖或删除它；如需插件版本请先自行移动该文件。',
+      text: `已存在内容不同的 agents/${AGENT_FILENAME}，本插件不会覆盖或删除它；如需插件版本请先自行移动该文件。`,
     });
   }
   if (agent.state === AGENT_STATES.conflict) {
@@ -2241,12 +2257,12 @@ function buildNotes({ agent, mcp, script, configError, nodeError = null }) {
     // operator needs to know which one: a link on the way to the file (home or
     // `agents/`), or a final path that is not a regular file (a link, a directory).
     const text = agent.reason === 'codex-home-is-link'
-      ? 'Codex home 本身是链接（符号链接或 Windows reparse point/junction），本插件不会穿过它写入或删除 agents/dsh-delegate.toml。'
+      ? `Codex home 本身是链接（符号链接或 Windows reparse point/junction），本插件不会穿过它写入或删除 agents/${AGENT_FILENAME}。`
       : agent.reason === 'agents-dir-is-link'
-        ? 'agents 目录是链接（符号链接或 Windows reparse point/junction），本插件不会穿过它写入或删除 dsh-delegate.toml。'
+        ? `agents 目录是链接（符号链接或 Windows reparse point/junction），本插件不会穿过它写入或删除 ${AGENT_FILENAME}。`
         : agent.reason === 'boundary-unverified'
           ? 'Codex home 或 agents 目录无法确认是真实目录（可能缺少 Windows PowerShell），本插件不会写入或删除任何文件。'
-          : 'agents/dsh-delegate.toml 不是普通文件（可能是链接或目录），本插件不会改动它。';
+          : `agents/${AGENT_FILENAME} 不是普通文件（可能是链接或目录），本插件不会改动它。`;
     notes.push({ code: 'AGENT_PATH_CONFLICT', text });
   }
   if (agent.state === AGENT_STATES.outdated) {
@@ -2362,6 +2378,7 @@ export async function runCodexAction(action, {
 
   if (action === 'remove') {
     await removeManaged(before, { changed, refused });
+    await migrateLegacyAgent(before, { changed, refused }, { removeOnly: true });
   } else if (action === 'repair') {
     // MCP only: the agent file is not touched at all — not created, not refreshed,
     // not deleted. The returned status still reports its real (possibly `not-installed`
@@ -2386,7 +2403,28 @@ export async function runCodexAction(action, {
  */
 async function installManaged(before, outcome) {
   await installManagedAgent(before, outcome);
+  await migrateLegacyAgent(before, outcome);
   await installMcpEntry(before, outcome);
+}
+
+/** Move a previously installed, unchanged companion to the public TaskBridge name. */
+async function migrateLegacyAgent(before, outcome, { removeOnly = false } = {}) {
+  const legacyPath = join(before.codexHome, 'agents', LEGACY_AGENT_FILENAME);
+  const legacy = await inspectFile(legacyPath);
+  if (legacy.kind !== 'file' || !isKnownPriorTemplate(legacy.contents)) return;
+  if (!removeOnly) {
+    if (before.agent.state === AGENT_STATES.missing) {
+      const current = await inspectFile(before.agent.path);
+      if (current.kind === 'missing') await installManagedAgent(before, outcome);
+    }
+    const template = renderAgentFile(await readAgentTemplate(), before.packageVersion);
+    const current = await inspectFile(before.agent.path);
+    if (current.kind !== 'file' || current.contents !== template) return;
+  }
+  const currentLegacy = await inspectFile(legacyPath);
+  if (currentLegacy.kind !== 'file' || currentLegacy.contents !== legacy.contents) return;
+  await unlink(legacyPath);
+  if (!outcome.changed.includes('agent')) outcome.changed.push('agent');
 }
 
 /**
@@ -2428,6 +2466,7 @@ export async function refreshKnownAgentTemplate(options = {}) {
     if (before.agent.state === AGENT_STATES.outdated) {
       await installManagedAgent(before, { changed, refused });
     }
+    await migrateLegacyAgent(before, { changed, refused });
     if (refreshMcp === true) {
       // The automatic MCP half: only a provably-owned, merely-stale definition is
       // rewritten, and only after the boundary and the config digest are re-proved. It
@@ -3128,7 +3167,7 @@ export async function adoptProvedMovedInstall(before) {
   const args = Array.isArray(mcp.previous.args) ? mcp.previous.args : [];
   if (args.length !== 1) return null;
   if (mcp.previous.command !== mcp.desired.command && !isLegacyDesktopCommand(mcp.previous.command)) return null;
-  if ((await isOwnedEntryScript(args[0], mcp.desired.args[0])) !== true) return null;
+  if ((await isExplicitlyMigratableScript(args[0], mcp.desired.args[0])) !== true) return null;
   let loaded;
   try {
     loaded = await loadConfig(mcp.path);
@@ -3145,7 +3184,7 @@ export async function adoptProvedMovedInstall(before) {
   if (classification.marked !== true || classification.reason !== 'args-shape-not-ours') return null;
   const currentArgs = Array.isArray(classification.previous?.args) ? classification.previous.args : [];
   if (currentArgs.length !== 1) return null;
-  if ((await isOwnedEntryScript(currentArgs[0], mcp.desired.args[0])) !== true) return null;
+  if ((await isExplicitlyMigratableScript(currentArgs[0], mcp.desired.args[0])) !== true) return null;
   return { document: loaded.document, classification, desired: mcp.desired };
 }
 
@@ -3236,7 +3275,7 @@ export async function adoptMovedInstall(adopted, outcome, before) {
     return;
   }
   const currentArgs = Array.isArray(classification.previous?.args) ? classification.previous.args : [];
-  if (currentArgs.length !== 1 || (await isOwnedEntryScript(currentArgs[0], mcp.desired.args[0])) !== true) {
+  if (currentArgs.length !== 1 || (await isExplicitlyMigratableScript(currentArgs[0], mcp.desired.args[0])) !== true) {
     refuse('MCP_ENTRY_CONFLICT',
       'the recorded entry script is no longer provably an installation of this package, so nothing was written',
       'script-not-provably-ours');

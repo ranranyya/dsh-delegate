@@ -212,6 +212,7 @@ async function submitTask({ req, res, connection, deps }) {
       connectionId: connection.connectionId,
       workspacePath: body.workspacePath,
       prompt: body.prompt,
+      ...(body.title === undefined ? {} : { title: body.title }),
       overrides: body.overrides,
       ...(continueFromTaskId === undefined ? {} : { continueFromTaskId }),
     });
@@ -229,6 +230,7 @@ async function submitTask({ req, res, connection, deps }) {
     authorization,
     workspacePath: body.workspacePath,
     prompt: body.prompt,
+    ...(body.title === undefined ? {} : { title: body.title }),
     overrides: body.overrides,
     ...(continueFromTaskId === undefined ? {} : { continueFromTaskId }),
   });

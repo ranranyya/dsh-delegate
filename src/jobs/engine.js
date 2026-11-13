@@ -71,6 +71,7 @@ import { RUN_OUTCOMES, RunError, SessionPlacementRefusal, diagnostic, runAgent }
 import { PermissionBridge, PermissionError, PERMISSION_CODES } from '../runtime/permissions.js';
 import { DELEGATE_SANDBOX_MODE } from '../runtime/sandbox.js';
 import { rememberSession, SESSION_CODES } from '../runtime/session-placement.js';
+import { taskTitle } from './title.js';
 import { REVIEW_STATES, reviewWork } from '../review/reviewer.js';
 import { buildReviewPrompt, buildWorkerPrompt } from '../review/prompts.js';
 import { captureBaseline, captureDiff } from '../workspace/audit.js';
@@ -425,6 +426,7 @@ export class JobEngine {
       ? 'switch'
       : (request?.authorization === 'session' ? 'session' : 'task');
     const task = this.createTask(prompt, authorization);
+    task.title = taskTitle(request?.title, prompt);
     // Frozen before the first await so the task record states, from the moment it
     // exists, whether it starts a conversation or continues one.
     task.continueFromTaskId = continueFromTaskId === '' ? null : continueFromTaskId;
@@ -2467,6 +2469,7 @@ export class JobEngine {
       task.native.started = true;
       const pending = runAgent(this.deps, {
         prompt,
+        title: task.title,
         cwd: task.executionPath,
         selection: workerSelection,
         timeoutMs: task.effective.worker.timeoutSeconds * 1000,
@@ -2985,6 +2988,7 @@ export class JobEngine {
     return {
       taskId: task.taskId,
       state: task.state,
+      title: task.title ?? taskTitle(null, task.prompt),
       phase: task.phase,
       createdAt: task.createdAt ?? null,
       startedAt: task.startedAt ?? null,
@@ -3340,6 +3344,7 @@ export class JobEngine {
     const view = {
       taskId: task.taskId,
       state: task.state,
+      title: task.title ?? taskTitle(null, task.prompt),
       phase: task.phase,
       createdAt: task.createdAt,
       startedAt: task.startedAt,

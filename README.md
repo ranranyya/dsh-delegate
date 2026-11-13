@@ -5,10 +5,10 @@
 你向指挥端提出目标；指挥端规划、拆分、派工和审查，DSH 根据插件设置执行。插件可选择 DSH 已接入的 API 提供方、执行模型及其支持的思考强度，并配置超时、并发与工作区隔离；额外模型审查可单独开关和配置。任务交付后集中审查，需要改进时续接同一任务对话。
 
 - [详细中文介绍](docs/INTRODUCTION.zh.md) · [English introduction](docs/INTRODUCTION.md)
-- [从 DSH Delegate／TaskDispatch 迁移到 1.3.1](docs/taskbridge-upgrade.md)：新包名为 `dsh-taskbridge`，保留旧数据和 MCP 技术标识，不要同时启用新旧插件。
+- [从 DSH Delegate／TaskDispatch 迁移到 TaskBridge](docs/taskbridge-upgrade.md)：包名为 `dsh-taskbridge`，保留旧数据和 MCP 技术标识，不要同时启用新旧插件。
 - [在 DSH“发现”中搜索和安装](docs/plugin-market.md)：添加本项目的自定义索引，安装源固定到本项目的 Git 提交。
 - [Claude Code 手动 MCP 接入](docs/claude-code.md)；Codex 继续使用设置页的安装/修复按钮。Claude Code 的一键安装按钮和真实客户端验收尚未完成。
-- [1.3.1 发布报告](docs/releases/1.3.1.zh.md)：npm、国内镜像、GitHub 安装包及公开插件索引的实际核验结果。
+- [1.3.2 更新说明](docs/releases/1.3.2.zh.md)：Codex 智能体更名、任务工作区命名和旧安装路径修复；[1.3.1 发布报告](docs/releases/1.3.1.zh.md)保留历史分发核验结果。
 
 DeepSeek Harness（DSH）的委托插件：让 MCP 宿主在你开启本机总开关后，调用 DSH
 已配置的接口执行任务，执行结果回到宿主（例如 Codex）自行验收。
@@ -16,7 +16,7 @@ DeepSeek Harness（DSH）的委托插件：让 MCP 宿主在你开启本机总�
 新安装时本机调用总开关默认关闭。开关状态会保存在插件设置中，重启后恢复保存值；
 关闭时拒绝新的委派任务，并请求停止正在运行的任务。
 
-> **发布版本：`1.3.1`（TaskBridge 更名与 npm 发行版）。** 源码仓库和可下载的 Release
+> **发布版本：`1.3.2`（智能体更名与任务工作区命名）。** 源码仓库和可下载的 Release
 > 位于 [GitHub](https://github.com/ranranyya/dsh-taskbridge)。npm 安装标识为 **`dsh-taskbridge`**，
 > GitHub Release 同时提供 `.tgz`。`1.1.0` 的静默等待说明见
 > [`docs/silent-wait.md`](./docs/silent-wait.md)；`1.2.0` 修正了其中三处真实问题（等待中断的
@@ -47,13 +47,13 @@ profile 是**应用保留的**：npm / `dsh plugin` CLI 对该 profile 的操作
 Desktop 侧的包操作只能交给应用完成——不要在 Desktop 的正式 profile 里执行 npm/pnpm
 命令，也不要直接编辑其中的文件。
 
-1. 打开 Desktop 的 **Plugins manager → 添加插件**，输入 **`dsh-taskbridge@1.3.1`**。
+1. 打开 Desktop 的 **Plugins manager → 添加插件**，输入 **`dsh-taskbridge@1.3.2`**。
    若中国大陆镜像尚未同步，先选择 npm 官方源再重试。安装后的显示名为 **DSH TaskBridge**。
    也可以从本项目 Release 下载 `.tgz`，或在仓库根目录打包：
 
    ```bash
    npm pack
-   #    → dsh-taskbridge-1.3.1.tgz
+   #    → dsh-taskbridge-1.3.2.tgz
    ```
 
 2. 使用本地包时，通过 **添加插件**入口选择下载或生成的 `.tgz`（或本仓库目录）完成安装。
@@ -67,7 +67,7 @@ Desktop 侧的包操作只能交给应用完成——不要在 Desktop 的正式
 
 ```bash
 # 装进一个 profile（例：web）
-dsh plugin --profile web add ./dsh-taskbridge-1.3.1.tgz && dsh plugin --profile web why dsh-taskbridge
+dsh plugin --profile web add ./dsh-taskbridge-1.3.2.tgz && dsh plugin --profile web why dsh-taskbridge
 
 # 启动（首次启动会自动把插件 bundle 追加到 dsh.profile.bundles）
 dsh --profile web
@@ -80,7 +80,7 @@ dsh --profile web
 ### 说明与注意
 
 - **不要装进你正在用的正式 profile 做试验。** 建议先用一次性 profile：
-  `dsh plugin --profile dsh-delegate-try add ./dsh-taskbridge-1.3.1.tgz`，再把
+  `dsh plugin --profile dsh-delegate-try add ./dsh-taskbridge-1.3.2.tgz`，再把
   `DSH_HOME` 指向临时目录做隔离验证。该命令同样只用于 CLI profile。
 - 该包声明了 `@deepseek-ai/dsh-*` 的 peer，若你的包管理器默认自动安装 peer，
   安装过程会尝试解析这些版本。可显式关闭：`npm_config_auto_install_peers=false`
@@ -123,6 +123,8 @@ dsh --profile web
 还留着 `conversation.mode: "reuse"`。只有 `delegate_submit` 显式带上
 `continueFromTaskId` 的**跟进任务**才会续接那一条任务会话（同 Workspace、同 Session）。
 详见 `docs/conversation-placement.md`。
+
+**工作区按内容命名。** 派工时通过 `delegate_submit.title` 提供简短任务名称，例如“制作潘德 G 版装备表”。新建的 DSH Workspace 使用这个名称；旧客户端未提供标题时从任务目标中提取，不会额外调用模型。名称重合时追加短标识。续接任务及已有 Workspace 保持原名称，磁盘中的工作树路径仍使用任务 ID。
 
 ## 4. 本机调用开关
 
@@ -230,26 +232,19 @@ dsh --profile web
 
 ### 6.1 Codex 集成（设置页一键安装）
 
-Codex 是唯一支持的宿主。**「Codex 集成」**分页提供一个明确的按钮动作：点击一次即可完成
+Codex 支持一键安装集成。**「Codex 集成」**分页提供一个明确的按钮动作：点击一次即可完成
 
-1. 安装自定义子智能体文件 `CODEX_HOME/agents/dsh-delegate.toml`（未设置 `CODEX_HOME`
-   时为 `%USERPROFILE%\.codex\agents\dsh-delegate.toml`）；
+1. 安装自定义子智能体文件 `CODEX_HOME/agents/dsh-taskbridge.toml`（未设置 `CODEX_HOME`
+   时为 `%USERPROFILE%\.codex\agents\dsh-taskbridge.toml`）；
 2. 在 `CODEX_HOME/config.toml` 里登记本包自带的 stdio MCP 服务
    `mcp_servers.dsh-delegate`，让子智能体可以使用 `delegate_status` /
-   `delegate_preflight` / `delegate_submit` / `delegate_result` / `delegate_cancel` /
+   `delegate_preflight` / `delegate_submit` / `delegate_wait` / `delegate_result` / `delegate_cancel` /
    `delegate_permission_decide`。
 
 需要说明的边界（分页里也有同样的提示）：
 
-- **只有点击才会新建，启动只做受限刷新。** 打开分页、安装/升级 `.tgz` 都不会碰 Codex 目录；
-  新建 agent、登记或迁移 `config.toml` 条目、移除托管项都只能通过「安装 / 更新 Codex 集成」
-  「仅修复 MCP 配置」「移除插件托管项」三个按钮。唯一的例外是**插件启动时的一次受限迁移**：
-  只有当 `agents/dsh-delegate.toml` 与某个**已发布版本的模板逐字节相同**（枚举的摘要表）时，
-  才会把它刷新为当前版本；比较的是**原始字节**，插件不会把 CRLF 归一化成 LF 再比，也不会改写
-  你文件的行尾。已发布版本若同时存在打包的 CRLF 与 LF 文本两种字节形态，摘要表会为两种形态各列
-  一条，两条都是精确的已发布身份。它**不会**创建缺失的 agent、不会创建 `agents/` 目录、不会写
-  `config.toml`，正文被改过或来源不明的文件一律不动。「刷新状态」和分页打开时的读取都只是只读诊断。
-- **不覆盖、不删除你写的文件。** 同名但内容不同的 `agents/dsh-delegate.toml` 会被保留，
+- **首次安装由按钮触发，启动刷新已有托管集成。** 点击「安装 / 更新 TaskBridge 智能体」安装智能体和 MCP；「仅修复 MCP 配置」不改智能体。启动时会刷新与已发布模板字节一致的文件，并更新同一安装位置的已托管 MCP 配置。1.3.2 还会把未修改的旧 `agents/dsh-delegate.toml` 迁移成 `agents/dsh-taskbridge.toml`，清除旧文件，避免两个名字同时出现。没有既有托管智能体时，启动不会首次安装；正文被改过或新文件被用户占用时保留用户文件。「刷新状态」和分页打开时的读取只做诊断。
+- **不覆盖、不删除你写的文件。** 同名但内容不同的 `agents/dsh-taskbridge.toml` 会被保留，
   界面报告为「不属于已知版本」；只有与**某个已发布版本逐字节相同**的托管文件才会被更新或删除，
   仅版本号变旧、正文被改过一字的文件都不会动。`config.toml` 里由插件写入的条目带托管标记注释；
   **没有该标记**的同名条目（即使 `command`/`args` 与插件要写的完全一致）同样视为你自己写的，
@@ -284,11 +279,11 @@ Codex 是唯一支持的宿主。**「Codex 集成」**分页提供一个明确�
 - **安装后需要 Codex 重新载入。** 新开会话或重启 Codex 才会读到新的子智能体和 MCP 条目。
   Codex 官方文档说明了[自定义子智能体](https://learn.chatgpt.com/docs/agent-configuration/subagents)和
   [MCP 连接](https://learn.chatgpt.com/docs/extend/mcp?surface=cli)；这些文档支持 agent 配置与
-  MCP 继承，但**没有**说明当前 Codex 桌面版/CLI 的输入框支持用 `@dsh-delegate` 选中该子智能体。
+  MCP 继承，但**没有**说明当前 Codex 桌面版/CLI 的输入框支持用 `@dsh-taskbridge` 选中该子智能体。
   本插件因此**不宣称**任何 Codex 界面支持这种 `@` 直接调用，只保证子智能体文件与 MCP 工具存在，
   由你通过 Codex 自身提供的选择方式指派它。
-- **触发规则写死在 agent 文件里**（见 `codex/dsh-delegate.toml`）：只有在父请求明确指派
-  （例如写出 `@dsh-delegate`、从智能体列表中选择它，或明确要求把该实现任务交给 DSH）时才派发；
+- **触发规则写死在 agent 文件里**（见 `codex/dsh-taskbridge.toml`）：只有在父请求明确指派
+  （例如写出 `@dsh-taskbridge`、从智能体列表中选择它，或明确要求把该实现任务交给 DSH）时才派发；
   仅仅在无关问题里提到 DSH / DeepSeek / 本插件**不是**派发请求。派发前先调用
   `delegate_status` 检查开关，再调用 `delegate_preflight` 读取工作区事实：干净仓库按插件设置里
   的 **worktree** 隔离派发；**脏仓库不会被自动降级**，指挥官根据任务和变更路径判断能否安全共享，
@@ -314,8 +309,8 @@ node bin/dsh-delegate-codex-agent.js remove    # 只删除插件托管项
 退出码：`0` 完成，`2` 因冲突/拒绝而未改动，`1` 失败。
 
 已安装的托管 MCP 条目会在插件启动时**自动**原地补齐缺失的 `tool_timeout_sec`（入口脚本正好是
-本安装时）。入口路径已经指向旧安装的条目不会被启动自检改写：请用「安装 / 更新 Codex 集成」或
-「仅修复 MCP 配置」显式采纳，只有在证明旧路径是同一包的真实安装后才会改写。显式按钮仍然是
+本安装时）。入口路径已经指向旧安装的条目不会被启动自检改写：请用「安装 / 更新 TaskBridge 智能体」或
+「仅修复 MCP 配置」显式采纳；仍存在的旧包须证明身份，已卸载的同级旧包按 1.3.2 的标准路径规则迁移。显式按钮仍然是
 未安装时唯一会创建条目的动作。
 
 ## 7. 凭据隔离
@@ -419,7 +414,7 @@ Codex 子智能体现在按「提交 → `delegate_wait` 同一任务」运作�
 60 分钟的等待跑完；客户端如果应用自己的默认工具超时（Codex 的历史默认是一分钟），仍可能提前
 结束等待，这是插件不能解除的客户端限制。
 
-升级后的操作：设置页 → Codex 集成 → **安装 / 更新 Codex 集成**，然后让 Codex 重新载入
+升级后的操作：设置页 → Codex 集成 → **安装 / 更新 TaskBridge 智能体**，然后让 Codex 重新载入
 （新开会话或重启）。
 
 完整说明见 [`docs/silent-wait.md`](./docs/silent-wait.md)。
@@ -488,7 +483,7 @@ Codex 子智能体现在按「提交 → `delegate_wait` 同一任务」运作�
   command 是本包的 Node 命令、`args[0]` 正好是本安装的 `dsh-delegate-mcp.js`）**且**缺
   `tool_timeout_sec` 的条目，才会在原地补齐。入口路径已经指向旧安装的条目只会被报告为
   `conflict`，启动不会替操作者改路径。
-- 「安装 / 更新 Codex 集成」或「仅修复 MCP 配置」是唯一会采纳旧路径的入口：它要求旧路径是
+- 「安装 / 更新 TaskBridge 智能体」或「仅修复 MCP 配置」是唯一会采纳旧路径的入口：它要求旧路径是
   真实安装（真实的 root/bin/入口文件，`package.json` 的 `name` 是本包且
   `bin["dsh-delegate-mcp"]` 映射到该入口），并在写入前重查当前 config 指纹、边界和条目所有权；
   期间有任何改动就拒绝。
@@ -499,7 +494,7 @@ Codex 子智能体现在按「提交 → `delegate_wait` 同一任务」运作�
   不是目录都拒绝升级，缺失层级逐级创建并复核，绝不沿链接把完整 config 写出去。
 - 已发布的 `1.1.0` 子智能体文件（CRLF 与 LF 两种字节形态）已加入精确识别列表，所以旧
   agent 能安全升级；`1.1.0` 之前、正文已变的历史版本按各自已发布的精确摘要识别。
-- 设置页保留显式「安装 / 更新 Codex 集成」按钮，并显示 `outdated` 的**具体漂移项**与说明。
+- 设置页保留显式「安装 / 更新 TaskBridge 智能体」按钮，并显示 `outdated` 的**具体漂移项**与说明。
 
 ### 1.2.0 当时未覆盖的验收
 
@@ -516,7 +511,7 @@ Codex 子智能体现在按「提交 → `delegate_wait` 同一任务」运作�
 # 不要在 Desktop 的正式 profile 下执行下面的 CLI 命令。
 
 # CLI web profile 的升级：换成本地新包或（将来）新版本
-dsh plugin --profile web add ./dsh-taskbridge-1.3.1.tgz
+dsh plugin --profile web add ./dsh-taskbridge-1.3.2.tgz
 
 # 导出：界面里"导出非敏感配置"按钮，或用只读 API
 #   GET /api/dsh-delegate/settings
@@ -580,10 +575,10 @@ dsh plugin --profile web remove dsh-taskbridge
   "等待宿主审查"，不是"已通过"。
 - **Codex 集成的限制**：
   - 一键安装按钮只支持 Codex；Claude Code 可按接入说明手动配置标准 MCP，尚无一键安装按钮或真实客户端验收。
-  - **不宣称**当前 Codex 桌面版/CLI 支持用 `@dsh-delegate` 在输入框直接选中该子智能体：
+  - **不宣称**当前 Codex 桌面版/CLI 支持用 `@dsh-taskbridge` 在输入框直接选中该子智能体：
     这取决于 Codex 版本自身是否提供提及选择，仓库内没有官方文档或运行时证据支持该说法。
     插件只保证子智能体文件与 MCP 条目存在；安装后必须让 Codex 重新载入。
-  - 仅管理 `agents/dsh-delegate.toml` 与 `config.toml` 里的 `mcp_servers.dsh-delegate`
+  - 仅管理 `agents/dsh-taskbridge.toml` 与 `config.toml` 里的 `mcp_servers.dsh-delegate`
     一项；不修改 Codex 的其他设置，不删除用户自己写的同名文件。所有权按内容证明：
     MCP 条目必须有本插件的托管标记注释，agent 文件必须与当前模板或某个**已发布版本逐字节相同**，
     否则一律视为你的文件并拒绝改动。

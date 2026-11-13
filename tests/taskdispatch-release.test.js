@@ -14,7 +14,7 @@ const manifest = JSON.parse(await readFile(join(ROOT, 'package.json'), 'utf8'));
 
 test('public identity changes while the actual managed data and MCP identifiers remain compatible', async () => {
   assert.equal(manifest.name, 'dsh-taskbridge');
-  assert.equal(manifest.version, '1.3.1');
+  assert.equal(manifest.version, '1.3.2');
   const home = join(tmpdir(), 'taskdispatch-home-fixture');
   assert.equal(installationRecordPath({ DSH_HOME: home }), join(home, 'data', 'dsh-delegate', 'codex-installation.json'));
   assert.equal(manifest.bin['dsh-delegate-mcp'], 'bin/dsh-delegate-mcp.js');

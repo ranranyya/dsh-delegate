@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.3.2 — TaskBridge companion and descriptive task workspace names
+
+- Rename the shipped Codex companion to `dsh-taskbridge` (`agents/dsh-taskbridge.toml`). Install and startup migrate an unchanged, recognized published `dsh-delegate.toml` and remove the old managed file; edited agent files remain operator-owned. Add TaskBridge CLI aliases while retaining the existing binaries and internal MCP identifiers.
+- Add an optional `title` to `delegate_submit` and carry it through HTTP, the job engine and the native Workspace controller. Newly created Workspaces use a short description of the work rather than the worktree's `task-UUID` directory name. Older callers derive a title from the prompt's goal. Follow-ups and existing Workspaces keep their titles; duplicate titles receive a short suffix. No additional model call is made for naming.
+- Explicit Codex install/repair can migrate a marked legacy MCP entry after the old package was uninstalled, when its missing package path is a known sibling of the current `dsh-taskbridge` installation. Custom wrappers, unrelated paths and automatic startup path adoption remain excluded.
+- Update the settings page, companion dispatch rules and upgrade instructions. Model selection, delegation authorization, quiet waiting and host review retain their existing behavior.
+
+- Make loopback HTTP test fixtures avoid Fetch-blocked ports, which Windows can allocate from a customized low dynamic-port range. This only affects tests.
+
 ## 1.3.1 — DSH TaskBridge identity and npm distribution
 
 - Unify the project, GitHub repository, plugin title, package and bundle identity as **DSH TaskBridge** / `dsh-taskbridge`. The previous GitHub-only `dsh-taskdispatch` name was rejected by npm's similarity protection; it never became an npm package.

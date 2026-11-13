@@ -511,7 +511,7 @@ export async function apply(ctx, config = {}) {
 }
 
 /** Version reported by the runtime facts block. Mirrors `package.json`. */
-const PLUGIN_VERSION = '1.3.1';
+const PLUGIN_VERSION = '1.3.2';
 
 /**
  * Read the native approval service without turning absence into a throw.

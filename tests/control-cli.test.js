@@ -21,6 +21,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
+import { listenLoopback } from './helpers/http.js';
 import { Readable, Writable } from 'node:stream';
 import { spawn, spawnSync } from 'node:child_process';
 import { closeSync, existsSync, mkdtempSync, openSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
@@ -588,7 +589,7 @@ async function realEngineFixture(options = {}) {
  */
 async function startPlane(handler) {
   const server = createServer((req, res) => { void handler(req, res); });
-  await new Promise((resolvePromise) => server.listen(0, '127.0.0.1', resolvePromise));
+  await listenLoopback(server);
   const { port } = server.address();
   return {
     url: `http://127.0.0.1:${port}`,

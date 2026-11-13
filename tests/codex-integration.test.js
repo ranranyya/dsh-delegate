@@ -67,7 +67,7 @@ import { USER_PLANE_PREFIX, wrapUserPlaneRoutes } from '../src/http/user-plane.j
 import { PREFLIGHT_ISOLATIONS, PREFLIGHT_REASONS } from '../src/workspace/preflight.js';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
-const DELIVERABLE_VERSION = '1.3.1';
+const DELIVERABLE_VERSION = '1.3.2';
 // The baseline the current release upgrades *from*, pinned rather than derived: an
 // expectation that followed `DELIVERABLE_VERSION` would assert nothing.
 const PREVIOUS_VERSION = '0.1.14';
@@ -817,7 +817,7 @@ test('install writes the agent file and the MCP entry, and repeating it changes 
     assert.equal(first.status.ready, true);
 
     const agent = readFileSync(fixture.agentPath, 'utf8');
-    assert.match(agent, /^name = "dsh-delegate"$/mu);
+    assert.match(agent, /^name = "dsh-taskbridge"$/mu);
     assert.match(agent, new RegExp(`^version = "${DELIVERABLE_VERSION.replace(/\./gu, '\\.')}"$`, 'mu'));
     assert.match(agent, /managed by the DSH TaskBridge plugin/u);
 
@@ -1070,7 +1070,7 @@ test(`the published 0.1.11 agent is refreshed to ${DELIVERABLE_VERSION} by start
   // so its bytes are rebuilt from the pinned 0.1.13 FIXTURE by rewriting only its
   // version line, then proved against the pinned published digest.
   const fixture = codexHomeFixture();
-  const template = readFileSync(join(ROOT, 'codex', 'dsh-delegate.toml'), 'utf8');
+  const template = readFileSync(join(ROOT, 'codex', 'dsh-taskbridge.toml'), 'utf8');
   assertShippedTemplate(template);
   const prior = historicalTemplate(AGENT_0_1_11_VERSION, 'crlf');
   try {
@@ -1165,7 +1165,7 @@ test(`the published ${AGENT_0_1_12_VERSION} agent is refreshed to ${DELIVERABLE_
   // `package/codex/dsh-delegate.toml` inside the packed `dsh-delegate-0.1.12.tgz` and
   // against the saved release baseline.
   const fixture = codexHomeFixture();
-  const template = readFileSync(join(ROOT, 'codex', 'dsh-delegate.toml'), 'utf8');
+  const template = readFileSync(join(ROOT, 'codex', 'dsh-taskbridge.toml'), 'utf8');
   assertShippedTemplate(template);
   const prior = historicalTemplate(AGENT_0_1_12_VERSION, 'crlf');
   try {
@@ -1251,7 +1251,7 @@ test('both published 0.1.10 byte forms are recognized and refreshed, as a histor
   // is refreshed in one step and that its bytes are the ownership proof rather than a
   // heuristic on the version line. It also proves the LF form is *not* accepted by
   // accident: the two digests really differ.
-  const template = readFileSync(join(ROOT, 'codex', 'dsh-delegate.toml'), 'utf8');
+  const template = readFileSync(join(ROOT, 'codex', 'dsh-taskbridge.toml'), 'utf8');
   const forms = [
     { name: 'packed CRLF', eol: 'crlf', sha256: AGENT_0_1_10_CRLF_DIGEST },
     { name: 'LF checkout', eol: 'lf', sha256: AGENT_0_1_10_LF_DIGEST },
@@ -1394,6 +1394,7 @@ test('the published 0.1.13 agent is refreshed when unchanged and preserved when 
  * is the only honest input for these tests.
  */
 const HISTORICAL_AGENT_FIXTURES = Object.freeze([
+  { version: '1.3.1', path: join(ROOT, 'tests', 'fixtures', 'codex-agent-1.3.1.toml'), packed: '2793b656be4a1906e16edfdd0103540bfad05681a413c166b578b02333ea2618', lf: 'b48558d6d6acca58b94a01029d6c884c4789488c7926cdaca40cb6cd15eea2ae' },
   {
     version: '1.3.0',
     path: join(ROOT, 'tests', 'fixtures', 'codex-agent-1.3.0.toml'),
@@ -1507,7 +1508,7 @@ test('a body edit survives install and repair even when the version marker is ol
     // matcher would call this "outdated" and overwrite it.
     const edited = installed
       .replace(/^version = ".*"$/mu, 'version = "0.1.5"')
-      .replace('name = "dsh-delegate"', '# my own note\nname = "dsh-delegate"');
+      .replace('name = "dsh-taskbridge"', '# my own note\nname = "dsh-taskbridge"');
     writeFileSync(fixture.agentPath, edited);
 
     for (const action of ['install', 'repair', 'install']) {
@@ -1579,7 +1580,7 @@ test('a file created between the status read and the first install is reported, 
   // window itself cannot be opened deterministically from a test.
   const home = mkdtempSync(join(tmpdir(), 'dsh-delegate-race-'));
   try {
-    const target = join(home, 'agents', 'dsh-delegate.toml');
+    const target = join(home, 'agents', 'dsh-taskbridge.toml');
     mkdirSync(dirname(target), { recursive: true });
 
     // First create: the file is ours and appears exactly once.
@@ -1587,13 +1588,13 @@ test('a file created between the status read and the first install is reported, 
     assert.equal(once, 'created');
     assert.equal(readFileSync(target, 'utf8'), 'first');
     // No temp file is left behind in either case.
-    assert.deepEqual(readdirSync(dirname(target)), ['dsh-delegate.toml']);
+    assert.deepEqual(readdirSync(dirname(target)), ['dsh-taskbridge.toml']);
 
     // Second create: the different file that appeared meanwhile survives untouched.
     const twice = await createFileExclusive(target, 'second');
     assert.equal(twice, 'exists');
     assert.equal(readFileSync(target, 'utf8'), 'first', 'the concurrent file must not be overwritten');
-    assert.deepEqual(readdirSync(dirname(target)), ['dsh-delegate.toml']);
+    assert.deepEqual(readdirSync(dirname(target)), ['dsh-taskbridge.toml']);
   } finally {
     rmSync(home, { recursive: true, force: true });
   }
@@ -3568,7 +3569,7 @@ test('the agent no longer points at a repository checkout and covers the exact d
 
   // Activation: explicit selection or mention only. An unrelated mention must not dispatch.
   assert.match(template, /explicitly selects this agent/u);
-  assert.match(template, /`@dsh-delegate`/u);
+  assert.match(template, /`@dsh-taskbridge`/u);
   assert.match(template, /is NOT a dispatch request/u);
   assert.match(template, /do not\s+submit a task/u);
   assert.match(template, /clarifying question/u);

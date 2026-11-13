@@ -76,7 +76,7 @@ export const SUPPORTED_PROTOCOL_VERSIONS = Object.freeze([
 export const LATEST_PROTOCOL_VERSION = SUPPORTED_PROTOCOL_VERSIONS[0];
 
 /** Identifies this server in the handshake. */
-export const SERVER_INFO = Object.freeze({ name: 'dsh-delegate', version: '1.3.1' });
+export const SERVER_INFO = Object.freeze({ name: 'dsh-delegate', version: '1.3.2' });
 
 /** Bound on a tool result's text. A task view can be large; a model's context cannot. */
 export const MAX_TOOL_TEXT_CHARS = 20_000;
@@ -232,6 +232,7 @@ export const TOOLS = Object.freeze([
             + 'different source path names a different repository and the continuation is refused.',
         },
         prompt: { type: 'string', description: 'The task to perform.' },
+        title: { type: 'string', maxLength: 120, description: 'Short work-content title in the operator\'s language, e.g. 修复登录错误. Used to name the new DSH Workspace; omit role instructions and task ids. A follow-up keeps its existing Workspace name.' },
         overrides: {
           type: 'object',
           description: 'Optional per-task overrides (model/effort/timeout). Validated by the harness.',

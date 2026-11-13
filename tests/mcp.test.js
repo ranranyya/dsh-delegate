@@ -1216,6 +1216,7 @@ async function executionPlaneFixture(options = {}) {
     engine,
     handler,
     agents,
+    workspaces,
     async close() {
       await engine.dispose();
       await cleanup(dir);
@@ -1289,7 +1290,7 @@ test('delegate_result retrieves the intended task through the real execution pla
         method: 'tools/call',
         params: {
           name: 'delegate_submit',
-          arguments: { workspacePath: plane.workspace, prompt: 'implement the change' },
+          arguments: { workspacePath: plane.workspace, prompt: 'implement the change', title: '修复授权界面' },
         },
       });
       assert.equal(submitted.result.isError, undefined, submitted.result.content?.[0]?.text);
@@ -1311,6 +1312,9 @@ test('delegate_result retrieves the intended task through the real execution pla
       assert.equal(body.task.taskId, taskId, 'the read must return the task that was submitted');
       assert.equal(body.task.connectionId, 'local-mcp');
       assert.equal(body.task.execution.text, 'implemented the change');
+      assert.equal(body.task.title, '修复授权界面');
+      assert.equal(body.task.execution.conversation.workspaceTitle, '修复授权界面');
+      assert.deepEqual(plane.workspaces.renames, [{ workspaceId: body.task.execution.conversation.workspaceId, title: '修复授权界面' }]);
 
       // The wire, not just the answer: the plane's own routes received the calls.
       assert.deepEqual(wire, [

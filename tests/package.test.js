@@ -56,7 +56,7 @@ const SUPPORTED_DSH_RANGE = SUPPORTED_DSH_VERSIONS.join(' || ');
  * so asserting itself would pass for any value. `1.3.1` adopts TaskBridge and npm
  * distribution after the GitHub-only `1.3.0`, preserving the runtime contracts.
  */
-const DELIVERABLE_VERSION = '1.3.1';
+const DELIVERABLE_VERSION = '1.3.2';
 
 /**
  * The published build this release upgrades *from*.
@@ -65,7 +65,7 @@ const DELIVERABLE_VERSION = '1.3.1';
  * current version must be exactly one PATCH above this baseline (a correction release),
  * and the two are different versions by construction.
  */
-const PREVIOUS_VERSION = '1.3.0';
+const PREVIOUS_VERSION = '1.3.1';
 
 // Published prior builds are retained only where the migration/ownership contract
 // names them. Other operator-facing and shipped code must not carry stale versions.
@@ -346,6 +346,9 @@ test('the stdio MCP executable is declared as a bin and points at a real script'
     'dsh-delegate-mcp': 'bin/dsh-delegate-mcp.js',
     'dsh-delegate-codex-agent': 'bin/dsh-delegate-codex-agent.js',
     'dsh-delegate-control': 'bin/dsh-delegate-control.js',
+    'dsh-taskbridge-mcp': 'bin/dsh-delegate-mcp.js',
+    'dsh-taskbridge-codex-agent': 'bin/dsh-delegate-codex-agent.js',
+    'dsh-taskbridge-control': 'bin/dsh-delegate-control.js',
   });
   const binPath = MANIFEST.bin['dsh-delegate-mcp'];
   assert.ok(existsSync(join(ROOT, binPath)), 'the bin target must exist');
@@ -383,9 +386,9 @@ test('the stdio MCP executable is declared as a bin and points at a real script'
   assert.match(controlSource, /export const CONTROL_TIMEOUT_MS = 10_000;/u,
     'the documented whole-command budget is ten seconds');
   assert.match(controlSource, /retry: false/u, 'the control call must opt out of the observation retry');
-  assert.ok(PACKED.includes('codex/dsh-delegate.toml'), 'the custom-agent template must be published');
-  const codexAgent = readFileSync(join(ROOT, 'codex/dsh-delegate.toml'), 'utf8');
-  assert.match(codexAgent, /^name = "dsh-delegate"$/mu);
+  assert.ok(PACKED.includes('codex/dsh-taskbridge.toml'), 'the custom-agent template must be published');
+  const codexAgent = readFileSync(join(ROOT, 'codex/dsh-taskbridge.toml'), 'utf8');
+  assert.match(codexAgent, /^name = "dsh-taskbridge"$/mu);
   // The managed copy is stamped with the package version, so an upgrade can tell an
   // older file of ours (safe to refresh) from an operator's edit (never touched).
   assert.match(codexAgent, new RegExp(`^version = "${MANIFEST.version.replace(/\./gu, '\\.')}"$`, 'mu'));
@@ -624,7 +627,7 @@ test(`the release is ${DELIVERABLE_VERSION}, the correction release after ${PREV
   assert.equal(lock.version, DELIVERABLE_VERSION, 'package-lock.json#version must match package.json');
   assert.equal(lock.packages[''].version, DELIVERABLE_VERSION, 'the lockfile root entry must match package.json');
 
-  const template = readFileSync(join(ROOT, 'codex', 'dsh-delegate.toml'), 'utf8');
+  const template = readFileSync(join(ROOT, 'codex', 'dsh-taskbridge.toml'), 'utf8');
   assert.match(template, new RegExp(`^version = "${escape(DELIVERABLE_VERSION)}"$`, 'mu'));
 
   const readme = readFileSync(join(ROOT, 'README.md'), 'utf8');
@@ -747,7 +750,7 @@ test('the archive carries every install-critical file', () => {
     // stdio MCP adapter
     'bin/dsh-delegate-mcp.js',
     'bin/dsh-delegate-codex-agent.js',
-    'codex/dsh-delegate.toml',
+    'codex/dsh-taskbridge.toml',
     // bundle composition
     'cordis.patch.yml',
   ];

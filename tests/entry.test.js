@@ -280,7 +280,7 @@ test('plugin startup refreshes exact shipped Codex agents and leaves unknown fil
   const { cleanup } = await import('./helpers/fakes.js');
   const prior = readFileSync(new URL('./fixtures/codex-agent-0.1.7.toml', import.meta.url), 'utf8')
     .replace(/\r?\n/gu, '\r\n');
-  const current = readFileSync(new URL('../codex/dsh-delegate.toml', import.meta.url), 'utf8');
+  const current = readFileSync(new URL('../codex/dsh-taskbridge.toml', import.meta.url), 'utf8');
 
   for (const entry of [
     { name: 'known', contents: prior, expected: current },
@@ -293,7 +293,10 @@ test('plugin startup refreshes exact shipped Codex agents and leaves unknown fil
     let handle;
     try {
       handle = await applyWithRealRuntime({ codexHome });
-      assert.equal(readFileSync(agentPath, 'utf8'), entry.expected);
+      const migratedPath = join(codexHome, 'agents', 'dsh-taskbridge.toml');
+      assert.equal(readFileSync(entry.name === 'known' ? migratedPath : agentPath, 'utf8'), entry.expected);
+      assert.equal(existsSync(agentPath), entry.name === 'edited', 'only a recognized legacy agent is migrated');
+      assert.equal(existsSync(migratedPath), entry.name === 'known');
       assert.equal(existsSync(join(codexHome, 'config.toml')), false, 'startup migration must not install an MCP entry');
     } finally {
       if (handle !== undefined) await cleanup(handle.directory);

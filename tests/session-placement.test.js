@@ -371,6 +371,7 @@ test('continueFromTaskId continues exactly the parent task thread', async () => 
     const placement = await placeSession(fixture.deps, {
       path: fixture.row.executionPath,
       continueFromTaskId: fixture.row.taskId,
+      title: 'a follow-up must not rename the original workspace',
     });
 
     assert.equal(placement.kind, PLACEMENT_KINDS.continuation);
@@ -381,6 +382,7 @@ test('continueFromTaskId continues exactly the parent task thread', async () => 
     assert.equal(fixture.deps.sessionController.creates.length, 0, 'a continuation must not create a Session');
     assert.deepEqual(fixture.deps.sessionController.resolves, ['session-parent']);
     assert.equal(placement.agent.id, 'session-parent');
+    assert.equal(fixture.deps.workspaces.renames.length, 0, 'a follow-up retains the original workspace title');
   } finally {
     await fixture.store.dispose();
     await cleanup(fixture.dir);

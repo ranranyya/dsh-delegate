@@ -13,7 +13,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
-import { once } from 'node:events';
+import { listenLoopback } from './helpers/http.js';
 
 import {
   DISCOVERY_CODES,
@@ -73,11 +73,7 @@ async function startServer(handler, t = null) {
       res.end();
     });
   });
-  // A listen/accept error would otherwise be an unhandled `'error'` event.
-  const failed = once(server, 'error').then(([error]) => error, () => new Error('server failed'));
-  server.listen(0, '127.0.0.1');
-  const [error] = await Promise.race([once(server, 'listening').then(() => [null]), failed]);
-  if (error !== null) throw error;
+  await listenLoopback(server);
   const { port } = server.address();
   const origin = `http://127.0.0.1:${port}`;
   let closed = false;
