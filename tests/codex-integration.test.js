@@ -67,7 +67,7 @@ import { USER_PLANE_PREFIX, wrapUserPlaneRoutes } from '../src/http/user-plane.j
 import { PREFLIGHT_ISOLATIONS, PREFLIGHT_REASONS } from '../src/workspace/preflight.js';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
-const DELIVERABLE_VERSION = '1.4.0';
+const DELIVERABLE_VERSION = '1.4.1';
 // The baseline the current release upgrades *from*, pinned rather than derived: an
 // expectation that followed `DELIVERABLE_VERSION` would assert nothing.
 const PREVIOUS_VERSION = '0.1.14';
@@ -1394,6 +1394,12 @@ test('the published 0.1.13 agent is refreshed when unchanged and preserved when 
  * is the only honest input for these tests.
  */
 const HISTORICAL_AGENT_FIXTURES = Object.freeze([
+  {
+    version: '1.4.0',
+    path: join(ROOT, 'tests', 'fixtures', 'agent-1.4.0.toml'),
+    packed: 'cfb21bc510b47be27c5e64bce86c48cbc9a49055777cd265e118ed942a94d9a5',
+    lf: '2b2f6c35ffc9e99d98f38d00e07fef11de8bf96a9dd446e80889fcf92ba45cd8',
+  },
   {
     version: '1.3.2',
     path: join(ROOT, 'tests', 'fixtures', 'codex-agent-1.3.2.toml'),

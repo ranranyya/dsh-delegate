@@ -1,10 +1,16 @@
 # Runtime compatibility
 
-This document states which DSH runtimes this plugin build (`1.4.0`, package
-`dsh-taskbridge-1.4.0.tgz`) may be loaded into, what changed in the newest one, and what
+Build 1.4.1 keeps the supported DSH
+range unchanged. The history/review corrections are tested in temporary data
+directories and isolated package installations; they do not establish a production
+Desktop upgrade or live provider execution. The 1.4.0 measurement below remains a
+historical waiting-channel sample, not a new 1.4.1 token-saving claim.
+
+This document states which DSH runtimes this plugin build (`1.4.1`, package
+`dsh-taskbridge-1.4.1.tgz`) may be loaded into, what changed in the newest one, and what
 has and has not been verified on it. It is a compatibility note, not an acceptance
 report; the package is distributed through npm and the GitHub Release. See the
-[1.4.0 release notes](releases/1.4.0.zh.md) for upgrade details and the
+[1.4.1 release notes](releases/1.4.1.zh.md) for upgrade details and the
 [1.3.1 release report](releases/1.3.1.zh.md) for historical distribution verification.
 
 `1.1.0` added silent waiting: the global `monitoring` thresholds (self-check and attention
@@ -199,10 +205,10 @@ What remains genuinely unverified:
 
 ## 5. Upgrading from an older plugin build
 
-1. Download `dsh-taskbridge-1.4.0.tgz` from the GitHub Release, or build the package locally (`npm pack`).
+1. Download `dsh-taskbridge-1.4.1.tgz` from the GitHub Release, or build the package locally (`npm pack`).
 2. Install it the way your surface requires: the Desktop **Plugins manager** for a
    Desktop profile (npm/CLI operations on that profile are refused), or
-   `dsh plugin --profile <name> add ./dsh-taskbridge-1.4.0.tgz` for a CLI profile you
+   `dsh plugin --profile <name> add ./dsh-taskbridge-1.4.1.tgz` for a CLI profile you
    start yourself.
 3. The settings, the switch value and the task history are preserved
    (`$DSH_HOME/data/dsh-delegate`); nothing is migrated destructively.

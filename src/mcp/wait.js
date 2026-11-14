@@ -164,6 +164,24 @@ export function compactTask(task) {
   for (const key of TASK_FIELDS) {
     if (task[key] !== undefined) out[key] = task[key];
   }
+  // A wait NEVER carries the review note body: the conclusion's state, time and length are
+  // what a host needs to act, and the body is read on demand through `delegate_result`.
+  // The object is kept (with `noteOmitted`) so an old client cannot read "no note" as
+  // "not reviewed", and `reviewPersistence` states whether the conclusion is durable yet.
+  const acceptance = out.hostAcceptance;
+  if (acceptance !== null && typeof acceptance === 'object' && !Array.isArray(acceptance)) {
+    out.hostAcceptance = {
+      accepted: acceptance.accepted === true,
+      state: acceptance.state ?? null,
+      acceptedAt: acceptance.acceptedAt ?? null,
+      by: acceptance.by ?? null,
+      // Counted from the body when it is here, so the summary states the REAL length even
+      // on a view that carries the full note.
+      noteChars: acceptance.noteChars ?? (typeof acceptance.note === 'string' ? Array.from(acceptance.note).length : 0),
+      noteOmitted: true,
+    };
+  }
+  if (task.reviewPersistence !== undefined) out.reviewPersistence = task.reviewPersistence;
   // Activity and self-check are small, bounded summaries the engine produced for
   // exactly this purpose; they are carried whole rather than re-projected here.
   if (task.activity !== undefined) out.activity = task.activity;

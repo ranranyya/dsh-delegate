@@ -1,6 +1,18 @@
 # Codex integration contract
 
-Status: implemented in 1.4.0 (1.1.0 introduced wait rules, 1.2.0 added installed-integration upgrades, 1.4.0 clarifies outer long waits and explicit host-review recording). This automatic installer covers Codex. Claude Code uses the separate manual MCP guide.
+Status: implemented in 1.4.1 (1.1.0 introduced wait rules, 1.2.0 added installed-integration upgrades, 1.4.0 clarifies outer long waits and explicit host-review recording). This automatic installer covers Codex. Claude Code uses the separate manual MCP guide.
+
+1.4.1 recognizes the exact unmodified
+1.4.0 companion in LF and CRLF forms, and updates the review contract: a completed
+task may be read and reviewed by its original identity after a restart. History
+does not restore execution or old permissions. Reviews are confirmed only when
+`reviewPersistence.durable` is true (`state: "saved"`); `saving` or `timed-out`
+means the write is still unconfirmed, and `failed` permits a retry. Ordinary waits
+omit review prose. A result that reports `noteOmitted: true` can be read with
+`delegate_result` plus `reviewNoteOffset` and optional `reviewNoteLimit` (1–2000
+Unicode code points per page, default 2000); follow `nextOffset` until `complete`.
+Review notes accept up to 8000 code points after trimming and are stored redacted.
+See the [release notes](releases/1.4.1.zh.md) for validation boundaries.
 
 This document is the contract between the plugin's settings page (browser half),
 the host-side installer (`src/codex/installer.js`) and the two files it manages.
@@ -515,7 +527,7 @@ successful diagnosis.
 ```jsonc
 {
   "codexHome": "…",
-  "packageVersion": "1.4.0",
+  "packageVersion": "1.4.1",
   "boundary": { "blocked": false, "link": null, "unknown": false, "home": "directory", "agents": "directory" },
   "agent": {
     "path": "…", "state": "installed", "installed": true, "managed": true,

@@ -1,5 +1,7 @@
 # DSH TaskBridge
 
+Version 1.4.1 adds review after restart, confirmed persistence, 8000-code-point review notes and compact waiting with on-demand full-note reads. Install `dsh-taskbridge@1.4.1` or use its release tarball. See the [release notes](releases/1.4.1.zh.md).
+
 Let Claude Code or Codex direct DSH tasks. Choose the execution API, model and supported reasoning effort in the DSH plugin settings.
 
 The host plans, dispatches and reviews; DSH executes using the effective configuration. Follow-up corrections explicitly continue the same task conversation and execution checkout. Providers come from DSH's existing API connections, without copying their credentials into the plugin.
@@ -14,4 +16,4 @@ Codex has a managed agent/MCP installation button. Version 1.3.2 names the compa
 
 Version 1.3.1 adopts DSH TaskBridge and the package identity `dsh-taskbridge`, replacing `dsh-delegate` and the GitHub-only `dsh-taskdispatch` 1.3.0. Read the [upgrade guide](taskbridge-upgrade.md) before replacing an old installation. Historical data, MCP tools, environment variables and the Codex `dsh-delegate` technical identifier remain compatible. Do not run old and new bundles together.
 
-In DSH's Add plugin dialog, use `dsh-taskbridge@1.4.0`; use the official npm registry if a regional mirror has not synchronized yet. Distribution also uses GitHub releases and a [DSH custom plugin index](plugin-market.md) pinned to exact Git commits. This is not universal official marketplace inclusion. A single same-model, approximately 45-second waiting comparison reduced recorded waiting-response tokens by 66.58% (3 model responses to 1); this is not a full-task or billing reduction. See the [measurement report](releases/1.4.0-token-benchmark.zh.md). Client time limits and full Desktop upgrade behavior require environment-specific verification.
+In DSH's Add plugin dialog, use `dsh-taskbridge@1.4.1`; use the official npm registry if a regional mirror has not synchronized yet. Distribution also uses GitHub releases and a [DSH custom plugin index](plugin-market.md) pinned to exact Git commits. This is not universal official marketplace inclusion. A single same-model, approximately 45-second waiting comparison reduced recorded waiting-response tokens by 66.58% (3 model responses to 1); this is not a full-task or billing reduction. See the [measurement report](releases/1.4.0-token-benchmark.zh.md). Client time limits and full Desktop upgrade behavior require environment-specific verification.

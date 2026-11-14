@@ -20,6 +20,8 @@ import { fenceExternalConnection } from '../auth/fence.js';
 import { AUTH_CODES } from '../auth/grants.js';
 import { classifyError, HttpError, readJsonBody, sendJson } from '../http/respond.js';
 import { preflightWorkspace } from '../workspace/preflight.js';
+import { redactText } from '../config/redact.js';
+import { REVIEW_NOTE_MAX_CHARS, normalizeReviewNote, reviewNoteOverflow } from '../jobs/review-note.js';
 
 /** Route prefix owned by this plane. Deliberately not under `/api`. */
 export const EXECUTION_PREFIX = '/dsh-delegate/x';
@@ -254,14 +256,30 @@ async function getTask({ req, res, connection, deps }) {
   if (typeof body.taskId !== 'string') {
     throw new HttpError(400, 'TASK_ID_REQUIRED', 'taskId is required');
   }
-  const task = deps.engine.get(body.taskId);
-  if (task.connectionId !== connection.connectionId) {
-    // Cross-connection reads are reported as absent, not as forbidden: a
-    // distinct code would confirm that a task id exists.
-    throw new HttpError(404, 'JOB_TASK_NOT_FOUND', 'no such task for this connection');
+  // The live map first (unchanged, synchronous), then the durable record of a finished
+  // task this connection owns. A restored row is evidence only: it is never re-executable.
+  let task;
+  try {
+    task = deps.engine.get(body.taskId);
+    if (task.connectionId !== connection.connectionId) {
+      // Cross-connection reads are reported as absent, not as forbidden: a
+      // distinct code would confirm that a task id exists.
+      throw new HttpError(404, 'JOB_TASK_NOT_FOUND', NOT_FOUND_MESSAGE);
+    }
+  } catch (error) {
+    if (error?.code !== 'JOB_TASK_NOT_FOUND' || typeof deps.engine.storedTaskRow !== 'function') throw error;
+    const row = await deps.engine.storedTaskRow(body.taskId, connection.connectionId);
+    // ONE answer for unknown, foreign and ownerless: the same status, code and message, so
+    // the reply cannot be used to learn that a task id exists on another connection.
+    if (row === null) throw new HttpError(404, 'JOB_TASK_NOT_FOUND', NOT_FOUND_MESSAGE);
+    sendJson(res, 200, { ok: true, task: deps.engine.historyViewOf(row) });
+    return;
   }
   sendJson(res, 200, { ok: true, task });
 }
+
+/** The one refusal for a task this caller cannot prove: unknown, foreign or ownerless. */
+const NOT_FOUND_MESSAGE = 'no such task for this connection';
 
 async function cancelTask({ req, res, connection, deps }) {
   const body = await readJsonBody(req);
@@ -324,8 +342,16 @@ async function decidePermission({ req, res, connection, deps }) {
 /** Body fields `POST /tasks/review` accepts. Everything else is refused. */
 const REVIEW_FIELDS = Object.freeze(['taskId', 'decision', 'note']);
 
-/** Longest review note the route will even read, in characters. */
-const REVIEW_NOTE_MAX_CHARS = 1_000;
+/**
+ * Longest review note the route will even read, in Unicode code points.
+ *
+ * Re-exported from the one shared definition (`src/jobs/review-note.js`) so the MCP
+ * schema, this route, the engine and the durable history projection cannot drift: a note
+ * this route accepts but the engine cuts would be recorded as something the caller never
+ * wrote. Code points, not UTF-16 units, so a Chinese or emoji note gets the same room as
+ * an ASCII one and a surrogate pair is never split.
+ */
+export const REVIEW_NOTE_LIMIT_CODE_POINTS = REVIEW_NOTE_MAX_CHARS;
 
 /**
  * Record the commander's delivery review of one finished task.
@@ -351,19 +377,38 @@ async function recordHostReview({ req, res, connection, deps }) {
   if (body.decision !== 'accepted' && body.decision !== 'changes-requested') {
     throw new HttpError(400, 'REVIEW_DECISION_INVALID', 'decision must be accepted or changes-requested');
   }
-  if (typeof body.note !== 'string' || body.note.trim() === '') {
+  const note = normalizeReviewNote(body.note);
+  if (note === '') {
     throw new HttpError(400, 'REVIEW_NOTE_REQUIRED', 'note must be a non-empty string');
   }
-  if (body.note.trim().length > REVIEW_NOTE_MAX_CHARS) {
-    throw new HttpError(400, 'REVIEW_NOTE_TOO_LONG', `note must be at most ${REVIEW_NOTE_MAX_CHARS} characters`);
+  if (Array.from(note).length > REVIEW_NOTE_MAX_CHARS) {
+    // The same facts the engine reports: the actual length and the bound, in the same
+    // unit. Nothing is written and no existing record is touched.
+    const overflow = reviewNoteOverflow(note);
+    throw new HttpError(400, 'REVIEW_NOTE_TOO_LONG', overflow.message, {
+      limit: overflow.limit,
+      length: overflow.length,
+      unit: 'unicode-code-points',
+    });
   }
-  const result = await deps.engine.recordHostReview({
-    // The verified connection, not `body.connectionId`: a caller cannot name an owner.
-    connectionId: connection.connectionId,
-    taskId: body.taskId,
-    decision: body.decision,
-    note: body.note,
-  });
+  let result;
+  try {
+    result = await deps.engine.recordHostReview({
+      // The verified connection, not `body.connectionId`: a caller cannot name an owner.
+      connectionId: connection.connectionId,
+      taskId: body.taskId,
+      decision: body.decision,
+      note,
+    });
+  } catch (error) {
+    // A finished task read back from durable history (after a restart) is reviewed through
+    // the same rules, against the stored record. Any OTHER refusal keeps its own code.
+    if (error?.code !== 'JOB_TASK_NOT_FOUND' || typeof deps.engine.recordHistoricalReview !== 'function') throw error;
+    result = await deps.engine.recordHistoricalReview({
+      taskId: body.taskId,
+      connectionId: connection.connectionId,
+    }, body.decision, redactText(note), null);
+  }
   sendJson(res, 200, { ok: true, ...result });
 }
 
@@ -423,10 +468,81 @@ async function observeTask({ req, res, connection, deps }) {
     // and writing to a closed response would only throw into the refusal path.
     if (abandonment.abandoned() || !isWritable(res)) return;
     sendJson(res, 200, { ok: true, ...observation });
+  } catch (error) {
+    if (error?.code !== 'JOB_TASK_NOT_FOUND' || typeof deps.engine.storedTaskRow !== 'function') throw error;
+    // A finished task that survived a restart is reported AT ONCE as its stored outcome.
+    // It is never waited on: there is no live executor, and an old stored permission
+    // request can never be decided, so this must not enter a wait loop.
+    const observation = await historyObservation(deps, body.taskId, connection);
+    if (abandonment.abandoned() || !isWritable(res)) return;
+    sendJson(res, 200, { ok: true, wait: { waitMs, waitedMs: 0, activitySinceWait: false }, ...observation });
   } finally {
     abandonment.dispose();
   }
 }
+
+/**
+ * The immediate observation of one stored (restarted) task.
+ *
+ * The reason follows the stored terminal state exactly (`failed`, `cancelled`,
+ * `interrupted`, or `ready` for a run awaiting review), so a restored failure is never
+ * reported as a result to review. The summary is the COMPACT observation shape, not the
+ * full record: no execution text, no diff and no review note travel on a wait, and no
+ * permission request is ever offered — an old one can never be decided.
+ * @param {object} deps - handler deps.
+ * @param {string} taskId - requested task id.
+ * @param {object} connection - verified connection.
+ * @returns {Promise<object>} observation fields.
+ */
+async function historyObservation(deps, taskId, connection) {
+  const row = await deps.engine.storedTaskRow(taskId, connection.connectionId);
+  if (row === null) throw new HttpError(404, 'JOB_TASK_NOT_FOUND', NOT_FOUND_MESSAGE);
+  const view = deps.engine.historyViewOf(row);
+  const reason = HISTORY_REASON[row.state] ?? 'ready';
+  const acceptance = view.hostAcceptance === null ? null : view.hostAcceptance;
+  return {
+    task: {
+      taskId: view.taskId,
+      state: view.state,
+      phase: view.phase,
+      title: view.title ?? null,
+      createdAt: view.createdAt ?? null,
+      startedAt: view.startedAt ?? null,
+      endedAt: view.endedAt ?? null,
+      route: view.route ?? null,
+      connectionId: view.connectionId ?? null,
+      selfApproved: false,
+      // The CONCLUSION's status and time, never its body: a wait stays short (R5) and the
+      // full note is read on demand through `delegate_result`.
+      hostAcceptance: acceptance === null
+        ? null
+        : {
+          accepted: acceptance.accepted === true,
+          state: acceptance.state ?? null,
+          acceptedAt: acceptance.acceptedAt ?? null,
+          by: acceptance.by ?? null,
+          noteChars: acceptance.noteChars ?? 0,
+          noteOmitted: true,
+        },
+      reviewPersistence: view.reviewPersistence,
+      source: 'history',
+      evidence: view.evidence,
+    },
+    reason,
+    permission: null,
+    failure: null,
+    activity: null,
+    selfCheck: null,
+  };
+}
+
+/** The observation reason of a stored terminal state. */
+const HISTORY_REASON = Object.freeze({
+  'awaiting-host-review': 'ready',
+  failed: 'failed',
+  cancelled: 'cancelled',
+  interrupted: 'interrupted',
+});
 
 /**
  * Watch one request/response pair for a real, premature disconnect.

@@ -82,6 +82,12 @@ import { REVIEW_STATES, reviewWork } from '../review/reviewer.js';
 import { buildReviewPrompt, buildWorkerPrompt } from '../review/prompts.js';
 import { captureBaseline, captureDiff } from '../workspace/audit.js';
 import { LOCK_CODES, WorkspaceError, resolveWorkspacePath } from '../workspace/locks.js';
+import {
+  REVIEW_NOTE_MAX_CHARS,
+  normalizeReviewNote,
+  reviewNoteLength,
+  reviewNoteOverflow,
+} from './review-note.js';
 
 /** Task lifecycle states. `awaiting-host-review` is terminal for this plugin. */
 export const TASK_STATES = Object.freeze({
@@ -211,7 +217,36 @@ export const HOST_REVIEW_STATES = Object.freeze({
 });
 
 /** Bounds on a review note: non-empty for a decision, and never unbounded. */
-const REVIEW_NOTE_MAX_CHARS = 1_000;
+const REVIEW_NOTE_MAX = REVIEW_NOTE_MAX_CHARS;
+
+/**
+ * Where a review decision is in its journey to durable storage.
+ *
+ * `saving` means "accepted for writing, durability not yet confirmed" — deliberately NOT
+ * acceptance: `hostAcceptance` stays null until the store has answered. `failed` is a
+ * settled failure a retry may leave. `timed-out` is UNCONFIRMED: the write is still in
+ * flight and may yet land, so it is neither failure nor success. A process restart holds
+ * no saving state; the disk is the only fact that outlives the process.
+ */
+export const REVIEW_PERSISTENCE_STATES = Object.freeze({
+  none: 'none',
+  saving: 'saving',
+  saved: 'saved',
+  failed: 'failed',
+  timedOut: 'timed-out',
+});
+
+/**
+ * How long ONE review request waits for its durable write.
+ *
+ * A bound on the REQUEST, never on the write: exceeding it answers "still saving" and
+ * leaves the write running, so a slow disk costs a deferred answer instead of a fabricated
+ * failure — and the late outcome is what the engine publishes afterwards.
+ */
+const REVIEW_WRITE_TIMEOUT_MS = HISTORY_WRITE_TIMEOUT_MS;
+
+/** Returned by `raceOutcome` when its bound expired first. */
+const REVIEW_OUTCOME_TIMEOUT = Symbol('review-write-timeout');
 
 /** The fixed marker recorded as the reviewer, so a stored decision is not a free name. */
 const HOST_REVIEW_BY = 'host-commander';
@@ -273,6 +308,17 @@ export const OBSERVE_TASK_REASONS = Object.freeze({
  */
 const OBSERVE_WAIT_MS = 25_000;
 const OBSERVE_SLICE_MS = 1000;
+
+/**
+ * How much of an observation's own bound is kept back when it waits for a review write.
+ *
+ * An observation must be answerable WITHIN the bound the caller asked for, so the wait for
+ * a still-running review write stops this much short of it and leaves room to build and
+ * return the answer. Without the margin a wait that used the whole budget would answer
+ * after its own deadline, which is exactly the kind of overrun the bounded observation was
+ * introduced to remove.
+ */
+const OBSERVE_REVIEW_SETTLE_MARGIN_MS = 250;
 
 /** Raised for job-level refusals. */
 export class JobError extends Error {
@@ -347,9 +393,15 @@ export class JobEngine {
     // Observers currently waiting, so disposal can release them without touching
     // the workers they were only watching.
     this.observers = new Set();
-    // One in-flight host-review write per task, so two concurrent identical requests
-    // cannot both claim success before the durable write has actually landed.
-    this.reviewWrites = new Map();
+    // One in-flight host-review write per task, plus the state of the last one, so two
+    // concurrent identical requests cannot both claim success before the durable write has
+    // landed — and so a write that outlived its request can still publish its outcome.
+    // Keyed by task id; see {@link beginReviewWrite} for the acceptance rule.
+    this.reviewState = new Map();
+    // Monotonic token for review writes. Not per task: a token is compared against the
+    // entry it belongs to, so a global counter is enough and cannot wrap into confusion
+    // with a task's own numbering.
+    this.reviewSeq = 0;
     this.listen();
   }
 
@@ -613,7 +665,8 @@ export class JobEngine {
       cleanupError: null,
       historyError: null,
       historySavedAt: null,
-      // Host acceptance is never granted here; it is the host's own record.
+      // Host acceptance is never granted here; it is the host's own record, and it is
+      // published only once the durable write has CONFIRMED it (see `recordHostReview`).
       hostAcceptance: null,
       settled,
       settle: () => { settle(); },
@@ -2248,12 +2301,24 @@ export class JobEngine {
    *  5. an existing decision is final: the SAME conclusion with the SAME note is an
    *     idempotent no-op, and a DIFFERENT one is refused (a correction is a follow-up
    *     task, not a rewrite of the record);
-   *  6. only then is it stored, and only reported as stored when the durable write
-   *     succeeded.
+   *  6. only then is it stored — and the conclusion becomes visible ONLY once the durable
+   *     write has confirmed it.
+   *
+   * Step 6 is the persistence contract: the decision is NOT put in
+   * `task.hostAcceptance` before the store answers, so an ordinary read never shows a
+   * conclusion the disk does not have. The request waits at most
+   * {@link REVIEW_WRITE_TIMEOUT_MS}; exceeding it is UNCONFIRMED, not failed — the write
+   * keeps running, the answer reports `reviewPersistence.state === 'timed-out'` with no
+   * decision, and the late outcome updates memory either way. Writes are serialized per
+   * task, and every attempt carries a token so a stale write cannot land on a newer
+   * conclusion.
    * @param {object} request - `taskId`, `decision`, `note`, and the authenticated
-   *   `connectionId` (from the plane, never from the caller's body).
-   * @returns {Promise<object>} `{ task, hostAcceptance }` where `task` is the public view.
-   * @throws {JobError} on any refusal.
+   *   `connectionId` (from the plane, never from the caller's body). An optional integer
+   *   `waitMs` bounds how long THIS CALL waits for durability (0 = the engine default).
+   * @returns {Promise<object>} `{ task, hostAcceptance, reviewPersistence }` where `task`
+   *   is the public view. `hostAcceptance` is non-null only for a confirmed decision.
+   * @throws {JobError} on any refusal, and with `JOB_REVIEW_NOT_PERSISTED` once the write
+   *   has genuinely FAILED (a timeout throws nothing).
    */
   async recordHostReview(request) {
     const connectionId = typeof request?.connectionId === 'string' ? request.connectionId : null;
@@ -2265,23 +2330,7 @@ export class JobEngine {
     if (taskId === '') {
       throw new JobError(JOB_CODES.reviewInvalid, 'taskId is required', { field: 'taskId' });
     }
-    const decision = request?.decision;
-    if (decision !== HOST_REVIEW_STATES.accepted && decision !== HOST_REVIEW_STATES.changesRequested) {
-      throw new JobError(JOB_CODES.reviewInvalid,
-        `decision must be ${HOST_REVIEW_STATES.accepted} or ${HOST_REVIEW_STATES.changesRequested}`,
-        { field: 'decision' });
-    }
-    const rawNote = typeof request?.note === 'string' ? request.note.trim() : '';
-    if (rawNote === '') {
-      throw new JobError(JOB_CODES.reviewInvalid, 'note must be a non-empty string', { field: 'note' });
-    }
-    if (rawNote.length > REVIEW_NOTE_MAX_CHARS) {
-      throw new JobError(JOB_CODES.reviewInvalid, `note must be at most ${REVIEW_NOTE_MAX_CHARS} characters`, {
-        field: 'note',
-        limit: REVIEW_NOTE_MAX_CHARS,
-        length: rawNote.length,
-      });
-    }
+    const { decision, note: rawNote } = reviewInput(request);
 
     const task = this.tasks.get(taskId);
     if (task === undefined || task.connectionId !== connectionId) {
@@ -2305,100 +2354,282 @@ export class JobEngine {
     }
 
     // The note is redacted through the same bounded redaction the rest of the projection
-    // uses, so a stored conclusion cannot smuggle a credential into history or a view.
-    const note = redactText(rawNote).slice(0, REVIEW_NOTE_MAX_CHARS);
-
-    // One review write per task at a time. Without this, a second identical request
-    // arriving while the first is still awaiting `history.save` would see the in-memory
-    // record and answer "idempotent success" before that write had actually landed — and
-    // if the write then failed, BOTH callers would have been told something that was not
-    // true. The latch is a promise chained on the previous attempt, so a failed write
-    // releases it and the next caller re-attempts rather than hanging.
-    const previous = this.reviewWrites.get(taskId) ?? Promise.resolve();
-    // A rejected predecessor must not poison the chain: every caller retries the write
-    // itself, it does not inherit the failure.
-    const attempt = previous.then(
-      () => this.applyHostReview(task, decision, note),
-      () => this.applyHostReview(task, decision, note),
-    );
-    // Store a latched (never-rejecting) form, so the next caller can chain on it without
-    // an unhandled rejection, and so a failure genuinely frees the duty to re-attempt.
-    const latched = attempt.then(() => undefined, () => undefined);
-    this.reviewWrites.set(taskId, latched);
-    try {
-      return await attempt;
-    } finally {
-      // Only the LAST attempt clears the latch. An earlier attempt finishing late must not
-      // expose a window in which a newer writer is not serialised behind it.
-      if (this.reviewWrites.get(taskId) === latched) this.reviewWrites.delete(taskId);
-    }
+    // uses, so a stored conclusion cannot smuggle a credential into history or a view. It
+    // is NOT cut here: the bound was already enforced above.
+    const note = redactText(rawNote);
+    const entry = this.beginReviewWrite(task, decision, note);
+    return await this.awaitReviewWrite(task, entry, reviewWaitMs(request));
   }
 
   /**
-   * Apply one already-validated review decision and make it durable.
-   *
-   * Split out of {@link recordHostReview} so the caller can SERIALISE it per task: the
-   * read of the existing record, the decision and the durable write must happen as one
-   * step, or two concurrent identical requests could both observe "no decision yet" and
-   * both claim success before either had written anything.
-   * @param {object} task - the task record, already proven reviewable and owned.
-   * @param {string} decision - `accepted` or `changes-requested`.
-   * @param {string} note - already redacted and bounded.
-   * @returns {Promise<object>} `{ task, hostAcceptance }` public views.
-   * @throws {JobError} on a conflicting decision or a failed durable write.
+   * Begin (or join) the durable write of one review decision. Only a write that is
+   * genuinely IN FLIGHT locks the conclusion: `saving`/`timed-out` join the same
+   * conclusion and refuse a different one; `failed` with no confirmed record frees the
+   * conclusion for a new attempt; `saved` replays idempotently or refuses a conflict.
+   * @param {object} task - task record (already proven reviewable and owned).
+   * @param {string} decision - validated decision.
+   * @param {string} note - normalized, redacted note.
+   * @returns {object} the persistence entry this request must wait on.
+   * @throws {JobError} when a different conclusion is recorded or already in flight.
    */
-  async applyHostReview(task, decision, note) {
-    const existing = task.hostAcceptance;
-    if (existing !== null && existing !== undefined) {
-      if (existing.state === decision && existing.note === note) {
-        // The same conclusion replayed: an idempotent success, not a second record. It is
-        // only reached AFTER the first attempt settled, so a first write that failed was
-        // already rolled back and this caller really does record it.
-        const replayed = this.view(task);
-        return { task: replayed, hostAcceptance: replayed.hostAcceptance };
+  beginReviewWrite(task, decision, note) {
+    if (this.history === null || this.history === undefined || typeof this.history.save !== 'function') {
+      // `persistHistory` answers success for the missing-store posture, which would let a
+      // review be claimed as saved when nothing was written, so this is refused up front.
+      throw this.reviewNotPersisted(
+        'no durable history store is configured, so the review decision was not recorded', task, null,
+      );
+    }
+    const current = this.reviewState.get(task.taskId) ?? null;
+    const recorded = task.hostAcceptance ?? null;
+
+    if (current !== null) {
+      if (current.state === REVIEW_PERSISTENCE_STATES.saved) {
+        return this.replayOrRefuse(task, recorded, decision, note);
       }
-      throw new JobError(JOB_CODES.reviewNotReviewable,
-        'this task already has a recorded review; send a follow-up task to record a correction', {
-          taskId: task.taskId,
-          state: task.state,
-          recorded: existing.state,
-          requested: decision,
-        });
+      if (current.state === REVIEW_PERSISTENCE_STATES.saving
+        || current.state === REVIEW_PERSISTENCE_STATES.timedOut) {
+        if (current.decision === decision && current.note === note) return current;
+        throw new JobError(JOB_CODES.reviewNotReviewable,
+          'a different review decision is being recorded for this task; wait for it or send a follow-up task', {
+            taskId: task.taskId,
+            state: task.state,
+            recorded: current.decision,
+            requested: decision,
+            persistence: current.state,
+          });
+      }
+      // `failed`: nothing was recorded, so this is a genuine new attempt.
     }
 
-    task.hostAcceptance = {
-      accepted: decision === HOST_REVIEW_STATES.accepted,
-      state: decision,
-      acceptedAt: this.clock(),
-      by: HOST_REVIEW_BY,
+    if (recorded !== null && recorded !== undefined) {
+      return this.replayOrRefuse(task, recorded, decision, note);
+    }
+
+    const entry = {
+      state: REVIEW_PERSISTENCE_STATES.saving,
+      decision,
       note,
+      token: (this.reviewSeq ?? 0) + 1,
+      startedAt: this.clock(),
+      confirmedAt: null,
+      error: null,
     };
-    // The record must be durable before the caller is told it exists: a review that is
-    // lost on restart would silently put the task back to "not reviewed". With no history
-    // store at all — or one with no `save` to call — there is nothing to write to, and
-    // `persistHistory` answers success for that case (it is the ordinary "no durable
-    // history" posture), which would let a review be claimed as saved when it is not.
-    if (this.history === null || this.history === undefined || typeof this.history.save !== 'function') {
-      task.hostAcceptance = null;
-      throw new JobError(JOB_CODES.reviewNotPersisted,
-        'no durable history store is configured, so the review decision was not recorded', {
-          taskId: task.taskId,
-          historyError: null,
-        });
+    this.reviewSeq = entry.token;
+    this.reviewState.set(task.taskId, entry);
+    // Started, deliberately not awaited: the request bounds how long IT waits, not how
+    // long the write may take. A write still running when the request stops waiting must
+    // be allowed to finish and publish its outcome.
+    entry.done = this.writeReview(task, entry);
+    entry.done.catch(() => undefined);
+    return entry;
+  }
+
+  /**
+   * Answer a request whose conclusion is already the recorded one, or refuse a conflict.
+   * @param {object} task - task record.
+   * @param {object} recorded - the recorded `hostAcceptance`.
+   * @param {string} decision - requested decision.
+   * @param {string} note - requested note.
+   * @returns {object} the saved persistence entry.
+   * @throws {JobError} on a different conclusion.
+   */
+  replayOrRefuse(task, recorded, decision, note) {
+    if (recorded !== null && recorded !== undefined
+      && recorded.state === decision && recorded.note === note) {
+      return { state: REVIEW_PERSISTENCE_STATES.saved, decision, note, token: -1, done: Promise.resolve(true) };
     }
-    const saved = await this.persistHistory(task);
-    if (saved !== true) {
-      // The in-memory record is rolled back so the two cannot disagree, and the caller is
-      // told the decision was NOT saved rather than being told it succeeded.
-      task.hostAcceptance = null;
-      throw new JobError(JOB_CODES.reviewNotPersisted,
-        'the review decision could not be written to history, so it was not recorded', {
-          taskId: task.taskId,
-          historyError: task.historyError ?? null,
-        });
+    throw new JobError(JOB_CODES.reviewNotReviewable,
+      'this task already has a recorded review; send a follow-up task to record a correction', {
+        taskId: task.taskId,
+        state: task.state,
+        recorded: recorded?.state ?? null,
+        requested: decision,
+      });
+  }
+
+  /**
+   * Write one review decision to the durable store and publish its real outcome.
+   *
+   * Success publishes `task.hostAcceptance` and marks `saved` — this is the only place a
+   * review becomes visible. Failure marks `failed`, records `historyError` and leaves
+   * `hostAcceptance` null so a retry is legal. An outcome whose token is no longer current
+   * is discarded: a stale write must never overwrite a newer conclusion.
+   *
+   * The view is snapshotted here WITH the decision, because the decision is not in memory
+   * until the write lands: the durable record says exactly what the request said.
+   * @param {object} task - task record.
+   * @param {object} entry - the persistence entry being written.
+   * @returns {Promise<boolean>} true when the decision is durable.
+   */
+  async writeReview(task, entry) {
+    let view;
+    try {
+      view = this.viewForReviewWrite(task, entry);
+      await this.history.save(view);
+    } catch (error) {
+      this.settleReviewWrite(task, entry, false, {
+        code: typeof error?.code === 'string' ? error.code : JOB_CODES.historyFailed,
+        message: diagnostic(error?.message ?? error, 300),
+      });
+      return false;
     }
+    this.settleReviewWrite(task, entry, true, null);
+    return true;
+  }
+
+  /**
+   * Publish (or discard) the outcome of one review write.
+   * @param {object} task - task record.
+   * @param {object} entry - persistence entry.
+   * @param {boolean} ok - whether the decision is durable.
+   * @param {object | null} error - bounded history error when not.
+   * @returns {void}
+   */
+  settleReviewWrite(task, entry, ok, error) {
+    if (this.reviewState.get(task.taskId) !== entry) return;
+    if (entry.state === REVIEW_PERSISTENCE_STATES.saved) return;
+    if (ok) {
+      task.hostAcceptance = {
+        accepted: entry.decision === HOST_REVIEW_STATES.accepted,
+        state: entry.decision,
+        acceptedAt: entry.startedAt,
+        by: HOST_REVIEW_BY,
+        note: entry.note,
+      };
+      task.historyError = null;
+      task.historySavedAt = this.clock();
+      entry.state = REVIEW_PERSISTENCE_STATES.saved;
+      entry.confirmedAt = this.clock();
+      entry.error = null;
+      return;
+    }
+    task.hostAcceptance = null;
+    task.historyError = error;
+    task.historySavedAt = null;
+    entry.state = REVIEW_PERSISTENCE_STATES.failed;
+    entry.error = error;
+  }
+
+  /**
+   * Wait for one review write, boundedly, and answer honestly about where it got to.
+   *
+   * Exceeding the bound is NOT a failure: the write is still running and may yet land, so
+   * the caller is answered `timed-out` with `pending: true` and no decision. Reporting a
+   * timeout as `JOB_REVIEW_NOT_PERSISTED` is the defect this replaces.
+   * @param {object} task - task record.
+   * @param {object} entry - persistence entry being awaited.
+   * @param {number} timeoutMs - wait bound in milliseconds (0 = engine default).
+   * @returns {Promise<object>} `{ task, hostAcceptance, reviewPersistence }`, JSON-safe.
+   * @throws {JobError} when the write has actually failed.
+   */
+  async awaitReviewWrite(task, entry, timeoutMs) {
+    if (entry.state !== REVIEW_PERSISTENCE_STATES.saved) {
+      const bound = Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : REVIEW_WRITE_TIMEOUT_MS;
+      const outcome = await raceOutcome(entry.done, bound);
+      if (outcome === REVIEW_OUTCOME_TIMEOUT
+        && this.reviewState.get(task.taskId) === entry
+        && entry.state === REVIEW_PERSISTENCE_STATES.saving) {
+        entry.state = REVIEW_PERSISTENCE_STATES.timedOut;
+      }
+    }
+    if (entry.state === REVIEW_PERSISTENCE_STATES.saved) {
+      const view = this.view(task);
+      return { task: view, hostAcceptance: view.hostAcceptance, reviewPersistence: view.reviewPersistence };
+    }
+    if (entry.state === REVIEW_PERSISTENCE_STATES.timedOut) {
+      const view = this.view(task);
+      return { task: view, hostAcceptance: view.hostAcceptance, reviewPersistence: view.reviewPersistence };
+    }
+    throw this.reviewNotPersisted(
+      'the review decision could not be written to history, so it was not recorded',
+      task,
+      entry.error ?? task.historyError ?? null,
+    );
+  }
+
+  /**
+   * The in-flight review write of one task, if any.
+   *
+   * In-process only: the public projection carries no promise (JSON cannot), so a wire
+   * consumer reads `reviewPersistence` and re-reads the task.
+   * @param {string} taskId - task id.
+   * @returns {Promise<boolean> | null} the write's own promise, or null when none is running.
+   */
+  reviewWriteDone(taskId) {
+    const entry = this.reviewState.get(taskId) ?? null;
+    if (entry === null || typeof entry.done?.then !== 'function') return null;
+    if (entry.state !== REVIEW_PERSISTENCE_STATES.saving && entry.state !== REVIEW_PERSISTENCE_STATES.timedOut) return null;
+    return entry.done;
+  }
+
+  /**
+   * The refusal for a review that was not (and will not be) durable.
+   * @param {string} message - explanation.
+   * @param {object} task - task record.
+   * @param {object | null} historyError - bounded history error.
+   * @returns {JobError} the refusal, with the task's persistence state attached.
+   */
+  reviewNotPersisted(message, task, historyError) {
     const view = this.view(task);
-    return { task: view, hostAcceptance: view.hostAcceptance };
+    return new JobError(JOB_CODES.reviewNotPersisted, message, {
+      taskId: task.taskId,
+      historyError,
+      reviewPersistence: view.reviewPersistence,
+    });
+  }
+
+  /**
+   * The public record of where a task's review decision is in its write.
+   *
+   * `hostAcceptance` answers "what conclusion is recorded?"; this answers "is it durable
+   * yet?". Both are JSON data only — no promise, no handle — so they survive a wire hop.
+   * @param {object} task - task record.
+   * @returns {object} bounded persistence block.
+   */
+  reviewPersistenceView(task) {
+    const entry = this.reviewState?.get(task.taskId) ?? null;
+    const recorded = task.hostAcceptance ?? null;
+    if (entry !== null) {
+      const durable = entry.state === REVIEW_PERSISTENCE_STATES.saved;
+      return {
+        state: entry.state,
+        decision: entry.decision,
+        // Only a DURABLE decision can be acceptance, and only the document can say it is
+        // durable: an in-flight entry never does.
+        accepted: durable && recorded?.accepted === true && recorded?.state === entry.decision,
+        durable,
+        pending: entry.state === REVIEW_PERSISTENCE_STATES.saving || entry.state === REVIEW_PERSISTENCE_STATES.timedOut,
+        startedAt: entry.startedAt ?? null,
+        confirmedAt: entry.confirmedAt ?? null,
+        retryable: entry.state === REVIEW_PERSISTENCE_STATES.failed,
+        error: entry.error ?? null,
+      };
+    }
+    if (recorded !== null && recorded !== undefined) {
+      return {
+        state: REVIEW_PERSISTENCE_STATES.saved,
+        decision: recorded.state ?? null,
+        accepted: recorded.accepted === true,
+        durable: true,
+        pending: false,
+        startedAt: null,
+        confirmedAt: recorded.acceptedAt ?? null,
+        retryable: false,
+        error: null,
+      };
+    }
+    return {
+      state: REVIEW_PERSISTENCE_STATES.none,
+      decision: null,
+      accepted: false,
+      durable: false,
+      pending: false,
+      startedAt: null,
+      confirmedAt: null,
+      retryable: false,
+      error: null,
+    };
   }
 
   /**
@@ -3103,6 +3334,13 @@ export class JobEngine {
     // outstanding permission request, which is decidable right now.
     const immediate = this.settleReason(task);
     if (immediate !== null) {
+      // Except for one thing a settled run can still change: its review decision may be
+      // mid-write. Waiting for that write is what lets a caller who lost the answer to a
+      // timed-out review learn the outcome here, instead of re-sending a decision (or
+      // believing the review vanished). The wait is bounded and the report is honest
+      // either way; nothing about the task's state is touched.
+      const settledObservation = await this.awaitReviewSettlement(task, waitMs, signal);
+      if (settledObservation !== null) return settledObservation;
       return this.observationOf(task, immediate, monitor, waitMs, 0, false);
     }
 
@@ -3125,6 +3363,36 @@ export class JobEngine {
     // different decision.
     const failure = reason === OBSERVE_TASK_REASONS.attention ? (outcome.failure ?? null) : null;
     return this.observationOf(task, reason, monitor, waitMs, outcome.waitedMs, outcome.activitySinceWait, failure);
+  }
+
+  /**
+   * Wait — boundedly — for a task's in-flight review write to settle.
+   *
+   * Only an UNCONFIRMED write is waited for: a saved decision is already visible in the
+   * ordinary observation, and no write at all is the ordinary case. This never changes the
+   * task's state and never decides anything; it only delays the answer so that a caller
+   * who lost the reply to a slow review can still find out what happened.
+   * @param {object} task - task record.
+   * @param {number} waitMs - the caller's own wait bound.
+   * @param {AbortSignal | null} signal - the caller's cancellation.
+   * @returns {Promise<object | null>} an observation when the wait changed the answer, else null.
+   */
+  async awaitReviewSettlement(task, waitMs, signal) {
+    const entry = this.reviewState.get(task.taskId) ?? null;
+    if (entry === null) return null;
+    if (entry.state !== REVIEW_PERSISTENCE_STATES.saving && entry.state !== REVIEW_PERSISTENCE_STATES.timedOut) return null;
+    if (entry.done === undefined) return null;
+    const bound = Math.max(0, waitMs - OBSERVE_REVIEW_SETTLE_MARGIN_MS);
+    if (bound === 0) return null;
+    const started = this.clock();
+    const outcome = await raceOutcome(entry.done, bound, signal);
+    if (outcome === REVIEW_OUTCOME_TIMEOUT) return null;
+    if (signal !== null && signal.aborted === true) return null;
+    // The write settled inside the wait: report the resulting fact (confirmed or failed)
+    // together with how long it took, without re-deriving the task's state.
+    const reason = this.settleReason(task) ?? OBSERVE_TASK_REASONS.attention;
+    const waitedMs = Math.max(0, this.clock() - started);
+    return this.observationOf(task, reason, this.ensureMonitor(task), waitMs, waitedMs, true, null);
   }
 
   /**
@@ -3286,9 +3554,15 @@ export class JobEngine {
       // Stated so no consumer reads `awaiting-host-review` as acceptance by itself; the
       // recorded review, when one exists, is reported separately below.
       selfApproved: false,
-      // The commander's own decision, or null when none has been recorded yet. Never
-      // derived from the task state: a completed run is not an accepted one.
-      hostAcceptance: task.hostAcceptance ?? null,
+      // The commander's own decision, or null when none has been RECORDED YET. Never
+      // derived from the task state: a completed run is not an accepted one, and a
+      // decision that is still being written is not accepted either. The note BODY is not
+      // carried on a wait (R5): its state, time and length are, plus `noteOmitted`, so the
+      // summary stays short without letting an old client read a missing body as "none".
+      hostAcceptance: summarizedAcceptance(task.hostAcceptance ?? null),
+      // Where that decision is in its durable write, so a waiting host can tell "not
+      // reviewed" from "the review is being written right now" and does not resubmit one.
+      reviewPersistence: this.reviewPersistenceView(task),
     };
   }
 
@@ -3336,8 +3610,66 @@ export class JobEngine {
     // task, so the stored view still says how much activity there was.
     this.releaseMonitor(task);
     await this.finalize(task);
-    await this.persistHistory(task);
+    await this.persistTerminalRecord(task);
     task.settle();
+  }
+
+  /**
+   * Store a terminal task's record without ever erasing a review.
+   *
+   * A review can be recorded while `finalize` is still waiting for the executor to confirm
+   * it stopped, so the two writes can overlap. The rule is order, not a race:
+   *
+   *  * a write already IN FLIGHT (`saving`/`timed-out`) is awaited first, so the terminal
+   *    snapshot can never be queued behind it and then overwrite its result;
+   *  * a `saved` decision is the newest fact, so the older terminal snapshot is skipped —
+   *    writing it would erase the conclusion with a view that predates it;
+   *  * a confirmed decision already on disk is carried into the new snapshot through
+   *    `history.update`, which patches the CURRENT row instead of trusting a stale copy;
+   *  * anything else (a settled failure, or no review at all) is a normal snapshot.
+   * @param {object} task - terminal task record.
+   * @returns {Promise<void>} resolves after the attempt, never rejects.
+   */
+  async persistTerminalRecord(task) {
+    const entry = this.reviewState.get(task.taskId) ?? null;
+    if (entry !== null && (entry.state === REVIEW_PERSISTENCE_STATES.saving || entry.state === REVIEW_PERSISTENCE_STATES.timedOut)) {
+      await raceOutcome(entry.done, HISTORY_WRITE_TIMEOUT_MS);
+    }
+    const current = this.reviewState.get(task.taskId) ?? null;
+    // A conclusion confirmed in this process — or one already on disk from an earlier
+    // process — is the newest fact; the terminal snapshot must not replace it.
+    if (current !== null && current.state === REVIEW_PERSISTENCE_STATES.saved) return;
+    const stored = await this.confirmedAcceptanceOnDisk(task.taskId).catch(() => null);
+    if (stored !== null) {
+      const view = this.view(task);
+      view.hostAcceptance = stored;
+      if (this.history !== null && typeof this.history.update === 'function') {
+        try {
+          await this.history.update(task.taskId, (row) => {
+            const next = { ...view };
+            next.hostAcceptance = row?.hostAcceptance ?? stored;
+            return next;
+          });
+          return;
+        } catch {
+          // fall through to the ordinary bounded write below
+        }
+      }
+    }
+    await this.persistHistory(task);
+  }
+
+  /**
+   * The confirmed review already stored for a task, if any.
+   * @param {string} taskId - task id.
+   * @returns {Promise<object | null>} the stored acceptance, or null.
+   */
+  async confirmedAcceptanceOnDisk(taskId) {
+    const history = this.history;
+    if (history === null || typeof history.load !== 'function') return null;
+    const rows = await history.load();
+    const row = Array.isArray(rows) ? rows.find((entry) => entry?.taskId === taskId) : undefined;
+    return row?.hostAcceptance ?? null;
   }
 
   /**
@@ -3390,6 +3722,314 @@ export class JobEngine {
     } finally {
       if (timer !== null) clearTimeout(timer);
     }
+  }
+
+  /**
+   * Build the public view one review write should store.
+   *
+   * The decision is not in memory yet — that is the whole point of the contract — so the
+   * stored view is the task's own projection with THIS decision filled in. It therefore
+   * inherits every redaction and every bound the projection applies, and the durable
+   * record says exactly what the request said rather than what memory happens to hold.
+   * @param {object} task - task record.
+   * @param {object} entry - the persistence entry being written.
+   * @returns {object} public view carrying the decision under review.
+   */
+  viewForReviewWrite(task, entry) {
+    const view = this.view(task);
+    view.hostAcceptance = {
+      accepted: entry.decision === HOST_REVIEW_STATES.accepted,
+      state: entry.decision,
+      acceptedAt: entry.startedAt,
+      by: HOST_REVIEW_BY,
+      note: entry.note,
+    };
+    return view;
+  }
+
+  /**
+   * Read one task's stored row for a caller that proved ownership.
+   *
+   * This is the R1 seam: after a restart the in-memory map is empty, but a finished task's
+   * result is still on disk. The row is a durable RECORD, never a runnable task — no
+   * native handle, grant or permission is reconstructed from it, and nothing is put back
+   * into `this.tasks`.
+   * @param {string} taskId - caller-supplied id.
+   * @param {string} connectionId - the caller's verified connection identity.
+   * @returns {Promise<object | null>} the stored row, or null when this caller cannot prove it.
+   */
+  async storedTaskRow(taskId, connectionId) {
+    const history = this.history;
+    if (history === null || history === undefined || typeof history.load !== 'function') return null;
+    const requested = typeof taskId === 'string' ? taskId.trim() : '';
+    const caller = typeof connectionId === 'string' && connectionId !== '' ? connectionId : null;
+    if (requested === '' || caller === null) return null;
+    let rows;
+    try {
+      rows = await history.load();
+    } catch (error) {
+      // An unreadable document is not evidence about any one task, so it is reported as an
+      // upstream failure rather than "no such task" (which would claim the task never existed).
+      throw new JobError(JOB_CODES.historyFailed, 'the stored task history could not be read', {
+        code: typeof error?.code === 'string' ? error.code : 'HISTORY_UNREADABLE',
+      });
+    }
+    const row = Array.isArray(rows) ? rows.find((entry) => entry?.taskId === requested) : undefined;
+    // A row with no owner recorded is NOT readable by anyone: there is no identity that can
+    // prove it, and answering it differently from an unknown id would confirm that it exists.
+    if (row === undefined || typeof row.connectionId !== 'string' || row.connectionId === ''
+      || row.connectionId !== caller) return null;
+    return row;
+  }
+
+  /**
+   * The public view of a stored row, with the evidence it no longer has stated.
+   *
+   * `truncation` from the document is kept (it says what was cut on the way to disk) and
+   * `evidence` states that this is history: which blocks are absent, whether the stored
+   * diff was already truncated, and — crucially — that a stored row is NOT an acceptance.
+   * `reviewPersistence` is the SAME projection a live task uses, so an in-flight, timed-out
+   * or failed review started in this process is visible through a restored task too; a
+   * confirmed conclusion comes from the document, never from memory.
+   * @param {object} row - stored history row.
+   * @returns {object} redacted public view.
+   */
+  historyViewOf(row) {
+    const view = structuredClone(row);
+    // A stored row carries no prompt and no resumable handle; nothing here may look like a
+    // task that could be started, continued or approved again.
+    delete view.prompt;
+    // Only a DURABLE record is acceptance: this is what the document says.
+    view.hostAcceptance = row.hostAcceptance ?? null;
+    view.reviewPersistence = this.reviewPersistenceView(row);
+    view.source = 'history';
+    view.selfApproved = false;
+    view.evidence = this.historyEvidenceOf(view);
+    return redactDeep(view);
+  }
+
+  /**
+   * State what a stored row does and does not carry.
+   *
+   * A restored record must never read as "the whole result, accepted": the operator
+   * decides whether the remaining evidence is enough, and a field that was cut or was
+   * never stored is named rather than silently missing.
+   * @param {object} view - history view.
+   * @returns {object} bounded evidence statement.
+   */
+  historyEvidenceOf(view) {
+    const absent = [];
+    if (view.diff === null || view.diff === undefined || (view.diff.files ?? []).length === 0) absent.push('diff');
+    if (view.execution === null || view.execution === undefined || (view.execution.text ?? '') === '') absent.push('execution.text');
+    const stored = view.truncation ?? null;
+    return {
+      source: 'history',
+      // Stated explicitly: the run ended before this process started.
+      restored: true,
+      // A stored row is evidence, never an acceptance.
+      accepted: view.hostAcceptance?.accepted === true,
+      absent,
+      // What the document itself recorded as cut on the way to disk (diff.patchText etc).
+      truncatedFields: Array.isArray(stored?.fields) ? stored.fields : [],
+      droppedBlocks: Array.isArray(stored?.dropped) ? stored.dropped : [],
+      note: 'this result was read from durable history: evidence the document no longer carries is listed here, and only the recorded review counts as acceptance',
+    };
+  }
+
+  /**
+   * Record a review of a task that exists only as a durable record (after a restart).
+   *
+   * The SAME rules as a live review apply — closed vocabulary, the shared note bound, one
+   * conclusion per task, idempotent replay, conflicting refusal — and the write goes
+   * through the same serialized store write. What is different is the candidate record:
+   * it is the stored row, re-read under the write so the stored evidence is never
+   * discarded or partially overwritten.
+   * @param {object} taskIdAndOwner - `taskId` and the verified `connectionId`.
+   * @param {string} decision - validated decision.
+   * @param {string} note - normalized, redacted note.
+   * @param {number} waitMs - per-request wait bound.
+   * @returns {Promise<object>} `{ task, hostAcceptance, reviewPersistence }`.
+   * @throws {JobError} on any refusal.
+   */
+  async recordHistoricalReview({ taskId, connectionId }, decision, note, waitMs) {
+    const input = reviewInput({ decision, note });
+    decision = input.decision;
+    note = redactText(input.note);
+    const row = await this.storedTaskRow(taskId, connectionId);
+    // The SAME answer an unknown task gets: the live path refuses an unknown id with this
+    // wording, so a restored task must not be distinguishable from a missing one.
+    if (row === null) throw new JobError(JOB_CODES.taskNotFound, 'no such task for this connection', { taskId });
+    // Only a run that really ENDED in `awaiting-host-review` may be reviewed. A failed,
+    // cancelled or interrupted record keeps its real outcome and cannot be turned into a
+    // reviewable one, and a live state stored by an older build is equally not reviewable.
+    if (row.state !== TASK_STATES.awaitingHostReview) {
+      throw new JobError(JOB_CODES.reviewNotReviewable, 'this stored task is not awaiting host review', {
+        taskId: row.taskId,
+        state: row.state,
+      });
+    }
+    const entry = this.beginHistoryReviewWrite(row, decision, note);
+    return await this.awaitHistoryReviewWrite(row, entry, waitMs);
+  }
+
+  /**
+   * Serialize a historical review write on the store.
+   *
+   * The row is re-read INSIDE the queued write (see {@link writeHistoryReview}), so the
+   * stored evidence is the base and a concurrent terminal write for the same task can only
+   * be followed, never overwritten with a stale copy.
+   * @param {object} row - the stored row as first read.
+   * @param {string} decision - validated decision.
+   * @param {string} note - normalized note to record.
+   * @returns {object} persistence entry to await.
+   * @throws {JobError} on a recorded or in-flight conflict.
+   */
+  beginHistoryReviewWrite(row, decision, note) {
+    const history = this.history;
+    if (history === null || history === undefined || typeof history.update !== 'function') {
+      throw new JobError(JOB_CODES.reviewNotPersisted,
+        'no durable history store is configured, so the review decision was not recorded', {
+          taskId: row.taskId,
+          historyError: null,
+        });
+    }
+    const recorded = row.hostAcceptance ?? null;
+    const key = row.taskId;
+    const current = this.reviewState.get(key) ?? null;
+    if (current !== null
+      && (current.state === REVIEW_PERSISTENCE_STATES.saving || current.state === REVIEW_PERSISTENCE_STATES.timedOut)) {
+      if (current.decision === decision && current.note === note) return current;
+      throw new JobError(JOB_CODES.reviewNotReviewable,
+        'a different review decision is being recorded for this task; wait for it or send a follow-up task', {
+          taskId: key,
+          recorded: current.decision,
+          requested: decision,
+        });
+    }
+    if (recorded !== null && recorded !== undefined) {
+      if (recorded.state === decision && recorded.note === note) {
+        return { state: REVIEW_PERSISTENCE_STATES.saved, decision, note, token: -1, done: Promise.resolve(true) };
+      }
+      throw new JobError(JOB_CODES.reviewNotReviewable,
+        'this task already has a recorded review; send a follow-up task to record a correction', {
+          taskId: key,
+          recorded: recorded.state ?? null,
+          requested: decision,
+        });
+    }
+    const entry = {
+      state: REVIEW_PERSISTENCE_STATES.saving,
+      decision,
+      note,
+      token: (this.reviewSeq ?? 0) + 1,
+      startedAt: this.clock(),
+      confirmedAt: null,
+      error: null,
+      historical: true,
+      connectionId: row.connectionId,
+    };
+    this.reviewSeq = entry.token;
+    this.reviewState.set(key, entry);
+    entry.done = this.writeHistoryReview(key, entry);
+    entry.done.catch(() => undefined);
+    return entry;
+  }
+
+  /**
+   * Write one historical review decision, re-reading the stored row under the write.
+   * @param {string} taskId - task id.
+   * @param {object} entry - persistence entry.
+   * @returns {Promise<boolean>} true when the decision is durable.
+   */
+  async writeHistoryReview(taskId, entry) {
+    const acceptance = {
+      accepted: entry.decision === HOST_REVIEW_STATES.accepted,
+      state: entry.decision,
+      acceptedAt: entry.startedAt,
+      by: HOST_REVIEW_BY,
+      note: entry.note,
+    };
+    try {
+      await this.history.update(taskId, (row) => {
+        if (row?.connectionId !== entry.connectionId) {
+          throw new JobError(JOB_CODES.taskNotFound, 'no such task for this connection', { taskId });
+        }
+        if (row?.state !== TASK_STATES.awaitingHostReview) {
+          throw new JobError(JOB_CODES.reviewNotReviewable, 'this stored task is not awaiting host review', {
+            taskId,
+            state: row?.state ?? null,
+          });
+        }
+        if (row.hostAcceptance !== null && row.hostAcceptance !== undefined) {
+          if (row.hostAcceptance.state === entry.decision && row.hostAcceptance.note === entry.note) return row;
+          throw new JobError(JOB_CODES.reviewNotReviewable,
+            'this task already has a recorded review; send a follow-up task to record a correction', { taskId });
+        }
+        row.hostAcceptance = acceptance;
+        return row;
+      });
+    } catch (error) {
+      if (this.reviewState.get(taskId) === entry) {
+        entry.state = REVIEW_PERSISTENCE_STATES.failed;
+        entry.error = {
+          code: typeof error?.code === 'string' ? error.code : JOB_CODES.historyFailed,
+          message: diagnostic(error?.message ?? error, 300),
+        };
+      }
+      return false;
+    }
+    if (this.reviewState.get(taskId) === entry) {
+      entry.state = REVIEW_PERSISTENCE_STATES.saved;
+      entry.confirmedAt = this.clock();
+      entry.error = null;
+    }
+    return true;
+  }
+
+  /**
+   * Answer a historical review request from the real persistence state.
+   *
+   * The answer is always read back from the DOCUMENT: a conclusion is reported only when
+   * the stored row carries it. An unresolved write is reported as `timed-out`/`failed`
+   * through the same projection a live task uses, never as a saved conclusion assembled
+   * from memory, and never with a fabricated review if the row can no longer be read.
+   * @param {object} row - the stored row.
+   * @param {object} entry - persistence entry.
+   * @param {number} timeoutMs - per-request bound (0 = default).
+   * @returns {Promise<object>} `{ task, hostAcceptance, reviewPersistence }`.
+   * @throws {JobError} when the write failed.
+   */
+  async awaitHistoryReviewWrite(row, entry, timeoutMs) {
+    const answer = async () => {
+      const stored = await this.storedTaskRow(row.taskId, row.connectionId);
+      if (stored === null) {
+        throw new JobError(JOB_CODES.historyFailed,
+          'the stored record is no longer available, so the review outcome cannot be confirmed from history',
+          { taskId: row.taskId, missingRecord: true });
+      }
+      const view = this.historyViewOf(stored);
+      return { task: view, hostAcceptance: view.hostAcceptance, reviewPersistence: view.reviewPersistence };
+    };
+    if (entry.state === REVIEW_PERSISTENCE_STATES.saved) {
+      return await answer();
+    }
+    const bound = Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : REVIEW_WRITE_TIMEOUT_MS;
+    const outcome = await raceOutcome(entry.done, bound);
+    if (outcome === REVIEW_OUTCOME_TIMEOUT
+      && this.reviewState.get(row.taskId) === entry
+      && entry.state === REVIEW_PERSISTENCE_STATES.saving) {
+      // Unconfirmed, not failed: the write keeps running and a later GET reports the
+      // outcome once the document carries it.
+      entry.state = REVIEW_PERSISTENCE_STATES.timedOut;
+    }
+    if (entry.state === REVIEW_PERSISTENCE_STATES.failed) {
+      throw new JobError(JOB_CODES.reviewNotPersisted,
+        'the review decision could not be written to history, so it was not recorded', {
+          taskId: row.taskId,
+          historyError: entry.error ?? null,
+        });
+    }
+    return await answer();
   }
 
   /**
@@ -3705,6 +4345,12 @@ export class JobEngine {
       // becoming a second transcript.
       activity: this.activityView(task),
       hostAcceptance: task.hostAcceptance,
+      // Where the review decision is in its durable write: `none`, `saving`, `saved`,
+      // `failed` or `timed-out`. Stated as its own field so a reader can tell "no decision"
+      // from "the decision is being written right now" WITHOUT having to read a
+      // provisional `hostAcceptance`. It never makes an unconfirmed decision look accepted:
+      // `accepted` here is true only for a `saved` entry.
+      reviewPersistence: this.reviewPersistenceView(task),
       // Stated explicitly so no consumer can read `awaiting-host-review` as
       // "done and approved".
       selfApproved: false,
@@ -3897,3 +4543,89 @@ export function sanitizeOverrides(value) {
 }
 
 export { AuthError, AUTH_CODES, defaultSettings };
+
+/**
+ * Validate the same review vocabulary and note bound for live and restored tasks.
+ * @param {object} request - decision and note.
+ * @returns {{ decision: string, note: string }} normalized review input.
+ */
+function reviewInput(request) {
+  const decision = request?.decision;
+  if (decision !== HOST_REVIEW_STATES.accepted && decision !== HOST_REVIEW_STATES.changesRequested) {
+    throw new JobError(JOB_CODES.reviewInvalid,
+      `decision must be ${HOST_REVIEW_STATES.accepted} or ${HOST_REVIEW_STATES.changesRequested}`,
+      { field: 'decision' });
+  }
+  const note = normalizeReviewNote(request?.note);
+  if (note === '') {
+    throw new JobError(JOB_CODES.reviewInvalid, 'note must be a non-empty string', { field: 'note' });
+  }
+  if (reviewNoteLength(note) > REVIEW_NOTE_MAX) {
+    const overflow = reviewNoteOverflow(note);
+    throw new JobError(JOB_CODES.reviewInvalid, overflow.message, {
+      field: 'note', limit: overflow.limit, length: overflow.length, unit: 'unicode-code-points',
+    });
+  }
+  return { decision, note };
+}
+
+/** Read an optional shorter per-call durability wait, in milliseconds. */
+function reviewWaitMs(request) {
+  const value = request?.waitMs;
+  if (!Number.isSafeInteger(value) || value < 0) return 0;
+  return Math.min(value, REVIEW_WRITE_TIMEOUT_MS);
+}
+
+/**
+ * Await a promise for at most `ms`, answering a sentinel instead of rejecting.
+ *
+ * The write keeps its own rejection handler: a failure that lands AFTER the bound expired
+ * must not become an unhandled rejection, and the engine reads the outcome from the
+ * persistence entry rather than from this race.
+ * @param {Promise<unknown>} promise - work to await.
+ * @param {number} ms - bound in milliseconds.
+ * @param {AbortSignal | null} [signal] - optional caller cancellation.
+ * @returns {Promise<unknown | symbol>} the value, or {@link REVIEW_OUTCOME_TIMEOUT}.
+ */
+async function raceOutcome(promise, ms, signal = null) {
+  if (signal?.aborted === true) return REVIEW_OUTCOME_TIMEOUT;
+  let onAbort = null;
+  let timer = null;
+  try {
+    return await new Promise((resolvePromise) => {
+      timer = setTimeout(() => { resolvePromise(REVIEW_OUTCOME_TIMEOUT); }, ms);
+      timer.unref?.();
+      if (signal !== null) {
+        onAbort = () => { resolvePromise(REVIEW_OUTCOME_TIMEOUT); };
+        signal.addEventListener?.('abort', onAbort, { once: true });
+      }
+      Promise.resolve(promise).then(
+        (value) => { resolvePromise(value); },
+        () => { resolvePromise(REVIEW_OUTCOME_TIMEOUT); },
+      );
+    });
+  } finally {
+    if (timer !== null) clearTimeout(timer);
+    if (onAbort !== null) signal.removeEventListener?.('abort', onAbort);
+  }
+}
+
+/**
+ * A review conclusion as a WAIT reports it: status, time and length, never the body.
+ *
+ * The object is kept so an old client cannot read "no note" as "not reviewed"; the body is
+ * read on demand (R5). `noteOmitted: true` states the omission explicitly.
+ * @param {object | null} acceptance - recorded acceptance.
+ * @returns {object | null} summarized acceptance.
+ */
+function summarizedAcceptance(acceptance) {
+  if (acceptance === null || typeof acceptance !== 'object') return null;
+  return {
+    accepted: acceptance.accepted === true,
+    state: acceptance.state ?? null,
+    acceptedAt: acceptance.acceptedAt ?? null,
+    by: acceptance.by ?? null,
+    noteChars: typeof acceptance.note === 'string' ? Array.from(acceptance.note).length : (acceptance.noteChars ?? 0),
+    noteOmitted: true,
+  };
+}

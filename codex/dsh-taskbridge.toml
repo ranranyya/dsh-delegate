@@ -1,7 +1,7 @@
 # dsh-taskbridge Codex companion — managed by the DSH TaskBridge plugin settings page.
 # Editing this file turns it into an operator-owned file: the plugin then never
 # overwrites or removes it, and reports it as "modified" instead.
-version = "1.4.0"
+version = "1.4.1"
 
 name = "dsh-taskbridge"
 description = "Dispatch an explicitly assigned implementation task to DSH through the dsh-taskbridge MCP tools, then return evidence for Codex review."
@@ -175,16 +175,29 @@ DISPATCH (only for an explicitly assigned implementation task)
      findings, changed files) and then do the review yourself, in Codex. If the diff
      is large, inspect only the files that matter for this change, once each. Do not
      re-read the same evidence repeatedly, and never reply "done" without reviewing.
+     The review note is up to 8000 Unicode code points; a longer answer states
+     `noteOmitted: true` and the note is read in pages with `reviewNoteOffset` and
+     `reviewNoteLimit` (2000 code points per page) until `complete` is true. Read the
+     full note before concluding when the page says it is longer.
      After the review, call `delegate_review` on THAT task with `decision: "accepted"`
-     or `decision: "changes-requested"` and a short, factual `note` describing the
-     checks or required corrections. Record accepted only when the delivered evidence
-     supports it. This records your conclusion; it grants no tool permission and does
-     not merge files. Wait for the write to succeed before reporting the decision as
-     recorded. A failed write is a recording problem, not proof that execution failed.
+     or `decision: "changes-requested"`. A passing conclusion keeps a SHORT note (what
+     you checked and that it passed); a rework note is written ONCE as a single
+     consolidated correction list, not as a conversation.
+     Record accepted only when the delivered evidence supports it. This records your
+     conclusion; it grants no tool permission and does not merge files.
+     A review is only recorded once the answer says it is durable (`reviewPersistence`
+     `state: "saved"`, or a returned `hostAcceptance`). If the answer says `saving` or
+     `timed-out`, the write is still running: do NOT report it as recorded and do NOT
+     resubmit or re-dispatche the work — read the SAME task again with
+     `delegate_result`/`delegate_wait` until it is confirmed. A `failed` write is a
+     recording problem, not proof that execution failed; retry it on the same task.
      For changes-requested, consolidate corrections and submit a follow-up using
      `continueFromTaskId`; do not overwrite the old task's decision. Never mark old
      records accepted in bulk, and never claim a decision was saved when an older
      server lacks this tool.
+     Reviewing is done in ONE pass per delivery: do not call `delegate_review` to
+     "check in" while the run is still going, and do not review the same result more
+     than once.
    - `failed`, `cancelled`: the run ended without deliverables. Call
      `delegate_result` ONCE for the same task to read the recorded reason, then report
      it. Do not resubmit identical work hoping for a different result; if a correction

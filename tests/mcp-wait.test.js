@@ -1264,7 +1264,9 @@ test('delegate_result keeps its own schema and behaviour beside the new tool', a
     'delegate_result', 'delegate_review', 'delegate_status', 'delegate_submit', 'delegate_wait',
   ]);
   const result = listed.result.tools.find((tool) => tool.name === 'delegate_result');
-  assert.deepEqual(Object.keys(result.inputSchema.properties), ['taskId']);
+  // The result read keeps its own closed schema; the only additions are the OPTIONAL
+  // paged readers of the review note (R5), so a plain `{ taskId }` call is unchanged.
+  assert.deepEqual(Object.keys(result.inputSchema.properties), ['taskId', 'reviewNoteOffset', 'reviewNoteLimit']);
   assert.deepEqual(result.inputSchema.required, ['taskId']);
   assert.equal(result.inputSchema.additionalProperties, false);
 

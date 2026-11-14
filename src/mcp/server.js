@@ -71,6 +71,13 @@
 // made it fail at link time with `ERR_MODULE_NOT_FOUND` before it could report
 // anything at all.
 import { diagnostic, redactText } from '../config/redact.js';
+import {
+  REVIEW_NOTE_MAX_CHARS,
+  normalizeReviewNote,
+  reviewNoteLength,
+  reviewNoteOverflow,
+  truncateCodePoints,
+} from '../jobs/review-note.js';
 import { waitForTask } from './wait.js';
 
 /** Protocol revisions this server can speak, newest first (as the SDK lists them). */
@@ -85,10 +92,21 @@ export const SUPPORTED_PROTOCOL_VERSIONS = Object.freeze([
 export const LATEST_PROTOCOL_VERSION = SUPPORTED_PROTOCOL_VERSIONS[0];
 
 /** Identifies this server in the handshake. */
-export const SERVER_INFO = Object.freeze({ name: 'dsh-delegate', version: '1.4.0' });
+export const SERVER_INFO = Object.freeze({ name: 'dsh-delegate', version: '1.4.1' });
 
 /** Bound on a tool result's text. A task view can be large; a model's context cannot. */
 export const MAX_TOOL_TEXT_CHARS = 20_000;
+
+/**
+ * Largest page of a review note one `delegate_result` call returns, in code points.
+ *
+ * A page is deliberately small: it exists so a note far larger than the tool-text bound can
+ * be read in full, a page at a time, without one answer blowing a model's context.
+ */
+export const MAX_REVIEW_NOTE_PAGE_CHARS = 2_000;
+
+/** Default page size of a `reviewNoteOffset` read. */
+export const DEFAULT_REVIEW_NOTE_PAGE_CHARS = 2_000;
 
 /** Bound on one execution-plane request. */
 export const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
@@ -112,12 +130,15 @@ export const MAX_WAIT_SECONDS = 3_600;
 export const MIN_WAIT_SECONDS = 1;
 
 /**
- * Longest `delegate_review` note, in characters.
+ * Longest `delegate_review` note, in Unicode code points.
  *
- * The same bound the execution plane and the engine enforce, declared here so the
- * advertised schema and the refusals cannot drift apart.
+ * This is the shared definition (`src/jobs/review-note.js`), re-exported because the MCP
+ * catalog is the first surface a client sees. The same value bounds the execution plane,
+ * the engine and the durable history projection, and all of them count CODE POINTS, not
+ * UTF-16 units: a note written in Chinese or with emoji gets the same room, and a
+ * surrogate pair cannot be split by a bound.
  */
-export const MAX_REVIEW_NOTE_CHARS = 1_000;
+export const MAX_REVIEW_NOTE_CHARS = REVIEW_NOTE_MAX_CHARS;
 
 /**
  * How many requests may be in flight at once on the stdio transport.
@@ -276,7 +297,11 @@ export const TOOLS = Object.freeze([
     title: 'Read task result',
     description: 'Read one task this connection submitted: state, effective provider/model/effort, '
       + 'changed-file summary, bounded diff, validation evidence and review outcome. '
-      + 'A finished execution is not host acceptance.',
+      + 'A finished execution is not host acceptance. '
+      + 'The review note is returned in full when it fits; when the whole answer is too large the answer says '
+      + '`hostAcceptance.noteOmitted: true` and the text is read in pages with `reviewNoteOffset` and '
+      + '`reviewNoteLimit` (a page answer carries only the slice, `noteChars`, `nextOffset` and `complete`). '
+      + 'A note is never silently shortened.',
     // A read of a stored task: no work is created, changed or cancelled.
     annotations: Object.freeze({
       title: 'Read task result',
@@ -289,6 +314,20 @@ export const TOOLS = Object.freeze([
       type: 'object',
       properties: {
         taskId: { type: 'string', description: 'Task identity returned by delegate_submit.' },
+        reviewNoteOffset: {
+          type: 'integer',
+          minimum: 0,
+          description: 'Read the review note from this CODE-POINT offset. Omit it for the normal full result; '
+            + 'supplying it (with or without reviewNoteLimit) returns ONLY the note slice plus its total '
+            + 'length, nextOffset and complete.',
+        },
+        reviewNoteLimit: {
+          type: 'integer',
+          minimum: 1,
+          maximum: MAX_REVIEW_NOTE_PAGE_CHARS,
+          description: `Code points of the review note to return per page (1..${MAX_REVIEW_NOTE_PAGE_CHARS}, `
+            + 'default 2000). Only meaningful together with reviewNoteOffset.',
+        },
       },
       required: ['taskId'],
       additionalProperties: false,
@@ -452,7 +491,9 @@ export const TOOLS = Object.freeze([
       + 'is the only thing that does. '
       + '\u0060decision: "accepted"\u0060 means you reviewed the evidence with \u0060delegate_result\u0060 and it is right; '
       + '\u0060decision: "changes-requested"\u0060 means it needs correction. Either way \u0060note\u0060 is required and '
-      + 'bounded (at most 1000 characters) — it is the recorded conclusion, not a place for secrets. '
+      + 'bounded (at most 8000 Unicode code points, so Chinese, line breaks and emoji all count once) — it is the '
+      + 'recorded conclusion, not a place for secrets. A longer note is refused before anything is written; it is '
+      + 'never silently shortened. '
       + 'This cannot approve a permission request, change the switch, a provider, a model, the isolation or a '
       + 'credential, merge or apply the diff, or create another task. Execution completion is never accepted '
       + 'automatically: until this is called the task stays unreviewed. '
@@ -485,7 +526,11 @@ export const TOOLS = Object.freeze([
         note: {
           type: 'string',
           maxLength: MAX_REVIEW_NOTE_CHARS,
-          description: 'Required non-empty bounded conclusion (at most 1000 characters), stored redacted. '
+          // The bound is counted in Unicode code points, not in UTF-16 units.
+          codePointLength: true,
+          description: 'Required non-empty bounded conclusion (at most 8000 Unicode code points), stored redacted. '
+            + 'The count is Unicode code points, so Chinese text, line breaks and emoji each count once; a longer '
+            + 'note is refused with its actual length instead of being cut. '
             + 'It is evidence of your review, never a grant and never a place for credentials.',
         },
       },
@@ -576,7 +621,18 @@ function validateArgs(tool, args) {
       if (typeof field !== 'string') throw new McpError('MCP_ARGUMENT_TYPE', `${tool.name}.${key} must be a string`);
       // A declared bound is enforced, not merely advertised: a note over the limit is
       // refused with the field named instead of reaching the plane and being cut there.
-      if (typeof declared.maxLength === 'number' && field.length > declared.maxLength) {
+      // A `maxLength` is a code-point bound (the shared review-note rule), so it is
+      // measured the same way every other surface measures it: `.length` would count an
+      // emoji twice and refuse a note the plane would have accepted.
+      if (typeof declared.maxLength === 'number' && declared.codePointLength === true) {
+        // Measured on the NORMALIZED text (the shared trim), so surrounding whitespace
+        // cannot make this layer refuse a note the plane would have accepted.
+        const points = reviewNoteLength(normalizeReviewNote(field));
+        if (points > declared.maxLength) {
+          throw new McpError('MCP_ARGUMENT_RANGE',
+            `${tool.name}.${key} must be at most ${declared.maxLength} Unicode code points, but it is ${points}`);
+        }
+      } else if (typeof declared.maxLength === 'number' && field.length > declared.maxLength) {
         throw new McpError('MCP_ARGUMENT_RANGE', `${tool.name}.${key} must be at most ${declared.maxLength} characters`);
       }
       out[key] = field;
@@ -607,6 +663,9 @@ function validateArgs(tool, args) {
     if (Array.isArray(declared.enum) && !declared.enum.includes(out[key])) {
       throw new McpError('MCP_ARGUMENT_ENUM', `${tool.name}.${key} must be one of ${declared.enum.join(', ')}`);
     }
+  }
+  if (tool.name === 'delegate_result' && out.reviewNoteLimit !== undefined && out.reviewNoteOffset === undefined) {
+    throw new McpError('MCP_ARGUMENT_REQUIRED', 'delegate_result.reviewNoteLimit requires reviewNoteOffset');
   }
   return out;
 }
@@ -894,6 +953,13 @@ function projectWithStage(value, stage, collect) {
     if (typeof target.reviewRouteError === 'string') {
       target.reviewRouteError = boundedText(target.reviewRouteError, stage.skeletonChars ?? 400, `${prefix}reviewRouteError`, collect);
     }
+    // A full result KEEPS the whole note while it fits; when a stage has to give it up it
+    // is marked `noteOmitted` and read back in pages, never shortened. (`prefix` already
+    // ends in a dot.)
+    const acceptance = target.hostAcceptance;
+    if (acceptance !== null && typeof acceptance === 'object') {
+      target.hostAcceptance = boundAcceptance(acceptance, `${prefix}hostAcceptance`, collect, stage.omitNote === true);
+    }
     // The settled decision trail is HISTORY; the pending request is the thing the
     // commander must act on NOW. Under a bound the history goes first, so a running
     // task can never keep an outstanding request invisible behind old evidence.
@@ -927,12 +993,20 @@ function projectWithStage(value, stage, collect) {
     // exception is `permission`: a wait answer publishes the pending operation there,
     // and a generic per-string cut would shorten the operation WITHOUT updating
     // `argumentsComplete`/`allowBlocked`, publishing a shortened operation that still
-    // reads as complete. It is bounded by the permission rule instead.
+    // reads as complete. It is bounded by the permission rule instead. A top-level
+    // `hostAcceptance` (the review answer) is the recorded conclusion and is bounded by
+    // its own rule, so a small per-string cap cannot shorten it.
     for (const [key, item] of Object.entries(projected)) {
       if (key === 'task' || key === 'tasks' || key === 'ok') continue;
-      projected[key] = key === 'permission'
-        ? boundPermissionBlock(item, key, collect)
-        : trimAllStrings(item, key, cap, collect);
+      if (key === 'permission') {
+        projected[key] = boundPermissionBlock(item, key, collect);
+        continue;
+      }
+      if (key === 'hostAcceptance' && item !== null && typeof item === 'object' && !Array.isArray(item)) {
+        projected[key] = boundAcceptance(item, key, collect);
+        continue;
+      }
+      projected[key] = trimAllStrings(item, key, cap, collect);
     }
   }
   return projected;
@@ -962,6 +1036,12 @@ function skeletonize(task, path, cap, collect) {
       }
     } else if (key === 'route' || key === 'reviewRoute') {
       out[key] = value === null ? null : boundValue(value, `${path}.${key}`, cap, collect);
+    } else if (key === 'hostAcceptance') {
+      // The recorded CONCLUSION is restored to its own bound after the generic walk, so a
+      // small per-string cap can never shorten what the host concluded while leaving a
+      // record that still reads as the whole note. A note beyond the accepted bound is
+      // cut once, and the cut is stated.
+      out[key] = value === null ? null : boundAcceptance(value, `${path}.hostAcceptance`, collect);
     } else {
       out[key] = value;
     }
@@ -977,6 +1057,62 @@ function skeletonize(task, path, cap, collect) {
   out.truncation = { path, field: 'result', detail: 'only identity, state, routing, refusal, acceptance and the live pending permission request are shown' };
   collect.push(out.truncation);
   return out;
+}
+
+/**
+ * Bound a recorded host review for a skeletonised answer.
+ *
+ * The conclusion fields are carried as the engine states them — `accepted`, `state`,
+ * `acceptedAt`, `by` — because they are the answer to "was this accepted?", and the note
+ * keeps its own generous cap rather than the skeleton's per-string one. Anything else
+ * present is bounded generically, so a widened record cannot smuggle a long value in
+ * through this exception.
+ * @param {object} acceptance - host-acceptance record.
+ * @param {string} path - JSON path.
+ * @param {object[]} collect - truncation records.
+ * @returns {object} bounded record.
+ */
+function boundAcceptance(acceptance, path, collect, omitNoteText = false) {
+  if (omitNoteText) return omitNote(acceptance, `${path}.note`, collect);
+  const out = {};
+  for (const [key, value] of Object.entries(acceptance)) {
+    if (key === 'note' && typeof value === 'string') {
+      out[key] = value;
+      continue;
+    }
+    if (['accepted', 'state', 'acceptedAt', 'by', 'noteChars', 'noteOmitted'].includes(key)) {
+      out[key] = value;
+      continue;
+    }
+    out[key] = boundValue(value, `${path}.${key}`, 240, collect);
+  }
+  return out;
+}
+
+/**
+ * Mark a review note the projection had to drop, instead of publishing a shortened body.
+ *
+ * The body is never silently cut: `noteOmitted: true` plus `noteChars` says the note is
+ * still there, and `reviewNoteOffset`/`reviewNoteLimit` read it in full.
+ * @param {object} acceptance - host-acceptance record (mutated copy).
+ * @param {string} path - JSON path of the note.
+ * @param {object[]} collect - truncation records.
+ * @returns {object} the acceptance with an explicitly omitted note.
+ */
+function omitNote(acceptance, path, collect) {
+  const length = typeof acceptance.note === 'string' ? Array.from(acceptance.note).length : 0;
+  if (acceptance.note !== undefined && acceptance.note !== null) {
+    collect.push({
+      path,
+      field: 'text',
+      keptChars: 0,
+      omittedChars: length,
+      detail: 'the review note is read with delegate_result reviewNoteOffset/reviewNoteLimit',
+    });
+  }
+  const { note, ...rest } = acceptance;
+  void note;
+  return { ...rest, noteChars: acceptance.noteChars ?? length, noteOmitted: true };
 }
 
 /**
@@ -1157,7 +1293,8 @@ function boundValue(value, path, cap, collect) {
     if (key === 'permission' && item !== null && typeof item === 'object' && !Array.isArray(item)) {
       out[key] = boundPermissionBlock(item, `${path}.permission`, collect);
       continue;
-    }    out[key] = boundValue(item, `${path}.${key}`, cap, collect);
+    }
+    out[key] = boundValue(item, `${path}.${key}`, cap, collect);
   }
   return out;
 }
@@ -1233,6 +1370,10 @@ function boundedJson(value) {
     { executionText: 400, reviewText: 400, lists: 20, permissionEvidence: 4 },
     { executionText: 200, reviewText: 200, lists: 5, permissionEvidence: 2 },
     { executionText: 120, reviewText: 120, lists: 1, permissionEvidence: 1 },
+    // Before the answer is skeletonised (whose small per-string cap would otherwise CUT the
+    // note), the note is given up explicitly: identity, state and everything else stay at
+    // full width, and only the body becomes `noteOmitted`, readable in pages.
+    { executionText: 120, reviewText: 120, lists: 1, permissionEvidence: 1, omitNote: true },
     { executionText: 80, reviewText: 80, lists: 1, permissionEvidence: 0, skeletonChars: 240 },
     { executionText: 40, reviewText: 40, lists: 1, permissionEvidence: 0, skeletonChars: 96 },
   ];
@@ -1550,7 +1691,10 @@ export function createMcpServer(options) {
       const result = name === 'delegate_wait'
         ? await waitAnswer(payload, context)
         : await callExecution(route, payload);
-      const bounded = boundedJson(result);
+      // A paged read of the review note returns only its slice: it is a different, small
+      // ANSWER shape, not a projection of the big one.
+      const page = name === 'delegate_result' ? reviewNotePage(payload, result) : null;
+      const bounded = boundedJson(page ?? result);
       // A structurally trimmed answer is a real answer, so `isError` stays unset;
       // only an answer that could not be delivered at all is reported as an error.
       return bounded.isError
@@ -1944,4 +2088,58 @@ export async function serveStdio(options) {
   while (pending.size > 0) await Promise.allSettled([...pending]);
   await writeChain;
   return { inflight: inputEnded, closed, drained: pending.size === 0 };
+}
+
+// ---------------------------------------------------------------------------
+// Paged review-note reads (R5)
+// ---------------------------------------------------------------------------
+//
+// A review note may be up to 8000 code points, and the same note appears twice in a full
+// result (`hostAcceptance` and inside the task), which can exceed the tool-text bound. The
+// full result therefore states `noteOmitted` when it had to give the body up, and this
+// reader returns the body a page at a time: every page carries its own total, so a caller
+// can reassemble the EXACT text and can tell a complete read from a partial one.
+
+/**
+ * Build the page answer for one `reviewNoteOffset` read, or null for a normal result.
+ * @param {object} payload - validated `delegate_result` arguments.
+ * @param {object} result - the plane's answer.
+ * @returns {object | null} the page answer, or null when this is not a paged read.
+ */
+function reviewNotePage(payload, result) {
+  if (payload?.reviewNoteOffset === undefined) return null;
+  const task = result?.task !== null && typeof result?.task === 'object' ? result.task : null;
+  const acceptance = task?.hostAcceptance ?? result?.hostAcceptance ?? null;
+  const note = typeof acceptance?.note === 'string' ? acceptance.note : '';
+  const points = Array.from(note);
+  const offset = Math.min(payload.reviewNoteOffset, points.length);
+  const limit = payload.reviewNoteLimit ?? DEFAULT_REVIEW_NOTE_PAGE_CHARS;
+  const slice = points.slice(offset, offset + limit).join('');
+  const next = offset + (offset + limit < points.length ? limit : points.length - offset);
+  return {
+    ok: true,
+    taskId: task?.taskId ?? payload.taskId,
+    state: task?.state ?? null,
+    reviewNote: {
+      offset,
+      limit,
+      text: slice,
+      noteChars: points.length,
+      nextOffset: next < points.length ? next : null,
+      complete: next >= points.length,
+      // Stated so a paged read is never confused with "the task has no analysis".
+      present: note !== '',
+    },
+    hostAcceptance: acceptance === null
+      ? null
+      : {
+        accepted: acceptance.accepted === true,
+        state: acceptance.state ?? null,
+        acceptedAt: acceptance.acceptedAt ?? null,
+        by: acceptance.by ?? null,
+        noteChars: points.length,
+        noteOmitted: true,
+      },
+    reviewPersistence: task?.reviewPersistence ?? null,
+  };
 }

@@ -15,7 +15,7 @@ https://ranranyya.github.io/dsh-taskbridge/index.json
 3. 搜索 **DSH TaskBridge** 或 **dsh-taskbridge**。
 4. 安装确认框应显示本项目 GitHub 仓库和精确提交。核对后安装，不要改填别人的 `dsh-delegate` 或 `dsh-dispatch` npm 包。
 
-当前索引采用固定 Git 提交作为安装来源，不依赖本机 npm 登录。另一种安装方式是直接在“添加插件”中输入 `dsh-taskbridge@1.4.0`，无需添加索引；若中国大陆镜像未同步，改选 npm 官方源。GitHub Release 同时提供 `.tgz` 和 SHA256 文件。
+当前索引采用固定 Git 提交作为安装来源，不依赖本机 npm 登录。另一种安装方式是直接在“添加插件”中输入 `dsh-taskbridge@1.4.1`，无需添加索引；若中国大陆镜像未同步，改选 npm 官方源。GitHub Release 同时提供 `.tgz` 和 SHA256 文件。
 
 ## 新版本
 

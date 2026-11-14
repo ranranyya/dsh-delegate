@@ -300,7 +300,7 @@ export type DelegateObserveReason =
 /** The compact task summary one observation returns. */
 export interface DelegateObservationSummary {
   taskId: string;
-  state: 'pending' | 'running' | 'awaiting-host-review' | 'failed' | 'cancelled';
+  state: 'pending' | 'running' | 'awaiting-host-review' | 'failed' | 'cancelled' | 'interrupted';
   phase: string;
   createdAt: number | null;
   startedAt: number | null;
@@ -329,7 +329,8 @@ export interface DelegateObservationSummary {
   /** Always false: execution completion is not host acceptance. */
   selfApproved: false;
   /** The commander's recorded delivery review, or null while none exists. */
-  hostAcceptance: DelegateHostAcceptance | null;
+  hostAcceptance: DelegateCompactHostAcceptance | null;
+  reviewPersistence: DelegateReviewPersistence;
 }
 
 /**
@@ -342,7 +343,7 @@ export interface DelegateObservationSummary {
 export interface DelegateReviewRequest {
   taskId: string;
   decision: 'accepted' | 'changes-requested';
-  /** Required, non-empty, at most 1000 characters; stored redacted. */
+  /** Required after trimming; at most 8000 Unicode code points; stored redacted. */
   note: string;
 }
 
@@ -352,8 +353,61 @@ export interface DelegateReviewResult {
    * The public task view after the decision. Its `state` stays `awaiting-host-review`
    * (that is the compatible underlying state); the conclusion is `hostAcceptance`.
    */
-  task: { taskId: string; state: string; phase: string; hostAcceptance: DelegateHostAcceptance | null };
-  hostAcceptance: DelegateHostAcceptance;
+  task: {
+    taskId: string;
+    state: string;
+    phase: string;
+    hostAcceptance: DelegateHostAcceptance | null;
+    reviewPersistence: DelegateReviewPersistence;
+  };
+  /** Null until persistence is confirmed; a timed-out write may still finish. */
+  hostAcceptance: DelegateHostAcceptance | null;
+  reviewPersistence: DelegateReviewPersistence;
+}
+
+/** Persistence state is separate from execution and from a proposed conclusion. */
+export interface DelegateReviewPersistence {
+  state: 'none' | 'saving' | 'timed-out' | 'saved' | 'failed';
+  decision: 'accepted' | 'changes-requested' | null;
+  accepted: boolean;
+  durable: boolean;
+  pending: boolean;
+  startedAt: number | null;
+  confirmedAt: number | null;
+  retryable: boolean;
+  error: { code: string; message: string } | null;
+}
+
+/** A wait carries status and length, never repeats the note body. */
+export interface DelegateCompactHostAcceptance extends Omit<DelegateHostAcceptance, 'note'> {
+  noteChars: number;
+  noteOmitted: true;
+}
+
+/** Optional paged note read on delegate_result; omit offset for the old result shape. */
+export interface DelegateReviewNotePageRequest {
+  taskId: string;
+  /** Nonnegative Unicode code-point offset. */
+  reviewNoteOffset: number;
+  /** Integer from 1 to 2000, default 2000. Requires reviewNoteOffset. */
+  reviewNoteLimit?: number;
+}
+
+export interface DelegateReviewNotePageResult {
+  ok: true;
+  taskId: string;
+  state: string | null;
+  reviewNote: {
+    offset: number;
+    limit: number;
+    text: string;
+    noteChars: number;
+    nextOffset: number | null;
+    complete: boolean;
+    present: boolean;
+  };
+  hostAcceptance: DelegateCompactHostAcceptance | null;
+  reviewPersistence: DelegateReviewPersistence | null;
 }
 
 /**

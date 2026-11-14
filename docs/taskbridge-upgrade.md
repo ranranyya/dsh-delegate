@@ -6,7 +6,7 @@
 
 1. 等待当前任务结束，关闭旧插件的本机调用开关。
 2. 在 DSH 插件管理中停用并卸载本项目旧 `dsh-delegate` 或 `dsh-taskdispatch` 包。**保留 `<DSH_HOME>/data/dsh-delegate` 数据目录**；DSH 若提供删除数据选项，不要勾选。新旧包不能同时启用。
-3. 在“添加插件”中输入 **`dsh-taskbridge@1.4.0`**。中国大陆镜像未同步时改选 npm 官方源。也可安装本项目 Release 的 `dsh-taskbridge-1.4.0.tgz`，或添加本项目固定 Git 提交的自定义索引。不要手动修改 Desktop 保留的 profile。
+3. 在“添加插件”中输入 **`dsh-taskbridge@1.4.1`**。中国大陆镜像未同步时改选 npm 官方源。也可安装本项目 Release 的 `dsh-taskbridge-1.4.1.tgz`，或添加本项目固定 Git 提交的自定义索引。不要手动修改 Desktop 保留的 profile。
 4. 打开 **DSH TaskBridge** 配置页，核对 API、模型、思考强度和总开关。数据目录与旧版相同；安装前关闭旧开关，避免恢复之前保存的开启状态。
 5. 在 Codex 集成中点击“安装 / 更新 TaskBridge 智能体”，更新智能体及 MCP，然后重新加载 Codex。未修改的旧 `dsh-delegate.toml` 会迁移为 `dsh-taskbridge.toml`；修改过的文件保留。只需修复 MCP 时可使用“仅修复 MCP 配置”。启动自检不会接管其他安装目录。
 6. 若添加过旧索引，改用 `https://ranranyya.github.io/dsh-taskbridge/index.json`。

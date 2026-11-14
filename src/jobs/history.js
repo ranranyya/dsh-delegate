@@ -25,6 +25,7 @@ import * as nodeFs from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 
 import { redactDeep } from '../config/redact.js';
+import { REVIEW_NOTE_MAX_CHARS, truncateCodePoints } from './review-note.js';
 
 /** Persisted document format version. Unknown versions are refused, never migrated. */
 const SCHEMA_VERSION = 1;
@@ -230,7 +231,7 @@ export class HistoryStore {
   async save(view) {
     if (this.disposed) throw this.disposedError();
     if (this.refusal !== null) this.throwIfRefused();
-    const entry = projectView(view, this.maxEntryBytes);
+    let entry = projectView(view, this.maxEntryBytes, { rejectOversizeNote: true });
     const run = this.enqueue(async () => {
       this.throwIfRefused();
       const base = await this.ensureLoaded();
@@ -243,10 +244,64 @@ export class HistoryStore {
         // race must not resurrect a finished task as `running`, so the terminal record
         // wins and the stale checkpoint is discarded instead of stored.
         if (isTerminal(draft[index].state) && !isTerminal(entry.state)) return structuredClone(draft[index]);
+        // Inspect the current row INSIDE the write queue. A terminal snapshot can
+        // have been captured before a review, then queued behind its slow write.
+        const recorded = draft[index].hostAcceptance;
+        if (recorded !== null && recorded !== undefined) {
+          if (entry.hostAcceptance !== null && entry.hostAcceptance !== undefined
+            && (entry.hostAcceptance.state !== recorded.state || entry.hostAcceptance.note !== recorded.note)) {
+            throw new HistoryError(HISTORY_CODES.viewInvalid, 'a saved review cannot be replaced by a task snapshot', {
+              taskId: entry.taskId,
+            });
+          }
+          entry = projectView({ ...entry, hostAcceptance: recorded }, this.maxEntryBytes, { rejectOversizeNote: true });
+        }
         draft[index] = entry;
       } else {
         draft.push(entry);
       }
+      draft.sort(compareStored);
+      const now = Date.now();
+      this.enforceLimits(draft, entry.taskId, now);
+      await this.writeDocument(draft, now);
+      this.jobs = draft;
+      return structuredClone(entry);
+    });
+    return await run;
+  }
+
+  /**
+   * Atomically patch ONE stored record through a caller-supplied mutation.
+   *
+   * The stored row is the base, so a patch can add a conclusion without discarding the
+   * execution evidence already on disk, and it runs on the same write queue as `save` so
+   * two writes can never interleave. The mutation receives a detached copy of the CURRENT
+   * row (re-read under the write) and returns the row to store; throwing refuses with the
+   * caller's error and nothing is written.
+   * @param {string} taskId - stored task id.
+   * @param {(row: object) => object} mutate - mutation of the current stored row.
+   * @returns {Promise<object>} detached copy of the stored entry.
+   * @throws {HistoryError} `HISTORY_VIEW_INVALID` when this task has no stored row.
+   */
+  async update(taskId, mutate) {
+    if (this.disposed) throw this.disposedError();
+    if (this.refusal !== null) this.throwIfRefused();
+    if (typeof taskId !== 'string' || taskId.trim() === '') {
+      throw new HistoryError(HISTORY_CODES.viewInvalid, 'a job history update needs a taskId', {});
+    }
+    const run = this.enqueue(async () => {
+      this.throwIfRefused();
+      const base = await this.ensureLoaded();
+      const index = base.findIndex((job) => job.taskId === taskId);
+      if (index < 0) {
+        throw new HistoryError(HISTORY_CODES.viewInvalid, 'no stored record exists for this task', { taskId });
+      }
+      const entry = projectView(await mutate(structuredClone(base[index])), this.maxEntryBytes, { rejectOversizeNote: true });
+      if (entry.taskId !== taskId) {
+        throw new HistoryError(HISTORY_CODES.viewInvalid, 'a history update may not change the task it patches', { taskId });
+      }
+      const draft = base.map((job) => structuredClone(job));
+      draft[index] = entry;
       draft.sort(compareStored);
       const now = Date.now();
       this.enforceLimits(draft, entry.taskId, now);
@@ -489,9 +544,12 @@ export class HistoryStore {
  * field, a credential or a native handle by widening its own object.
  * @param {object} view - public job view.
  * @param {number} maxEntryBytes - per-entry byte budget.
+ * @param {{ rejectOversizeNote?: boolean }} [options] - `rejectOversizeNote` refuses an
+ *   oversized review note instead of cutting it (writes); a load keeps the cut.
  * @returns {object} bounded, redacted entry.
+ * @throws {HistoryError} when the view, or the note under `rejectOversizeNote`, is invalid.
  */
-function projectView(view, maxEntryBytes) {
+function projectView(view, maxEntryBytes, options = {}) {
   if (!isPlainObject(view)) {
     throw new HistoryError(HISTORY_CODES.viewInvalid, 'a job history view must be an object', {});
   }
@@ -504,6 +562,7 @@ function projectView(view, maxEntryBytes) {
   }
 
   const ctx = newCutContext(view.truncation, maxEntryBytes);
+  const acceptance = acceptanceView(view.hostAcceptance, ctx, { rejectOversize: options.rejectOversizeNote === true });
   const entry = {
     taskId,
     state: view.state,
@@ -545,7 +604,7 @@ function projectView(view, maxEntryBytes) {
     activity: activityView(view.activity),
     error: errorView(view.error, ctx),
     cancelledBy: label(view.cancelledBy),
-    hostAcceptance: acceptanceView(view.hostAcceptance),
+    hostAcceptance: acceptance,
     // A completed job is not an accepted one. This is fixed, never copied.
     selfApproved: false,
   };
@@ -1103,16 +1162,68 @@ function errorView(value, ctx) {
   };
 }
 
-/** @returns {object | null} bounded host-acceptance record. */
-function acceptanceView(value) {
+/**
+ * Bounded host-acceptance record.
+ *
+ * A recorded conclusion is free prose, so `label()` (256 characters) is the wrong rule for
+ * its note: that silently dropped most of a longer conclusion. A note within the shared
+ * code-point bound is kept exactly as written and REFUSED here when it is longer, so a
+ * caller can never be told a shortened conclusion was saved; a document already carrying
+ * more than the bound keeps read-compatible behaviour.
+ * @param {unknown} value - host-acceptance value.
+ * @param {object} ctx - cut context.
+ * @param {{ rejectOversize?: boolean }} [options] - `rejectOversize` refuses instead of cutting.
+ * @returns {object | null} bounded host-acceptance record.
+ * @throws {HistoryError} `HISTORY_VIEW_INVALID` when the note exceeds the bound and
+ *   `rejectOversize` is set.
+ */
+function acceptanceView(value, ctx, options = {}) {
   if (!isPlainObject(value)) return null;
+  const note = options.rejectOversize === true ? requireNote(value.note) : noteText(value.note, ctx);
   return {
     accepted: value.accepted === true,
     state: label(value.state),
     acceptedAt: time(value.acceptedAt),
     by: label(value.by),
-    note: label(value.note),
+    note,
+    noteChars: typeof value.note === 'string' ? Array.from(value.note).length : null,
   };
+}
+
+/**
+ * Validate an incoming note against the shared bound, refusing rather than cutting.
+ * @param {unknown} value - note.
+ * @returns {string | null} the note as given, or null when there is none.
+ * @throws {HistoryError} `HISTORY_VIEW_INVALID` with the actual length and the limit.
+ */
+function requireNote(value) {
+  if (typeof value !== 'string' || value === '') return null;
+  const length = Array.from(value).length;
+  if (length > REVIEW_NOTE_MAX_CHARS) {
+    throw new HistoryError(
+      HISTORY_CODES.viewInvalid,
+      `hostAcceptance.note must be at most ${REVIEW_NOTE_MAX_CHARS} Unicode code points, but it is ${length}`,
+      { field: 'hostAcceptance.note', limit: REVIEW_NOTE_MAX_CHARS, length, unit: 'unicode-code-points' },
+    );
+  }
+  return value;
+}
+
+/**
+ * Keep a stored review note as written, cutting only a value beyond the accepted bound and
+ * stating that cut.
+ * @param {unknown} value - note.
+ * @param {object} ctx - cut context.
+ * @returns {string | null} the note, or null when there is none.
+ */
+function noteText(value, ctx) {
+  if (typeof value !== 'string' || value === '') return null;
+  const bounded = truncateCodePoints(value, REVIEW_NOTE_MAX_CHARS);
+  if (bounded !== value) {
+    ctx.fields.add('hostAcceptance.note');
+    return `${bounded}${TRUNCATION_MARK}`;
+  }
+  return value;
 }
 
 /**
@@ -1179,6 +1290,13 @@ function fitEntry(entry, ctx) {
 
 /**
  * Halve the longest remaining free-text field.
+ *
+ * The recorded host review is NOT in {@link TEXT_PATHS}: an accepted conclusion is the most
+ * valuable prose in the entry, so a large diff or a long worker output is reduced first,
+ * then the long arrays and optional blocks. If a legal note still does not fit beside all
+ * of that, the save is REFUSED — a conclusion is never shortened and then reported saved.
+ * Only a note past the accepted bound (another writer's document) is cut, by
+ * {@link noteText}, with the cut stated.
  * @param {object} entry - mutable entry.
  * @param {object} ctx - cut context.
  * @returns {boolean} whether anything was cut.

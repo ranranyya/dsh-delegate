@@ -1347,6 +1347,37 @@ export function hasLiveTasks(tasks) {
 }
 
 /**
+ * Whether a task's RECORD may still change, which is a wider question than "is it running".
+ *
+ * A finished run is terminal as an execution, but its record is not settled: it waits for
+ * the host's review, and a review written by the commander can be mid-save. The page must
+ * keep refreshing while any of that is true, or a conclusion written from outside appears
+ * only after a manual reload — and it must stop once the conclusion is durable, or the page
+ * polls a row that will never change again.
+ * @param {object} task - task view.
+ * @returns {boolean} true while the record may still change.
+ */
+export function isTaskRecordChanging(task) {
+  if (isLiveTask(task)) return true;
+  if (task?.state === 'awaiting-host-review') {
+    // A stored conclusion still waiting for confirmation is not a fixed record yet.
+    const persistence = task.reviewPersistence;
+    if (persistence !== null && typeof persistence === 'object') return persistence.durable !== true;
+    return task.hostAcceptance === null || task.hostAcceptance === undefined;
+  }
+  return task?.reviewPersistence?.pending === true;
+}
+
+/**
+ * Whether any of these tasks has a record that may still change.
+ * @param {object[]} tasks - task views.
+ * @returns {boolean} true when a refresh could still learn something.
+ */
+export function hasChangingRecords(tasks) {
+  return Array.isArray(tasks) && tasks.some(isTaskRecordChanging);
+}
+
+/**
  * Pre-flight checks for the silence thresholds AND the repeated-failure count.
  *
  * Mirrors `validateMonitoringSettings`. Kept separate because the monitoring save has
@@ -1416,15 +1447,23 @@ export function precheckMonitoring(monitoring) {
 export function taskOutcome(task) {
   const state = String(task?.state ?? '');
   const acceptance = task?.hostAcceptance;
+  const persistence = task?.reviewPersistence;
   // Only an explicit `accepted === true` is acceptance. The presence of an object is NOT
-  // enough: a `changes-requested` record is also an object.
-  const accepted = acceptance !== null && acceptance !== undefined && acceptance.accepted === true;
-  const decided = acceptance !== null && acceptance !== undefined;
+  // enough: a `changes-requested` record is also an object — and neither is a conclusion
+  // that is still being written, which is why a non-durable record is not `decided`.
+  const decided = (acceptance !== null && acceptance !== undefined)
+    && (persistence === null || persistence === undefined || persistence.durable !== false);
+  const accepted = decided && acceptance?.accepted === true;
   const executed = state === 'awaiting-host-review' || decided;
   let label;
   let tone;
   let note;
   let phaseLabel;
+  // A conclusion that is being written, or whose write was never confirmed, is its OWN
+  // state: the page must not claim 审查通过 before the record is durable, and must not
+  // hide a pending decision behind "等待宿主审查".
+  const saving = persistence?.pending === true;
+  const failedWrite = persistence?.state === 'failed';
   if (accepted) {
     label = '审查通过';
     tone = 'on';
@@ -1435,6 +1474,18 @@ export function taskOutcome(task) {
     label = '需要修正';
     tone = 'warn';
     note = '宿主已记录验收结论：需要修正（本任务的执行结果未被接受）。';
+    phaseLabel = null;
+  } else if (saving) {
+    label = persistence.state === 'timed-out' ? '审查结论保存未确认' : '审查结论保存中';
+    tone = 'warn';
+    note = persistence.state === 'timed-out'
+      ? '审查结论已发出但尚未确认写入；插件会继续读取同一任务直到确认，不要重新派工。'
+      : '审查结论正在写入，确认保存后才会显示审查通过或需要修正。';
+    phaseLabel = null;
+  } else if (failedWrite) {
+    label = '审查结论保存失败';
+    tone = 'warn';
+    note = '审查结论未能写入，未记录为已验收；可对同一任务重试。';
     phaseLabel = null;
   } else if (state === 'awaiting-host-review') {
     label = '等待宿主审查';
@@ -1500,6 +1551,76 @@ export function hostReviewLine(task, formatTime) {
     ? `：${boundedText(acceptance.note, 200)}`
     : '';
   return `${label}${at}${note}`;
+}
+
+/**
+ * Length of a review note in Unicode code points.
+ * @param {unknown} value - note.
+ * @returns {number} code-point count (0 for a non-string).
+ */
+export function reviewNoteChars(value) {
+  return typeof value === 'string' ? Array.from(value).length : 0;
+}
+
+/** How many code points of a review note a LIST shows. */
+export const REVIEW_NOTE_PREVIEW_CHARS = 200;
+
+/**
+ * The list preview of a recorded review note, and whether the whole note is longer.
+ *
+ * The preview is a display cut of the SAVED body: the body itself is never shortened (that
+ * is a storage rule), and `truncated` tells the page to offer the full text.
+ * @param {object} task - task view.
+ * @returns {{ text: string, chars: number, truncated: boolean, omitted: boolean } | null} preview.
+ */
+export function reviewNotePreview(task) {
+  const acceptance = task?.hostAcceptance;
+  if (acceptance === null || acceptance === undefined) return null;
+  // A note read back from a compact answer is stated as omitted: the text exists, the
+  // answer does not carry it, so the page must offer the full read instead of "no note".
+  if (acceptance.noteOmitted === true && typeof acceptance.note !== 'string') {
+    const chars = Number.isFinite(acceptance.noteChars) ? acceptance.noteChars : 0;
+    return { text: '', chars, truncated: chars > 0, omitted: true };
+  }
+  const note = typeof acceptance.note === 'string' ? acceptance.note : '';
+  const all = Array.from(note);
+  return {
+    text: all.slice(0, REVIEW_NOTE_PREVIEW_CHARS).join(''),
+    chars: all.length,
+    truncated: all.length > REVIEW_NOTE_PREVIEW_CHARS,
+    omitted: false,
+  };
+}
+
+/**
+ * How often the page refreshes while a record may still change, in milliseconds.
+ *
+ * Kept here rather than in the page so the hook and the page share one number.
+ */
+export const RECORD_REFRESH_INTERVAL_MS = 5000;
+
+/**
+ * The refresh decision for one render of the task view.
+ *
+ * Separates "is the execution running" (a status display question) from "may the RECORD
+ * still change" (a polling question): a task waiting for review, or a review mid-save,
+ * keeps the page polling even though nothing is executing — and the page stops once every
+ * visible record is settled. Hidden pages never poll, and a page that is already loading
+ * never starts a second request.
+ * @param {object} input - `tasks`, `selectedTask`, `visible`, `loading`.
+ * @returns {{ refresh: boolean, intervalMs: number, reason: string }} plan.
+ */
+export function recordRefreshPlan(input = {}) {
+  const all = [];
+  if (Array.isArray(input.tasks)) all.push(...input.tasks);
+  if (input.selectedTask !== null && input.selectedTask !== undefined) all.push(input.selectedTask);
+  const changing = hasChangingRecords(all);
+  const intervalMs = RECORD_REFRESH_INTERVAL_MS;
+  if (input.visible === false) return { refresh: false, intervalMs, reason: 'hidden' };
+  if (changing !== true) return { refresh: false, intervalMs, reason: 'settled' };
+  // One request at a time: a refresh already in flight owns the next tick.
+  if (input.loading === true) return { refresh: false, intervalMs, reason: 'loading' };
+  return { refresh: true, intervalMs, reason: 'changing' };
 }
 /**
  * Discoverable changed-file list in a task's diff payload.

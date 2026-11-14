@@ -204,6 +204,20 @@ node bin/dsh-delegate-control.js cancel <taskId>   # 只停止这一个任务
 
 ## 7. 续接（跟进任务）
 
+### 1.4.1：审查保存与长备注
+
+原身份可读取和补审已结束的历史任务，重启不恢复执行或旧审批。审查备注统一最多
+8000 Unicode 码点（输入去除首尾空白并脱敏），合法正文完整保存，超限或容量不足明确拒绝。
+`reviewPersistence` 区分 `saving`、`timed-out`、`saved`、`failed`；超过 5 秒只是尚未确认，
+不能宣称保存失败或提前通过。晚到结果通过状态读取确认；确定失败可重试。
+
+等待仅带结论状态和长度。结果中的 `noteOmitted: true` 表示正文被明确省略，使用
+`delegate_result({ taskId, reviewNoteOffset: 0 })` 按 `nextOffset` 读取；默认每页 2000 码点，
+可选 `reviewNoteLimit` 范围 1—2000，直到 `complete: true`。列表 200 码点预览与详情展开
+不改变保存正文；可见页面的待审／保存中刷新由程序完成，不唤醒 GPT。
+
+### 同一任务继续修正
+
 同一个任务的修改、纠正或重试，用 `continueFromTaskId` 提交，并继续使用**同一个**
 已授权的源工作区路径。这样跟进任务会续接同一条 DSH 对话、落在同一棵工作树里。
 不相关的任务不要复用 id，也不要为了"保持上下文"而续接。

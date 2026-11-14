@@ -339,6 +339,14 @@ export const KNOWN_AGENT_TEMPLATES = [
   // Exact published 1.2.0 bytes (archive fixture, LF and CRLF forms).
   { version: '1.2.0', sha256: '8479c8ab418d71b15fb30880aa5149fb1070d194e8444a110a2a614cebf4eaf4' },
   { version: '1.2.0', sha256: '947f3fb8a8e9ae5cc6fb3c9d379c69b595af4c46f89ac77f69aa1edf696a8f8e' },
+  // Exact 1.4.0 bytes, taken from that release's own `codex/dsh-taskbridge.toml`
+  // (`tests/fixtures/agent-1.4.0.toml`, written by 1.4.0 and stamped by ITS renderer), in
+  // the LF form it was published in and the CRLF form a Windows install rewrites it to.
+  // These are the digests of the OLD file, never derived from the new template: that is what
+  // lets an untouched 1.4.0 install be recognised and refreshed, while any operator edit
+  // still hashes to something unknown and is left alone.
+  { version: '1.4.0', sha256: '2b2f6c35ffc9e99d98f38d00e07fef11de8bf96a9dd446e80889fcf92ba45cd8' },
+  { version: '1.4.0', sha256: 'cfb21bc510b47be27c5e64bce86c48cbc9a49055777cd265e118ed942a94d9a5' },
 ];
 
 /** The `version = "…"` line of an agent file, at column 0. */

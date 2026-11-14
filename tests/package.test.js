@@ -56,7 +56,7 @@ const SUPPORTED_DSH_RANGE = SUPPORTED_DSH_VERSIONS.join(' || ');
  * so asserting itself would pass for any value. `1.4.0` is the silent-wait reliability
  * release: truthful phases, the repeated-failure reminder and the outer-wait contract.
  */
-const DELIVERABLE_VERSION = '1.4.0';
+const DELIVERABLE_VERSION = '1.4.1';
 
 /**
  * The published build this release upgrades *from*.
@@ -65,7 +65,7 @@ const DELIVERABLE_VERSION = '1.4.0';
  * current version must be exactly one PATCH above this baseline (a correction release),
  * and the two are different versions by construction.
  */
-const PREVIOUS_VERSION = '1.3.1';
+const PREVIOUS_VERSION = '1.4.0';
 
 // Published prior builds are retained only where the migration/ownership contract
 // names them. Other operator-facing and shipped code must not carry stale versions.

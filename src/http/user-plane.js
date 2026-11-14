@@ -371,7 +371,7 @@ export function userPlaneRoutes(deps) {
         // it), so the response says so rather than leaving a silent gap.
         return jsonResponse(200, {
           ok: true,
-          task: { ...archivedRecord(archived), prompt: null, promptArchived: false },
+          task: { ...archivedRecord(deps, archived), prompt: null, promptArchived: false },
           history: historyStatus({ available: true, archived: jobs.length }),
         });
       },
@@ -768,9 +768,10 @@ function engineRecord(deps, taskId) {
  * @param {object} job - detached view returned by `HistoryStore.load()`.
  * @returns {object} a new object; nested blocks are the store's already-redacted ones.
  */
-function archivedRecord(job) {
+function archivedRecord(deps, job) {
+  const view = typeof deps.engine.historyViewOf === 'function' ? deps.engine.historyViewOf(job) : job;
   return {
-    ...job,
+    ...view,
     // No live run exists, so there is nothing further to withhold or replay.
     archived: true,
     live: false,
@@ -803,7 +804,7 @@ async function readTaskRecords(deps, options = {}) {
   for (const job of archive.jobs) {
     if (liveIds.has(job.taskId)) continue;
     if (filtered && job.connectionId !== options.connectionId) continue;
-    merged.push(archivedRecord(job));
+    merged.push(archivedRecord(deps, job));
   }
   merged.sort(compareNewestFirst);
 

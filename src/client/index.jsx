@@ -86,6 +86,11 @@ import {
   hasLiveTasks,
   formatDuration,
   hostReviewLine,
+  RECORD_REFRESH_INTERVAL_MS,
+  REVIEW_NOTE_PREVIEW_CHARS,
+  recordRefreshPlan,
+  reviewNotePreview,
+  hasChangingRecords,
   isLiveTask,
   minutesToSeconds,
   monitoringDraftOf,
@@ -1775,6 +1780,53 @@ function ReviewPanel({ store, snapshot }) {
 // ---------------------------------------------------------------------------
 
 /**
+ * The full recorded review note of one task, expandable and copyable.
+ *
+ * The note itself is never shortened — the list shows a preview, this shows the whole text —
+ * and a copy that fails says so instead of pretending the clipboard holds it.
+ * @param {object} props - `task`.
+ * @returns {object} the detail control.
+ */
+function ReviewNoteDetail({ task }) {
+  const [open, setOpen] = useState(false);
+  const [copyState, setCopyState] = useState(null);
+  const preview = reviewNotePreview(task);
+  if (preview === null) return '未记录（插件不会自行验收）';
+  if (preview.omitted === true) {
+    return `审查意见已保存（${preview.chars} 字符），当前读取结果省略正文；可在结果详情中按需读取全文。`;
+  }
+  if (preview.chars === 0) return '（无审查意见正文）';
+  const full = typeof task?.hostAcceptance?.note === 'string' ? task.hostAcceptance.note : '';
+  const copy = () => {
+    const clipboard = globalThis.navigator?.clipboard;
+    if (typeof clipboard?.writeText !== 'function') {
+      setCopyState('复制失败：浏览器不支持写入剪贴板，请手动选择文本。');
+      return;
+    }
+    void Promise.resolve().then(() => clipboard.writeText(full)).then(
+      () => { setCopyState('已复制完整审查意见'); },
+      () => { setCopyState('复制失败：浏览器未允许写入剪贴板，请手动选择文本。'); },
+    );
+  };
+  return (
+    <div className="dshdg-note">
+      <div className="dshdg-row">
+        <span className="dshdg-hint">{preview.chars} 字符</span>
+        <span className="dshdg-spacer" />
+        {preview.chars > REVIEW_NOTE_PREVIEW_CHARS ? (
+          <button type="button" onClick={() => setOpen(!open)}>{open ? '收起' : '展开全文'}</button>
+        ) : null}
+        <button type="button" onClick={copy}>复制全文</button>
+      </div>
+      {copyState === null ? null : <p className="dshdg-hint">{copyState}</p>}
+      {open || preview.chars <= REVIEW_NOTE_PREVIEW_CHARS
+        ? <pre className="dshdg-mono dshdg-note-full">{full}</pre>
+        : <pre className="dshdg-mono dshdg-note-preview">{`${preview.text}…`}</pre>}
+    </div>
+  );
+}
+
+/**
  * One task's details: effective config, diff, evidence, usage, review outcome.
  * @param {object} props - `store`, `task`.
  * @returns {object} the detail card.
@@ -1896,6 +1948,8 @@ function TaskDetail({ store, task }) {
         </dd>
         <dt>宿主验收</dt>
         <dd>{hostReviewLine(task, formatTime)}</dd>
+        <dt>完整审查意见</dt>
+        <dd><ReviewNoteDetail key={task.taskId} task={task} /></dd>
       </dl>
 
       <h4>改动文件</h4>
@@ -1982,33 +2036,43 @@ function TaskDetail({ store, task }) {
  *
  *  * it runs ONLY while the tasks tab is mounted (the effect lives in `TasksPanel`),
  *    so switching tabs or unmounting clears the timer;
- *  * it runs ONLY while there is something that can change — a live task in the list
- *    or a live selected detail. A page full of terminal records never polls;
- *  * it skips a hidden document (`document.hidden`) and registers a
- *    `visibilitychange` listener so returning to the tab reads immediately instead
- *    of waiting out the interval;
- *  * it never overlaps: a refresh in flight suppresses the next tick, and the
- *    interval is reset after each attempt, so a slow host cannot accumulate calls;
+ *  * it runs while any RECORD may still change — a running task, a task awaiting host
+ *    review, or a review that is still being written — not only while something is
+ *    executing. A finished run's conclusion is written by the commander, and a page that
+ *    stopped polling when execution ended would never show it;
+ *  * it stops once every visible record is settled (the conclusion is durable);
+ *  * it skips a hidden document and registers a `visibilitychange` listener so returning
+ *    to the tab reads immediately instead of waiting out the interval;
+ *  * it never overlaps: a refresh in flight suppresses the next tick;
  *  * it is a pure read of the task list — no model call, no task action, no settings
- *    write — so it cannot disturb an unsaved draft or the selected task.
- *
- * The interval is deliberately much slower than the host's 5 s suggestion is worth
- * fighting over: 5 s of list reads costs nothing and keeps the page truthful.
+ *    write — so it cannot disturb an unsaved draft or the selected task;
+ *  * a failed refresh keeps the records already shown and states the failure.
  * @param {object} props - `store`, `snapshot`, `intervalMs`.
  * @returns {object | null} nothing (side effects only).
  */
-function useTaskAutoRefresh({ store, snapshot, intervalMs = 5000 }) {
-  const live = hasLiveTasks(snapshot.tasks) || (snapshot.taskDetail !== null && isLiveTask(snapshot.taskDetail));
+function useTaskAutoRefresh({ store, snapshot, intervalMs = RECORD_REFRESH_INTERVAL_MS }) {
+  const plan = recordRefreshPlan({
+    tasks: snapshot.tasks,
+    selectedTask: snapshot.taskDetail,
+    visible: globalThis.document?.hidden !== true,
+    loading: snapshot.loading?.tasks === true,
+  });
+  const changing = hasChangingRecords([
+    ...(Array.isArray(snapshot.tasks) ? snapshot.tasks : []),
+    ...(snapshot.taskDetail === null || snapshot.taskDetail === undefined ? [] : [snapshot.taskDetail]),
+  ]);
   // Read through a ref so the effect does not restart on every store revision: a
   // restarted effect would reset the timer constantly and effectively poll far
   // faster than the interval.
-  const liveRef = useRef(live);
-  liveRef.current = live;
+  const changingRef = useRef(changing);
+  changingRef.current = changing;
+  const [refreshError, setRefreshError] = useState(null);
 
   useEffect(() => {
-    if (!live) return undefined;
+    if (!changing) return undefined;
     let timer = null;
     let disposed = false;
+    let inFlight = false;
 
     const schedule = () => {
       if (disposed) return;
@@ -2017,22 +2081,38 @@ function useTaskAutoRefresh({ store, snapshot, intervalMs = 5000 }) {
       timer.unref?.();
     };
 
+    const read = () => {
+      if (inFlight) return;
+      inFlight = true;
+      setRefreshError(null);
+      void store.refreshTasks('auto').then((result) => {
+        // A failed read keeps the records already shown (the store does not clear them) and
+        // is stated as a refresh problem — never as a lost task or a failed execution.
+        if (result?.ok === false) setRefreshError(describeError(result.error));
+      }).finally(() => {
+        inFlight = false;
+        schedule();
+      });
+    };
+
     const tick = () => {
       timer = null;
       if (disposed) return;
       // A hidden tab is not watching anything: skip the read entirely, and let the
       // visibility listener below schedule the next one when it comes back.
       if (globalThis.document?.hidden === true) return;
-      if (!liveRef.current) return;
-      void store.refreshTasks('auto').finally(() => { schedule(); });
+      if (!changingRef.current) return;
+      read();
     };
 
     const onVisibility = () => {
       if (globalThis.document?.hidden === true) return;
-      if (!liveRef.current) return;
+      if (!changingRef.current) return;
       if (timer !== null) clearTimeout(timer);
       timer = null;
-      void store.refreshTasks('auto').finally(() => { schedule(); });
+      // Coming back to the page reads once IMMEDIATELY: the operator must not wait out
+      // an interval to see what changed while the tab was hidden.
+      read();
     };
 
     schedule();
@@ -2044,28 +2124,66 @@ function useTaskAutoRefresh({ store, snapshot, intervalMs = 5000 }) {
       timer = null;
       doc?.removeEventListener?.('visibilitychange', onVisibility);
     };
-  }, [store, live, intervalMs]);
+  }, [store, changing, intervalMs]);
+  return { ...plan, refreshError };
+}
+
+/**
+ * The review-note preview of one task row: at most 200 code points, plus a clear way to
+ * read the whole note. The preview is a display cut; the saved body is untouched.
+ * @param {object} props - `task`, `onOpen`.
+ * @returns {object | null} the preview line, or null when there is no conclusion.
+ */
+function TaskListNote({ task, onOpen }) {
+  const preview = reviewNotePreview(task);
+  if (preview === null) return null;
+  if (preview.omitted === true) {
+    return (
+      <p className="dshdg-hint">
+        {`审查意见已保存（${preview.chars} 字符），此处省略正文。`}
+        <button type="button" className="dshdg-link" onClick={onOpen}>查看完整审查意见</button>
+      </p>
+    );
+  }
+  if (preview.chars === 0) return null;
+  return (
+    <p className="dshdg-hint dshdg-note-preview">
+      {`审查意见：${preview.text}${preview.truncated ? '…' : ''}（${preview.chars} 字符）`}
+      {preview.truncated
+        ? <button type="button" className="dshdg-link" onClick={onOpen}>查看完整审查意见</button>
+        : null}
+    </p>
+  );
 }
 
 function TasksPanel({ store, snapshot }) {
   const tasks = snapshot.tasks ?? [];
   const detail = snapshot.taskDetail;
-  useTaskAutoRefresh({ store, snapshot });
+  const plan = useTaskAutoRefresh({ store, snapshot });
   const liveCount = tasks.filter(isLiveTask).length;
+  const changing = hasChangingRecords([
+    ...tasks,
+    ...(detail === null || detail === undefined ? [] : [detail]),
+  ]);
   return (
     <div className="dshdg-panel">
       <div className="dshdg-row">
         <p className="dshdg-muted">这里只记录执行事实。执行完成不等于被接受：“等待宿主审查”要由宿主（例如 Codex）单独给出结论。</p>
         <span className="dshdg-spacer" />
         <span className="dshdg-hint">
-          {liveCount === 0 && !(detail !== null && isLiveTask(detail))
-            ? '当前没有运行中的任务，不会自动刷新。'
-            : `有 ${liveCount} 个进行中的任务，页面可见时每 5 秒自动刷新一次（只读，不调用模型）。`}
+          {changing !== true
+            ? '当前没有会变化的记录，不会自动刷新。'
+            : `${liveCount > 0 ? `有 ${liveCount} 个进行中的任务；` : ''}有记录可能变化（待审或结论保存中），页面可见时每 5 秒只读刷新一次（不调用模型）。`}
         </span>
         <button type="button" disabled={snapshot.loading?.tasks === true} onClick={() => { void store.refreshTasks('manual'); }}>
           {snapshot.loading?.tasks === true ? '读取中…' : '刷新'}
         </button>
       </div>
+      {plan.refreshError !== null && plan.refreshError !== undefined ? (
+        <p className="dshdg-warn">
+          自动刷新失败（{String(plan.refreshError)}），下面仍是上次读取的内容；可点“刷新”重试。
+        </p>
+      ) : null}
       {tasks.length === 0 ? <p className="dshdg-faint">还没有任务记录。</p> : (
         <div className="dshdg-list">
           {tasks.map((task) => {
@@ -2109,6 +2227,7 @@ function TasksPanel({ store, snapshot }) {
                   </button>
                 </div>
                 <p className="dshdg-hint">{progress.headline}</p>
+                <TaskListNote task={task} onOpen={() => { void store.openTask(task.taskId); }} />
                 {isAwaitingPermission(task)
                   ? <p className="dshdg-hint">{permissionSummary(task).note}</p>
                   : null}

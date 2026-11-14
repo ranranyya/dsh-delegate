@@ -20,7 +20,7 @@ import { WorkspaceLocks } from '../src/workspace/locks.js';
 import { AuthorizationRegistry } from '../src/auth/grants.js';
 import { createExecutionHandler } from '../src/http/execution-plane.js';
 import { mockRequest, mockResponse } from './helpers/node-http-mocks.js';
-import { createMcpServer } from '../src/mcp/server.js';
+import { createMcpServer, MAX_REVIEW_NOTE_CHARS } from '../src/mcp/server.js';
 import { taskOutcome, taskProgress, hostReviewBadge, hostReviewLine } from '../src/client/api.js';
 import {
   cleanup,
@@ -296,7 +296,7 @@ test('an empty, oversized, wrong-vocabulary or non-string decision is refused', 
     const cases = [
       { decision: 'accepted', note: '' },
       { decision: 'accepted', note: '   ' },
-      { decision: 'accepted', note: 'x'.repeat(1_001) },
+      { decision: 'accepted', note: 'x'.repeat(8_001) },
       { decision: 'approved', note: 'ok' },
       { decision: 'accepted', note: 42 },
       { decision: undefined, note: 'ok' },
@@ -308,11 +308,13 @@ test('an empty, oversized, wrong-vocabulary or non-string decision is refused', 
         `${JSON.stringify(input).slice(0, 60)} must be refused`,
       );
     }
-    // The exact bound is accepted.
+    // The exact bound is accepted, and the whole note survives.
+    const note = 'y'.repeat(8_000);
     const atLimit = await h.engine.recordHostReview({
-      connectionId: 'local-mcp', taskId, decision: 'accepted', note: 'y'.repeat(1_000),
+      connectionId: 'local-mcp', taskId, decision: 'accepted', note,
     });
-    assert.equal(atLimit.hostAcceptance.note.length, 1_000);
+    assert.equal(atLimit.hostAcceptance.note, note);
+    assert.equal(Array.from(atLimit.hostAcceptance.note).length, 8_000);
   } finally {
     await h.close();
   }
@@ -599,10 +601,12 @@ test('POST /tasks/review records the decision and refuses unknown fields or a fo
     assert.equal(unknown.status, 400);
     assert.equal(unknown.body.error.code, 'REVIEW_ARGUMENT_UNKNOWN');
 
-    // A note over the bound never reaches the engine.
-    const tooLong = await callPlane(deps, '/tasks/review', { taskId, decision: 'accepted', note: 'z'.repeat(1_001) });
+    // A note over the bound never reaches the engine; its actual length is reported.
+    const tooLong = await callPlane(deps, '/tasks/review', { taskId, decision: 'accepted', note: 'z'.repeat(8_001) });
     assert.equal(tooLong.status, 400);
     assert.equal(tooLong.body.error.code, 'REVIEW_NOTE_TOO_LONG');
+    assert.equal(tooLong.body.error.details.length, 8_001);
+    assert.equal(tooLong.body.error.details.limit, 8_000);
 
     // Another recorded conclusion is a refusal with the engine's own code.
     const conflict = await callPlane(deps, '/tasks/review', { taskId, decision: 'changes-requested', note: 'different' });
@@ -625,8 +629,10 @@ test('the MCP catalog advertises delegate_review with a closed schema, and its r
   assert.deepEqual(Object.keys(review.inputSchema.properties).sort(), ['decision', 'note', 'taskId']);
   assert.deepEqual(review.inputSchema.required, ['taskId', 'decision', 'note']);
   assert.equal(review.inputSchema.additionalProperties, false);
-  assert.deepEqual(review.inputSchema.properties.decision.enum, ['accepted', 'changes-requested']);
-  assert.equal(review.inputSchema.properties.note.maxLength, 1_000);
+  assert.deepEqual([...review.inputSchema.properties.decision.enum], ['accepted', 'changes-requested']);
+  assert.equal(review.inputSchema.properties.note.maxLength, MAX_REVIEW_NOTE_CHARS);
+  assert.equal(MAX_REVIEW_NOTE_CHARS, 8_000);
+  assert.equal(review.inputSchema.properties.note.codePointLength, true, 'the bound is counted in code points');
 
   const answer = await server.handle({
     jsonrpc: '2.0', id: 3, method: 'tools/call',
@@ -638,7 +644,7 @@ test('the MCP catalog advertises delegate_review with a closed schema, and its r
   // Undeclared arguments and an over-long note are refused before the plane.
   for (const args of [
     { taskId: 't1', decision: 'accepted', note: 'ok', extra: 1 },
-    { taskId: 't1', decision: 'accepted', note: 'q'.repeat(1_001) },
+    { taskId: 't1', decision: 'accepted', note: 'q'.repeat(8_001) },
     { taskId: 't1', decision: 'approved', note: 'ok' },
   ]) {
     seen.length = 0;

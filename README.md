@@ -1,5 +1,7 @@
 # DSH TaskBridge
 
+**1.4.1** 修复跨重启补审、审查保存一致性及长备注，详见 [1.4.1 更新说明](docs/releases/1.4.1.zh.md)。安装标识为 `dsh-taskbridge@1.4.1`，也可使用对应的 `.tgz` 安装包。
+
 **让 Claude Code 或 Codex 指挥 DSH 完成任务，在 DSH 插件中配置 API、执行模型和思考强度。**
 
 你向指挥端提出目标；指挥端规划、拆分、派工和审查，DSH 根据插件设置执行。插件可选择 DSH 已接入的 API 提供方、执行模型及其支持的思考强度，并配置超时、并发与工作区隔离；额外模型审查可单独开关和配置。任务交付后集中审查，需要改进时续接同一任务对话。
@@ -16,7 +18,7 @@ DeepSeek Harness（DSH）的委托插件：让 MCP 宿主在你开启本机总�
 新安装时本机调用总开关默认关闭。开关状态会保存在插件设置中，重启后恢复保存值；
 关闭时拒绝新的委派任务，并请求停止正在运行的任务。
 
-> **发布版本：`1.4.0`（静默等待、重复失败提醒与审查状态闭环）。** 源码仓库和可下载的 Release
+> **当前版本：`1.4.1`（跨重启补审、可靠保存与长备注）。** 源码仓库和可下载的 Release
 > 位于 [GitHub](https://github.com/ranranyya/dsh-taskbridge)。npm 安装标识为 **`dsh-taskbridge`**，
 > GitHub Release 同时提供 `.tgz`。`1.1.0` 的静默等待说明见
 > [`docs/silent-wait.md`](./docs/silent-wait.md)；`1.2.0` 修正了其中三处真实问题（等待中断的
@@ -47,13 +49,13 @@ profile 是**应用保留的**：npm / `dsh plugin` CLI 对该 profile 的操作
 Desktop 侧的包操作只能交给应用完成——不要在 Desktop 的正式 profile 里执行 npm/pnpm
 命令，也不要直接编辑其中的文件。
 
-1. 打开 Desktop 的 **Plugins manager → 添加插件**，输入 **`dsh-taskbridge@1.4.0`**。
+1. 打开 Desktop 的 **Plugins manager → 添加插件**，输入 **`dsh-taskbridge@1.4.1`**。
    若中国大陆镜像尚未同步，先选择 npm 官方源再重试。安装后的显示名为 **DSH TaskBridge**。
    也可以从本项目 Release 下载 `.tgz`，或在仓库根目录打包：
 
    ```bash
    npm pack
-   #    → dsh-taskbridge-1.4.0.tgz
+   #    → dsh-taskbridge-1.4.1.tgz
    ```
 
 2. 使用本地包时，通过 **添加插件**入口选择下载或生成的 `.tgz`（或本仓库目录）完成安装。
@@ -67,7 +69,7 @@ Desktop 侧的包操作只能交给应用完成——不要在 Desktop 的正式
 
 ```bash
 # 装进一个 profile（例：web）
-dsh plugin --profile web add ./dsh-taskbridge-1.4.0.tgz && dsh plugin --profile web why dsh-taskbridge
+dsh plugin --profile web add ./dsh-taskbridge-1.4.1.tgz && dsh plugin --profile web why dsh-taskbridge
 
 # 启动（首次启动会自动把插件 bundle 追加到 dsh.profile.bundles）
 dsh --profile web
@@ -80,7 +82,7 @@ dsh --profile web
 ### 说明与注意
 
 - **不要装进你正在用的正式 profile 做试验。** 建议先用一次性 profile：
-  `dsh plugin --profile dsh-delegate-try add ./dsh-taskbridge-1.4.0.tgz`，再把
+  `dsh plugin --profile dsh-delegate-try add ./dsh-taskbridge-1.4.1.tgz`，再把
   `DSH_HOME` 指向临时目录做隔离验证。该命令同样只用于 CLI profile。
 - 该包声明了 `@deepseek-ai/dsh-*` 的 peer，若你的包管理器默认自动安装 peer，
   安装过程会尝试解析这些版本。可显式关闭：`npm_config_auto_install_peers=false`
@@ -515,7 +517,7 @@ Codex 子智能体现在按「提交 → `delegate_wait` 同一任务」运作�
 # 不要在 Desktop 的正式 profile 下执行下面的 CLI 命令。
 
 # CLI web profile 的升级：换成本地新包或（将来）新版本
-dsh plugin --profile web add ./dsh-taskbridge-1.4.0.tgz
+dsh plugin --profile web add ./dsh-taskbridge-1.4.1.tgz
 
 # 导出：界面里"导出非敏感配置"按钮，或用只读 API
 #   GET /api/dsh-delegate/settings

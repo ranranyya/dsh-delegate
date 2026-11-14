@@ -1,6 +1,6 @@
 {
   "name": "dsh-taskbridge",
-  "version": "1.4.0",
+  "version": "1.4.1",
   "description": "让 Claude Code 或 Codex 指挥 DSH 完成任务；在 DSH 插件中配置 API、执行模型、思考强度、权限审批与集中审查。",
   "license": "MIT",
   "repository": {
@@ -75,7 +75,8 @@
     "docs/plugin-market.md",
     "docs/taskbridge-upgrade.md",
     "docs/releases/1.4.0.zh.md",
-    "docs/releases/1.4.0-token-benchmark.zh.md"
+    "docs/releases/1.4.0-token-benchmark.zh.md",
+    "docs/releases/1.4.1.zh.md"
   ],
   "dsh": {
     "manifestVersion": 1,
