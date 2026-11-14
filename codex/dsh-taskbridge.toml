@@ -1,7 +1,7 @@
 # dsh-taskbridge Codex companion — managed by the DSH TaskBridge plugin settings page.
 # Editing this file turns it into an operator-owned file: the plugin then never
 # overwrites or removes it, and reports it as "modified" instead.
-version = "1.4.1"
+version = "1.4.2"
 
 name = "dsh-taskbridge"
 description = "Dispatch an explicitly assigned implementation task to DSH through the dsh-taskbridge MCP tools, then return evidence for Codex review."

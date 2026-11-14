@@ -1,6 +1,6 @@
 # DSH TaskBridge
 
-**1.4.1** 修复跨重启补审、审查保存一致性及长备注，详见 [1.4.1 更新说明](docs/releases/1.4.1.zh.md)。安装标识为 `dsh-taskbridge@1.4.1`，也可使用对应的 `.tgz` 安装包。
+**1.4.2** 默认通用，不再按 DSH 版本白名单拦截安装或加载；保留必要的运行时接口检查。详见 [1.4.2 更新说明](docs/releases/1.4.2.zh.md)。
 
 **让 Claude Code 或 Codex 指挥 DSH 完成任务，在 DSH 插件中配置 API、执行模型和思考强度。**
 
@@ -18,7 +18,7 @@ DeepSeek Harness（DSH）的委托插件：让 MCP 宿主在你开启本机总�
 新安装时本机调用总开关默认关闭。开关状态会保存在插件设置中，重启后恢复保存值；
 关闭时拒绝新的委派任务，并请求停止正在运行的任务。
 
-> **当前版本：`1.4.1`（跨重启补审、可靠保存与长备注）。** 源码仓库和可下载的 Release
+> **当前版本：`1.4.2`（移除 DSH 版本白名单，默认通用加载）。** 源码仓库和可下载的 Release
 > 位于 [GitHub](https://github.com/ranranyya/dsh-taskbridge)。npm 安装标识为 **`dsh-taskbridge`**，
 > GitHub Release 同时提供 `.tgz`。`1.1.0` 的静默等待说明见
 > [`docs/silent-wait.md`](./docs/silent-wait.md)；`1.2.0` 修正了其中三处真实问题（等待中断的
@@ -30,7 +30,7 @@ DeepSeek Harness（DSH）的委托插件：让 MCP 宿主在你开启本机总�
 
 | 项 | 要求 | 说明 |
 | --- | --- | --- |
-| DSH | `0.2.0-rc.2` / `0.2.1-rc.2` / `0.2.1-rc.3` / `0.2.2-rc.1` | `peerDependencies` 精确声明这四个版本的范围（`0.2.0-rc.2 \|\| 0.2.1-rc.2 \|\| 0.2.1-rc.3 \|\| 0.2.2-rc.1`）；DSH 启动时会用 `semver` 加 `includePrerelease` 校验 `@deepseek-ai/dsh-*` 的 peer 范围，不匹配的插件行会被拒绝加载（`skippedBundles` / denied row）。`0.2.0-rc.2` 是开发与自动测试所用版本；`0.2.1-rc.2` 在**隔离 profile** 中完成验收（未写入正式 profile）；`0.2.1-rc.3` 为上一宿主版本（本次没有在它上面重新做原生全量验证）；`0.2.2-rc.1` 是本次新增支持的 DSH Desktop 原生运行时（原生源码已审计；原生 base+web+delegate 全量 profile 加载、stdio MCP、runner 模型路由回读、沙箱策略回读均已在隔离夹具中通过；但**没有真实模型调用、没有实际沙箱命令、没有生产 Desktop 安装**）。之前声明过的版本一个都没有移除。其他 DSH 版本**未经验证**，请不要假定可用。逐版本状态见 [`docs/runtime-compatibility.md`](./docs/runtime-compatibility.md)。 |
+| DSH | 默认通用，不按版本号筛选 | 不声明 `engines.dsh`；宿主提供的 DSH 依赖使用 `*`。所需模型路由、审批等接口仍按实际能力检查；说明见 [`docs/runtime-compatibility.md`](./docs/runtime-compatibility.md)。 |
 | Node.js | `>= 24` | 与 DSH `0.2.0-rc.2` / `0.2.1-rc.2` 运行时一致；使用了原生 ESM、`AbortSignal.timeout`、`node --test`。 |
 | 操作系统 | Windows / Linux / macOS | 自动测试在 Windows + Node 24 上运行；需要 git 的工作树隔离在缺少 git 时会被显式拒绝，而不是静默降级。 |
 
@@ -49,13 +49,13 @@ profile 是**应用保留的**：npm / `dsh plugin` CLI 对该 profile 的操作
 Desktop 侧的包操作只能交给应用完成——不要在 Desktop 的正式 profile 里执行 npm/pnpm
 命令，也不要直接编辑其中的文件。
 
-1. 打开 Desktop 的 **Plugins manager → 添加插件**，输入 **`dsh-taskbridge@1.4.1`**。
+1. 打开 Desktop 的 **Plugins manager → 添加插件**，输入 **`dsh-taskbridge@1.4.2`**。
    若中国大陆镜像尚未同步，先选择 npm 官方源再重试。安装后的显示名为 **DSH TaskBridge**。
    也可以从本项目 Release 下载 `.tgz`，或在仓库根目录打包：
 
    ```bash
    npm pack
-   #    → dsh-taskbridge-1.4.1.tgz
+   #    → dsh-taskbridge-1.4.2.tgz
    ```
 
 2. 使用本地包时，通过 **添加插件**入口选择下载或生成的 `.tgz`（或本仓库目录）完成安装。
@@ -69,7 +69,7 @@ Desktop 侧的包操作只能交给应用完成——不要在 Desktop 的正式
 
 ```bash
 # 装进一个 profile（例：web）
-dsh plugin --profile web add ./dsh-taskbridge-1.4.1.tgz && dsh plugin --profile web why dsh-taskbridge
+dsh plugin --profile web add ./dsh-taskbridge-1.4.2.tgz && dsh plugin --profile web why dsh-taskbridge
 
 # 启动（首次启动会自动把插件 bundle 追加到 dsh.profile.bundles）
 dsh --profile web
@@ -82,7 +82,7 @@ dsh --profile web
 ### 说明与注意
 
 - **不要装进你正在用的正式 profile 做试验。** 建议先用一次性 profile：
-  `dsh plugin --profile dsh-delegate-try add ./dsh-taskbridge-1.4.1.tgz`，再把
+  `dsh plugin --profile dsh-delegate-try add ./dsh-taskbridge-1.4.2.tgz`，再把
   `DSH_HOME` 指向临时目录做隔离验证。该命令同样只用于 CLI profile。
 - 该包声明了 `@deepseek-ai/dsh-*` 的 peer，若你的包管理器默认自动安装 peer，
   安装过程会尝试解析这些版本。可显式关闭：`npm_config_auto_install_peers=false`
@@ -517,7 +517,7 @@ Codex 子智能体现在按「提交 → `delegate_wait` 同一任务」运作�
 # 不要在 Desktop 的正式 profile 下执行下面的 CLI 命令。
 
 # CLI web profile 的升级：换成本地新包或（将来）新版本
-dsh plugin --profile web add ./dsh-taskbridge-1.4.1.tgz
+dsh plugin --profile web add ./dsh-taskbridge-1.4.2.tgz
 
 # 导出：界面里"导出非敏感配置"按钮，或用只读 API
 #   GET /api/dsh-delegate/settings
@@ -542,17 +542,7 @@ dsh plugin --profile web remove dsh-taskbridge
 
 - **发布渠道**：1.3.1 已通过 npm、GitHub Release 和本项目自定义插件索引分发。索引不是官方默认
   市场收录；更新能力取决于 DSH 客户端，插件没有独立的自动更新程序，也未提供作者签名或构建来源证明。
-- **DSH 版本锁定**：`peerDependencies` 与 `engines.dsh` 精确声明四个版本（`0.2.0-rc.2`、
-  `0.2.1-rc.2`、`0.2.1-rc.3`、`0.2.2-rc.1`），其余版本会被 peer 门禁拒绝。其中
-  `0.2.0-rc.2` 是开发与自动测试版本，`0.2.1-rc.2` 的验收在**隔离 profile** 中完成，
-  `0.2.1-rc.3` 为上一宿主版本（本次未在它上面重新做原生全量验证），`0.2.2-rc.1` 是本次新增支持的原生
-  运行时——原生源码已审计，原生 base+web+delegate 全量 profile 加载、stdio MCP、runner 模型路由
-  回读与沙箱策略回读均已在隔离夹具中通过，但**没有真实模型调用**、**没有实际沙箱命令**，
-  也**没有**在生产 Desktop profile 上做端到端安装运行。逐版本状态见
-  [`docs/runtime-compatibility.md`](./docs/runtime-compatibility.md)。
-- **更早的插件版本会被新宿主的门禁跳过**：`0.2.2-rc.1` 宿主不会加载未声明该版本的旧插件
-  （即上一版与更早的构建），而是报 `skippedBundles` / denied row。想在新宿主上使用本插件的
-  行为，需要升级插件，而不是放宽门禁。
+- **按实际接口工作**：1.4.2 起不按 DSH 版本号筛选。若宿主缺少所需模型路由、审批等接口，相关操作仍会报告具体能力不足；默认通用不表示所有宿主版本都已做过端到端实测。旧插件包仍保留它们自己的声明，遇到旧版兼容性提示应先升级插件。
 - **本机开关不是进程身份认证**：开关开启时，能连接本机 DSH 端口的同机进程可以提交任务。
   不要在不可信的本机环境中开启；它不能防御同账号的恶意进程。
 - **逐次授权桥同样不是进程级边界**：开关模式刻意只用一个 `local-mcp` 连接身份，所以

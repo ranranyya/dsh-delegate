@@ -1,8 +1,9 @@
 # Codex integration contract
 
-Status: implemented in 1.4.1 (1.1.0 introduced wait rules, 1.2.0 added installed-integration upgrades, 1.4.0 clarifies outer long waits and explicit host-review recording). This automatic installer covers Codex. Claude Code uses the separate manual MCP guide.
+Status: implemented in 1.4.2 (1.1.0 introduced wait rules, 1.2.0 added installed-integration upgrades, 1.4.0 clarifies outer long waits and explicit host-review recording). This automatic installer covers Codex. Claude Code uses the separate manual MCP guide.
 
-1.4.1 recognizes the exact unmodified
+1.4.2 also recognizes the exact published 1.4.1 companion for managed upgrades.
+The review behavior introduced in 1.4.1 recognizes the exact unmodified
 1.4.0 companion in LF and CRLF forms, and updates the review contract: a completed
 task may be read and reviewed by its original identity after a restart. History
 does not restore execution or old permissions. Reviews are confirmed only when
@@ -527,7 +528,7 @@ successful diagnosis.
 ```jsonc
 {
   "codexHome": "…",
-  "packageVersion": "1.4.1",
+  "packageVersion": "1.4.2",
   "boundary": { "blocked": false, "link": null, "unknown": false, "home": "directory", "agents": "directory" },
   "agent": {
     "path": "…", "state": "installed", "installed": true, "managed": true,

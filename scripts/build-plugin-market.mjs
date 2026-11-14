@@ -42,7 +42,6 @@ export async function buildMarketSite({ commit, publishedAt, outputDir }) {
         version: manifest.version,
         publishTimestamp: timestamp,
         source: { type: 'git', url: repository, commit },
-        engines: { dsh: manifest.engines.dsh },
       }],
     }],
   };

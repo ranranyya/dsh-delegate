@@ -1,6 +1,6 @@
 {
   "name": "dsh-taskbridge",
-  "version": "1.4.1",
+  "version": "1.4.2",
   "description": "让 Claude Code 或 Codex 指挥 DSH 完成任务；在 DSH 插件中配置 API、执行模型、思考强度、权限审批与集中审查。",
   "license": "MIT",
   "repository": {
@@ -13,8 +13,7 @@
   },
   "type": "module",
   "engines": {
-    "node": ">=24",
-    "dsh": "0.2.0-rc.2 || 0.2.1-rc.2 || 0.2.1-rc.3 || 0.2.2-rc.1"
+    "node": ">=24"
   },
   "main": "src/index.js",
   "types": "src/index.d.ts",
@@ -76,7 +75,8 @@
     "docs/taskbridge-upgrade.md",
     "docs/releases/1.4.0.zh.md",
     "docs/releases/1.4.0-token-benchmark.zh.md",
-    "docs/releases/1.4.1.zh.md"
+    "docs/releases/1.4.1.zh.md",
+    "docs/releases/1.4.2.zh.md"
   ],
   "dsh": {
     "manifestVersion": 1,
@@ -92,11 +92,11 @@
     }
   },
   "peerDependencies": {
-    "@deepseek-ai/dsh-agent": "0.2.0-rc.2 || 0.2.1-rc.2 || 0.2.1-rc.3 || 0.2.2-rc.1",
-    "@deepseek-ai/dsh-llm": "0.2.0-rc.2 || 0.2.1-rc.2 || 0.2.1-rc.3 || 0.2.2-rc.1",
-    "@deepseek-ai/dsh-llm-pi-ai": "0.2.0-rc.2 || 0.2.1-rc.2 || 0.2.1-rc.3 || 0.2.2-rc.1",
-    "@deepseek-ai/dsh-tool-fs": "0.2.0-rc.2 || 0.2.1-rc.2 || 0.2.1-rc.3 || 0.2.2-rc.1",
-    "@deepseek-ai/dsh-tool-fs-search": "0.2.0-rc.2 || 0.2.1-rc.2 || 0.2.1-rc.3 || 0.2.2-rc.1",
+    "@deepseek-ai/dsh-agent": "*",
+    "@deepseek-ai/dsh-llm": "*",
+    "@deepseek-ai/dsh-llm-pi-ai": "*",
+    "@deepseek-ai/dsh-tool-fs": "*",
+    "@deepseek-ai/dsh-tool-fs-search": "*",
     "@earendil-works/pi-ai": "^0.87.1 || ^1.1.0"
   },
   "dependencies": {

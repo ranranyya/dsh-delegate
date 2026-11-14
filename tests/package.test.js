@@ -36,27 +36,12 @@ const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const MANIFEST = JSON.parse(readFileSync(join(ROOT, 'package.json'), 'utf8'));
 
 /**
- * The DSH runtimes that were actually verified. `0.2.0-rc.2` is the development
- * runtime; `0.2.1-rc.2` was accepted in an isolated profile and `0.2.1-rc.3` was the
- * previous host runtime. `0.2.2-rc.1` is the DSH Desktop native runtime this release
- * adds: its agent/model-selection and sandbox/approval sources were audited and its
- * native base+web bootstrap was verified independently. Nothing else has been exercised.
- */
-const SUPPORTED_DSH_VERSIONS = ['0.2.0-rc.2', '0.2.1-rc.2', '0.2.1-rc.3', '0.2.2-rc.1'];
-
-/**
- * The exact union range that admits precisely {@link SUPPORTED_DSH_VERSIONS}.
- */
-const SUPPORTED_DSH_RANGE = SUPPORTED_DSH_VERSIONS.join(' || ');
-
-/**
  * The package version this build must declare everywhere a human writes it.
  *
  * Pinned rather than derived: `MANIFEST.version` is one of the places checked below,
- * so asserting itself would pass for any value. `1.4.0` is the silent-wait reliability
- * release: truthful phases, the repeated-failure reminder and the outer-wait contract.
+ * so asserting itself would pass for any value. `1.4.2` removes the DSH version gate.
  */
-const DELIVERABLE_VERSION = '1.4.1';
+const DELIVERABLE_VERSION = '1.4.2';
 
 /**
  * The published build this release upgrades *from*.
@@ -65,7 +50,7 @@ const DELIVERABLE_VERSION = '1.4.1';
  * current version must be exactly one PATCH above this baseline (a correction release),
  * and the two are different versions by construction.
  */
-const PREVIOUS_VERSION = '1.4.0';
+const PREVIOUS_VERSION = '1.4.1';
 
 // Published prior builds are retained only where the migration/ownership contract
 // names them. Other operator-facing and shipped code must not carry stale versions.
@@ -94,11 +79,6 @@ function semverParts(version) {
   const [core] = version.split('-');
   const [major, minor, patch] = core.split('.').map(Number);
   return { major, minor, patch };
-}
-
-/** Split a semver range into its `||`-separated union members. */
-function rangeMembers(range) {
-  return range.split('||').map((member) => member.trim()).filter((member) => member !== '');
 }
 
 /** Directories that are never part of a published archive, at any depth. */
@@ -205,11 +185,8 @@ test('the manifest keeps its identity, license and runtime constraints', () => {
   // Node 24 is what the tests and both supported DSH runtimes use; a wider claim
   // would be untested.
   assert.equal(MANIFEST.engines.node, '>=24');
-  // The engine range is the union of exactly the two verified runtimes: no member
-  // may be dropped (a regression to a single version) and none may be added (an
-  // unverified version claimed as supported).
-  assert.equal(MANIFEST.engines.dsh, SUPPORTED_DSH_RANGE);
-  assert.deepEqual(rangeMembers(MANIFEST.engines.dsh), SUPPORTED_DSH_VERSIONS);
+  assert.equal(Object.hasOwn(MANIFEST.engines, 'dsh'), false,
+    'DSH versions must not be restricted by an engine range');
 });
 
 test('the plugin half declares a bundle patch, which exists inside the archive', () => {
@@ -436,15 +413,13 @@ test('the stdio MCP executable is declared as a bin and points at a real script'
   }
 });
 
-test('peer constraints declare exactly the verified DSH runtimes', () => {
+test('host-provided DSH peers have no version whitelist', () => {
   const peers = MANIFEST.peerDependencies;
-  // DSH admits a plugin by checking every @deepseek-ai/dsh-* peer range against the
-  // running runtime version with prereleases included. 0.2.0-rc.2 and 0.2.1-rc.2 are
-  // the two versions this package was actually exercised on; anything looser would
-  // claim compatibility that was never tested.
+  // With engines.dsh absent, DSH falls back to checking its native peer ranges,
+  // including prereleases. Those peers must not reintroduce the old whitelist.
   for (const [name, range] of Object.entries(peers)) {
     if (!name.startsWith('@deepseek-ai/dsh')) continue;
-    assert.equal(range, SUPPORTED_DSH_RANGE, `${name} must allow exactly the verified runtimes`);
+    assert.equal(range, '*', `${name} must not gate DSH versions`);
   }
   assert.equal(peers['@earendil-works/pi-ai'], '^0.87.1 || ^1.1.0');
 });
@@ -462,12 +437,12 @@ test('the review composition native tool packages are declared, not assumed', ()
 
   for (const name of REVIEW_PACKAGES) {
     // The module really imports what is declared, and it is declared as a peer
-    // whose range is the verified-runtime union (same rule as the row above).
+    // without a DSH version whitelist (same rule as the row above).
     assert.ok(preset.includes(`'${name}'`) || preset.includes(`"${name}"`), `${name} must be the specifier preset.js loads`);
     assert.equal(
       MANIFEST.peerDependencies[name],
-      SUPPORTED_DSH_RANGE,
-      `${name} must be a peer over the verified runtimes`,
+      '*',
+      `${name} must be a host-provided peer without a version whitelist`,
     );
     // Host-supplied as a service, so it must never also be a hard dependency.
     assert.ok(!(name in MANIFEST.dependencies), `${name} must not be a runtime dependency`);
@@ -489,7 +464,7 @@ test('the review composition native tool packages are declared, not assumed', ()
 test('devDependencies pin the development runtime, not the widened peer range', () => {
   // Peers advertise what the host may provide; devDependencies are what this
   // repository itself installs and tests against. The suite therefore keeps the
-  // single pinned development runtime even though peers now admit two versions.
+  // single pinned development runtime while the host-provided peers stay unrestricted.
   for (const name of [
     '@deepseek-ai/dsh-agent',
     '@deepseek-ai/dsh-llm',
@@ -646,9 +621,7 @@ test(`the release is ${DELIVERABLE_VERSION}, newer than ${PREVIOUS_VERSION}`, ()
   const compatibility = readFileSync(join(ROOT, 'docs', 'runtime-compatibility.md'), 'utf8');
   assert.ok(PACKED.includes('docs/runtime-compatibility.md'), 'the compatibility note must be published');
   assert.match(compatibility, new RegExp(escape(DELIVERABLE_VERSION), 'gu'), 'the compatibility note names this release');
-  for (const version of SUPPORTED_DSH_VERSIONS) {
-    assert.ok(compatibility.includes(version), `the compatibility note must list DSH ${version}`);
-  }
+  assert.match(compatibility, /no DSH version whitelist/iu);
 
   // No stale release literal may survive in code or in the documents an operator
   // reads, except for the explicit historical-contract locations that identify the
@@ -682,31 +655,11 @@ test(`the release is ${DELIVERABLE_VERSION}, newer than ${PREVIOUS_VERSION}`, ()
   }
 });
 
-test('the supported-version table is the one the manifest admits', () => {
-  // Compatibility is a claim made in two places at once: the manifest range an
-  // installer checks, and the table an operator reads. A release that widened one and
-  // forgot the other is exactly how an untested runtime gets advertised.
+test('the runtime policy documents version-independent loading and capability checks', () => {
   const compatibility = readFileSync(join(ROOT, 'docs', 'runtime-compatibility.md'), 'utf8');
-  const tableRows = compatibility
-    .split('\n')
-    .filter((line) => /^\|\s*`?\d+\.\d+\.\d+-rc\.\d+`?\s*\|/u.test(line.trim()))
-    .map((line) => line.split('|')[1].trim().replace(/`/gu, ''));
-  for (const version of SUPPORTED_DSH_VERSIONS) {
-    assert.ok(tableRows.includes(version), `the supported-version table does not list ${version}`);
-    assert.ok(MANIFEST.engines.dsh.includes(version), `engines.dsh does not admit ${version}`);
-    for (const [name, range] of Object.entries(MANIFEST.peerDependencies)) {
-      if (!name.startsWith('@deepseek-ai/dsh')) continue;
-      assert.ok(range.includes(version), `${name} does not admit ${version}`);
-    }
-  }
-  // The table may not advertise a runtime the manifest refuses.
-  for (const row of tableRows) {
-    assert.ok(SUPPORTED_DSH_VERSIONS.includes(row), `the table lists an unverified runtime: ${row}`);
-  }
-  // 0.1.11 is skipped by the native engine gate and must be described as such rather
-  // than silently omitted: an operator on that build needs to know why it refuses.
-  assert.match(compatibility, /0\.1\.11/u, 'the note must mention the plugin build whose native gate refuses 0.2.2');
-  assert.match(compatibility, /skipped|refus/iu, 'the note must say what happens to an older plugin build');
+  assert.match(compatibility, /no DSH version whitelist/iu);
+  assert.match(compatibility, /capabilit/iu, 'required runtime interfaces still need checks');
+  assert.doesNotMatch(compatibility, /same exact union|nothing else is admitted/u);
 });
 
 test('the Codex MCP command resolves a Node.js runtime, never the desktop executable', () => {

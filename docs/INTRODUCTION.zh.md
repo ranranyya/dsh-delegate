@@ -1,6 +1,6 @@
 # DSH TaskBridge
 
-1.4.1 补齐跨重启补审、可靠保存、8000 Unicode 码点审查意见及按需全文读取，页面自动显示审查进展。安装 `dsh-taskbridge@1.4.1` 或对应的 Release 安装包；详见 [1.4.1 更新说明](releases/1.4.1.zh.md)。
+1.4.2 默认通用，不再按 DSH 版本白名单拦截；保留 1.4.1 的历史补审、可靠保存和长审查意见。安装 `dsh-taskbridge@1.4.2` 或对应的 Release 安装包；详见 [1.4.2 更新说明](releases/1.4.2.zh.md)。
 
 **让 Claude Code 或 Codex 指挥 DSH 完成任务，在 DSH 插件里配置执行所用的 API、模型和思考强度。**
 
@@ -31,7 +31,7 @@
 
 ## 安装、升级和边界
 
-项目原名 DSH Delegate，1.3.0 曾使用 DSH TaskDispatch。1.3.1 起统一为 **DSH TaskBridge**，包名为 `dsh-taskbridge`。从旧包升级请先阅读 [更名升级说明](taskbridge-upgrade.md)。在 DSH“添加插件”中输入 `dsh-taskbridge@1.4.1`；中国大陆镜像若尚未同步，改选 npm 官方源。GitHub Release 同时提供安装包。
+项目原名 DSH Delegate，1.3.0 曾使用 DSH TaskDispatch。1.3.1 起统一为 **DSH TaskBridge**，包名为 `dsh-taskbridge`。从旧包升级请先阅读 [更名升级说明](taskbridge-upgrade.md)。在 DSH“添加插件”中输入 `dsh-taskbridge@1.4.2`；中国大陆镜像若尚未同步，改选 npm 官方源。GitHub Release 同时提供安装包。
 
 [插件索引与更新说明](plugin-market.md)介绍如何添加索引，在 DSH 的“发现”中搜索本插件。发布自定义索引不代表已进入官方内置市场；DSH 当前需要用户自行添加可信索引。
 

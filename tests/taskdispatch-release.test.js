@@ -14,7 +14,7 @@ const manifest = JSON.parse(await readFile(join(ROOT, 'package.json'), 'utf8'));
 
 test('public identity changes while the actual managed data and MCP identifiers remain compatible', async () => {
   assert.equal(manifest.name, 'dsh-taskbridge');
-  assert.equal(manifest.version, '1.4.1');
+  assert.equal(manifest.version, '1.4.2');
   const home = join(tmpdir(), 'taskdispatch-home-fixture');
   assert.equal(installationRecordPath({ DSH_HOME: home }), join(home, 'data', 'dsh-delegate', 'codex-installation.json'));
   assert.equal(manifest.bin['dsh-delegate-mcp'], 'bin/dsh-delegate-mcp.js');
@@ -28,7 +28,7 @@ test('public identity changes while the actual managed data and MCP identifiers 
   }
 });
 
-for (const version of ['1.2.0', '1.3.0', '1.3.1', '1.3.2']) test(`the real published ${version} fixture remains recognized in exact LF and CRLF forms`, async () => {
+for (const version of ['1.2.0', '1.3.0', '1.3.1', '1.3.2', '1.4.1']) test(`the real published ${version} fixture remains recognized in exact LF and CRLF forms`, async () => {
   const prior = await readFile(join(ROOT, `tests/fixtures/codex-agent-${version}.toml`), 'utf8');
   const lf = prior.replaceAll('\r\n', '\n');
   for (const text of [lf, lf.replaceAll('\n', '\r\n')]) {
@@ -73,7 +73,8 @@ test('generated public index pins the real Git source and carries the exact vers
     assert.equal(doc.format, 1);
     assert.equal(doc.plugins[0].name, manifest.name);
     assert.equal(doc.plugins[0].versions[0].version, manifest.version);
-    assert.equal(doc.plugins[0].versions[0].engines.dsh, manifest.engines.dsh);
+    assert.equal(Object.hasOwn(doc.plugins[0].versions[0], 'engines'), false,
+      'the public index must not reintroduce a DSH version gate');
     assert.deepEqual(doc.plugins[0].versions[0].source, { type: 'git', url: 'https://github.com/ranranyya/dsh-taskbridge', commit });
     assert.match(doc.plugins[0].description.zh, /思考强度/u);
     assert.match(doc.plugins[0].description.zh, /Claude Code/u);

@@ -347,6 +347,9 @@ export const KNOWN_AGENT_TEMPLATES = [
   // still hashes to something unknown and is left alone.
   { version: '1.4.0', sha256: '2b2f6c35ffc9e99d98f38d00e07fef11de8bf96a9dd446e80889fcf92ba45cd8' },
   { version: '1.4.0', sha256: 'cfb21bc510b47be27c5e64bce86c48cbc9a49055777cd265e118ed942a94d9a5' },
+  // Exact published 1.4.1 companion, including its LF and CRLF forms.
+  { version: '1.4.1', sha256: '8b6211918ce867ecfdac3495973813a70b7290bdd40221b439d98638f82ac3d4' },
+  { version: '1.4.1', sha256: 'e2a8dc4cac897266e198b98be8fbf91d4159ab9a799704f200224457d292b5be' },
 ];
 
 /** The `version = "…"` line of an agent file, at column 0. */

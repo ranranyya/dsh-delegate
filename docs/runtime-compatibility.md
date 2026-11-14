@@ -1,16 +1,14 @@
 # Runtime compatibility
 
-Build 1.4.1 keeps the supported DSH
-range unchanged. The history/review corrections are tested in temporary data
-directories and isolated package installations; they do not establish a production
-Desktop upgrade or live provider execution. The 1.4.0 measurement below remains a
-historical waiting-channel sample, not a new 1.4.1 token-saving claim.
+Build 1.4.2 has **no DSH version whitelist**: it omits `engines.dsh`, declares
+host-provided `@deepseek-ai/dsh-*` peers as `*`, and publishes no DSH engine range
+in the custom plugin index. The plugin uses runtime capability checks rather than
+rejecting a host solely by its version number. Node.js `>=24` is still required.
 
-This document states which DSH runtimes this plugin build (`1.4.1`, package
-`dsh-taskbridge-1.4.1.tgz`) may be loaded into, what changed in the newest one, and what
-has and has not been verified on it. It is a compatibility note, not an acceptance
-report; the package is distributed through npm and the GitHub Release. See the
-[1.4.1 release notes](releases/1.4.1.zh.md) for upgrade details and the
+The historical runtime audits below describe the interfaces already implemented;
+they are not an exclusive admission list or a claim of end-to-end testing on every
+DSH build. See the [1.4.2 release notes](releases/1.4.2.zh.md) for this change,
+the [1.4.1 release notes](releases/1.4.1.zh.md) for review fixes, and the
 [1.3.1 release report](releases/1.3.1.zh.md) for historical distribution verification.
 
 `1.1.0` added silent waiting: the global `monitoring` thresholds (self-check and attention
@@ -42,39 +40,20 @@ upgrades the installed MCP entry) and Codex reloaded before the new wait rules a
 managed `tool_timeout_sec` take effect. No unit-test count and no mock constitutes an
 acceptance run.
 
-## 1. Supported versions
+## 1. Default loading policy
 
-`engines.dsh` and every `@deepseek-ai/dsh-*` peer range are the **same exact union**,
-and nothing else is admitted:
-
-```
-0.2.0-rc.2 || 0.2.1-rc.2 || 0.2.1-rc.3 || 0.2.2-rc.1
-```
-
-| DSH runtime | Status in this build | Evidence |
-| --- | --- | --- |
-| `0.2.0-rc.2` | Supported; development and automated-test runtime | The repository's own test suite and native development cohort run on it. |
-| `0.2.1-rc.2` | Supported; accepted in an **isolated** profile | Prior acceptance run in a temporary `DSH_HOME`; not the operator's production profile. |
-| `0.2.1-rc.3` | Supported; previous host runtime | Declared by the previous host build. This build was **not** independently native-boot verified on `0.2.1-rc.3` during this task, so no full-profile check is claimed for it. |
-| `0.2.2-rc.1` | Supported; the newest runtime this build adds | Native sources audited (`.cache/compat-022-20261107/reference-022`); native base+web bootstrap verified in isolated fixtures (`.cache/native022-host-*`). |
-
-Additional rules:
-
-- **DSH checks these ranges with prereleases included.** `@deepseek-ai/dsh-*` peer
-  ranges are matched with `semver` plus `includePrerelease`, so an exact prerelease
-  string is required; a caret or tilde would admit builds that were never exercised.
-- **No version was dropped.** Every release admitted before this one is still admitted,
-  and the automated tests assert that the manifest, both lockfiles and the table above
-  agree with each other.
-- **Any other DSH version is unverified.** Do not assume it works; the loader will
-  refuse a plugin whose peer range does not match.
-- **Older *plugin* builds are refused by the native gate.** The gate is checked against
-  the plugin's declared ranges, so an older build (`0.1.11` and anything before it) that
-  does not declare `0.2.2-rc.1` is *skipped* by a `0.2.2-rc.1` host
-  (`skippedBundles` / a denied row) rather than loaded with unknown behaviour. Getting
-  this build's behaviour on `0.2.2-rc.1` requires upgrading the plugin, not relaxing the
-  gate.
-- **Node.js `>= 24`** is required (`engines.node`), matching the DSH runtimes above.
+- No DSH version whitelist is declared. Both stable and prerelease DSH builds may
+  pass the host's metadata check without updating an enumerated range.
+- DSH falls back to its peer checks when `engines.dsh` is absent; the native peers
+  use `*` so that fallback does not restore the old restriction.
+- The index omits the optional engine field rather than publishing an empty or
+  outdated DSH range. Package and discovery metadata therefore agree.
+- Required runtime capabilities, model-selection readback and permission checks
+  remain in place. Removing a version filter does not disable those checks.
+- Development dependencies remain pinned for reproducible tests; they do not
+  restrict the host-provided peer versions used by an installed plugin.
+- Older plugin packages keep their own metadata and can still be refused by a
+  newer host. Upgrade to `dsh-taskbridge@1.4.2` to use this loading policy.
 
 ## 2. What DSH 0.2.2 changes
 
@@ -205,27 +184,27 @@ What remains genuinely unverified:
 
 ## 5. Upgrading from an older plugin build
 
-1. Download `dsh-taskbridge-1.4.1.tgz` from the GitHub Release, or build the package locally (`npm pack`).
+1. Download `dsh-taskbridge-1.4.2.tgz` from the GitHub Release, or build the package locally (`npm pack`).
 2. Install it the way your surface requires: the Desktop **Plugins manager** for a
    Desktop profile (npm/CLI operations on that profile are refused), or
-   `dsh plugin --profile <name> add ./dsh-taskbridge-1.4.1.tgz` for a CLI profile you
+   `dsh plugin --profile <name> add ./dsh-taskbridge-1.4.2.tgz` for a CLI profile you
    start yourself.
 3. The settings, the switch value and the task history are preserved
    (`$DSH_HOME/data/dsh-delegate`); nothing is migrated destructively.
 4. If the Codex companion was installed, no action is needed: a `0.1.11` — or `0.1.10` —
    agent file whose bytes still match a published template is refreshed automatically on
    startup, or explicitly from the Codex panel. A file you edited is left untouched.
-5. To roll back, re-install the older `.tgz`. The data directory is not deleted, but an
-   older plugin build will be skipped by a `0.2.2-rc.1` host's native gate (section 1),
-   so rolling back the plugin means staying on an older DSH as well.
+5. To roll back, re-install the older `.tgz`. The data directory is not deleted.
+   Older packages retain their own version restrictions and may be refused by the
+   host; the unrestricted policy is specific to 1.4.2 and later builds that keep it.
 
 ## 6. Where this is enforced
 
 | Claim | Enforced by |
 | --- | --- |
-| The exact runtime union in `engines.dsh` and every `@deepseek-ai/dsh-*` peer | `tests/package.test.js` ("the manifest keeps its identity…", "peer constraints declare exactly the verified DSH runtimes") |
+| No DSH engine range and unrestricted native peers | `tests/package.test.js` (manifest and host-provided peer checks) |
 | Both lockfiles' root metadata match `package.json` | `tests/package.test.js` ("the lockfile pins the same dependency set…") |
-| This table matches the manifest, in both directions | `tests/package.test.js` ("the supported-version table is the one the manifest admits") |
+| The published index does not restore a DSH version filter | `tests/taskdispatch-release.test.js` (real index generator output) |
 | A published `0.1.11` or `0.1.10` agent is refreshed, an edited one is not | `tests/codex-integration.test.js` |
 
 
